@@ -8,7 +8,7 @@ use fastwebsockets::Role;
 use http_body_util::Either;
 use http_body_util::combinators::BoxBody;
 use hyper::body::Incoming;
-use hyper::header::{HeaderValue, SEC_WEBSOCKET_PROTOCOL};
+use hyper::header::{HeaderName, HeaderValue, SEC_WEBSOCKET_PROTOCOL};
 use hyper::{Request, Response};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -27,26 +27,68 @@ pub(super) async fn ws_server_upgrade(
         return bad_request();
     }
 
+    let client_id = req
+        .headers()
+        .get("x-client-id")
+        .or_else(|| req.headers().get("x-device-id"))
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
+    if let (Some(id), Some(reg)) = (&client_id, &server.fleet_registry) {
+        reg.register_client(id.clone(), client_addr);
+    }
+
     let mask_frame = server.config.websocket_mask_frame;
     let (remote_addr, local_rx, local_tx, need_cookie) = match server
         .handle_tunnel_request(restrictions, restrict_path_prefix, client_addr, &req)
         .await
     {
         Ok(ret) => ret,
-        Err(err) => return err,
+        Err(err) => {
+            if let (Some(id), Some(reg)) = (&client_id, &server.fleet_registry) {
+                reg.unregister_client(id);
+            }
+            return err;
+        }
     };
 
     let (response, fut) = match fastwebsockets::upgrade::upgrade(&mut req) {
         Ok(ret) => ret,
         Err(err) => {
             warn!("Rejecting connection with bad upgrade request: {} {}", err, req.uri());
+            if let (Some(id), Some(reg)) = (&client_id, &server.fleet_registry) {
+                reg.unregister_client(id);
+            }
             return bad_request();
         }
     };
 
     let executor = server.executor.clone();
+    let client_id_cleanup = client_id;
+    let fleet_reg = server.fleet_registry.clone();
+    let session_id = uuid::Uuid::now_v7().to_string();
+
+    if let Some(reg) = &server.fleet_registry {
+        reg.register_session(
+            session_id.clone(),
+            client_id_cleanup.clone().unwrap_or_else(|| "anonymous".to_string()),
+            remote_addr.port,
+            client_addr,
+            remote_addr.port,
+        );
+    }
+
     server.executor.spawn(
         async move {
+            scopeguard::defer!({
+                if let Some(reg) = &fleet_reg {
+                    reg.unregister_session(&session_id);
+                    if let Some(id) = &client_id_cleanup {
+                        reg.unregister_client(id);
+                    }
+                }
+            });
+
             let (ws_rx, ws_tx) = match fut.await {
                 Ok(ws) => match mk_websocket_tunnel(ws, Role::Server, mask_frame) {
                     Ok(ws) => ws,
@@ -80,6 +122,12 @@ pub(super) async fn ws_server_upgrade(
     let mut response = Response::from_parts(response.into_parts().0, Either::Right(BoxBody::default()));
     if need_cookie && inject_cookie(&mut response, &remote_addr).is_err() {
         return bad_request();
+    }
+
+    if remote_addr.port != 0 {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("x-assigned-port"), HeaderValue::from(remote_addr.port));
     }
 
     response

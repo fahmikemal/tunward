@@ -12,7 +12,6 @@ use anyhow::Context;
 use futures_util::pin_mut;
 use hyper::header::COOKIE;
 use log::debug;
-use std::cmp::min;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -178,12 +177,21 @@ impl<E: TokioExecutorRef> Client<E> {
     ) -> anyhow::Result<()> {
         const REVERSE_TUNNEL_REPLY_TIMEOUT: Duration = Duration::from_secs(if cfg!(test) { 5 } else { 30 });
         fn new_reconnect_delay(max_delay: Duration) -> impl FnMut() -> Duration {
-            let mut reconnect_delay = Duration::from_secs(1);
+            let mut attempt: u32 = 0;
+            let base_secs = 1.0_f64;
+            let max_secs = max_delay.as_secs_f64();
 
             move || -> Duration {
-                let delay = reconnect_delay;
-                reconnect_delay = min(reconnect_delay * 2, max_delay);
-                delay
+                let exp_secs = base_secs * 2.0_f64.powi(attempt as i32);
+                attempt = attempt.saturating_add(1);
+                let ceiling = exp_secs.min(max_secs);
+                let jittered = if ceiling > 0.5 {
+                    use rand::Rng;
+                    rand::thread_rng().gen_range(0.5..=ceiling)
+                } else {
+                    ceiling
+                };
+                Duration::from_secs_f64(jittered)
             }
         }
 
@@ -244,6 +252,9 @@ impl<E: TokioExecutorRef> Client<E> {
 
             // Connect to endpoint
             event!(parent: &span, Level::DEBUG, "Server response: {:?}", response);
+            if let Some(port_hdr) = response.headers.get("x-assigned-port").and_then(|v| v.to_str().ok()) {
+                tracing::info!("Reverse tunnel active on assigned remote port: {port_hdr}");
+            }
             let task = {
                 let executor = self.executor.clone();
                 let connector = connector.clone();

@@ -88,6 +88,7 @@ fn server_no_tls(dns_resolver: DnsResolver) -> Server {
         http_proxy: None,
         remote_server_idle_timeout: Duration::from_secs(30),
         enable_webtransport: false,
+        management_api: None,
     };
     Server::new(server_config, DefaultTokioExecutor::default())
 }
@@ -114,6 +115,7 @@ fn server_webtransport(dns_resolver: DnsResolver) -> Server {
         http_proxy: None,
         remote_server_idle_timeout: Duration::from_secs(30),
         enable_webtransport: true,
+        management_api: None,
     };
     Server::new(server_config, DefaultTokioExecutor::default())
 }
@@ -155,6 +157,7 @@ async fn client_webtransport(server_port: u16, dns_resolver: DnsResolver) -> Cli
             )
             .unwrap(),
         )),
+        client_id: None,
     };
 
     Client::new(
@@ -185,6 +188,7 @@ async fn client_ws(server_port: u16, dns_resolver: DnsResolver) -> Client {
         dns_resolver,
         http_proxy: None,
         webtransport: None,
+        client_id: None,
     };
 
     Client::new(
@@ -736,4 +740,152 @@ async fn test_socks5_tunnel_unreachable_target_replies_error(
     let rep = socks5_handshake_connect(&mut client, Ipv4Addr::LOCALHOST, dead_endpoint.port()).await;
     assert_ne!(rep, 0x00, "reply must report failure when the target is unreachable");
     assert_eq!(rep, 0x01, "expected GeneralFailure reply code");
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[tokio::test]
+#[serial]
+async fn test_fleet_management_and_ephemeral_reverse_tunnel(
+    no_restrictions: RestrictionsRules,
+    dns_resolver: DnsResolver,
+) {
+    let mgmt_addr = free_addr().0;
+    let server_bind = free_addr().0;
+    let server_config = ServerConfig {
+        socket_so_mark: SoMark::new(None),
+        bind: server_bind,
+        websocket_ping_frequency: Some(Duration::from_secs(10)),
+        timeout_connect: Duration::from_secs(10),
+        websocket_mask_frame: false,
+        tls: None,
+        dns_resolver: dns_resolver.clone(),
+        restriction_config: None,
+        http_proxy: None,
+        remote_server_idle_timeout: Duration::from_secs(30),
+        enable_webtransport: false,
+        management_api: Some(mgmt_addr),
+    };
+    let server = Server::new(server_config, DefaultTokioExecutor::default());
+    let server_port = server.config.bind.port();
+    let server_h = tokio::spawn(server.serve(no_restrictions));
+    defer! { server_h.abort(); };
+
+    // Wait for management API to be reachable
+    let mut ready = false;
+    for _ in 0..20 {
+        if let Ok(mut stream) = TcpStream::connect(mgmt_addr).await {
+            let _ = stream
+                .write_all(b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                .await;
+            let mut resp = String::new();
+            if stream.read_to_string(&mut resp).await.is_ok() && resp.contains("200 OK") {
+                ready = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ready, "Management API /healthz failed to respond");
+
+    // Start mock upstream echo service
+    let echo_addr = free_addr().0;
+    let echo_listener = TcpListener::bind(echo_addr).await.unwrap();
+    let echo_h = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = echo_listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                while let Ok(n) = socket.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let _ = socket.write_all(&buf[..n]).await;
+                }
+            });
+        }
+    });
+    defer! { echo_h.abort(); };
+
+    // Start client with client_id
+    let client_config = ClientConfig {
+        remote_addr: TransportAddr::new(TransportScheme::Ws, Host::Ipv4(Ipv4Addr::LOCALHOST), server_port, None)
+            .unwrap(),
+        socket_so_mark: SoMark::new(None),
+        http_upgrade_path_prefix: "tunward".to_string(),
+        http_upgrade_credentials: None,
+        http_headers: HashMap::new(),
+        http_headers_file: None,
+        http_header_host: HeaderValue::from_str(&format!("127.0.0.1:{server_port}")).unwrap(),
+        timeout_connect: Duration::from_secs(10),
+        websocket_ping_frequency: Some(Duration::from_secs(10)),
+        websocket_mask_frame: false,
+        dns_resolver: dns_resolver.clone(),
+        http_proxy: None,
+        webtransport: None,
+        client_id: Some("kiosk-padang-01".to_string()),
+    };
+    let client = Client::new(
+        client_config,
+        1,
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        DefaultTokioExecutor::default(),
+    )
+    .await
+    .unwrap();
+
+    let connector = TcpUpstreamConnector::new(
+        Host::Ipv4(Ipv4Addr::LOCALHOST),
+        echo_addr.port(),
+        SoMark::new(None),
+        Duration::from_secs(1),
+        dns_resolver,
+    );
+    let client_h = tokio::spawn(client.run_reverse_tunnel(
+        RemoteAddr {
+            protocol: LocalProtocol::ReverseTcp,
+            host: Host::Ipv4(Ipv4Addr::LOCALHOST),
+            port: 0,
+        },
+        connector,
+    ));
+    defer! { client_h.abort(); };
+
+    // Verify client appears in /api/v1/clients
+    let mut client_found = false;
+    for _ in 0..40 {
+        if let Ok(mut stream) = TcpStream::connect(mgmt_addr).await {
+            let _ = stream
+                .write_all(b"GET /api/v1/clients HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                .await;
+            let mut resp = String::new();
+            if stream.read_to_string(&mut resp).await.is_ok() && resp.contains("kiosk-padang-01") {
+                client_found = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(client_found, "Client kiosk-padang-01 must appear in /api/v1/clients");
+
+    // Verify GET /api/v1/clients/kiosk-padang-01
+    let mut stream = TcpStream::connect(mgmt_addr).await.unwrap();
+    stream
+        .write_all(b"GET /api/v1/clients/kiosk-padang-01 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).await.unwrap();
+    assert!(resp.contains("200 OK"));
+    assert!(resp.contains("kiosk-padang-01"));
+
+    // Verify GET /healthz reflects active client count
+    let mut stream = TcpStream::connect(mgmt_addr).await.unwrap();
+    stream
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).await.unwrap();
+    assert!(resp.contains("\"active_clients\":1"));
 }

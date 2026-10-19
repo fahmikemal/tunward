@@ -1,12 +1,15 @@
 pub mod config;
 mod embedded_certificate;
 pub mod executor;
+pub mod management;
 mod protocols;
 mod restrictions;
 mod somark;
 #[cfg(test)]
 mod test_integrations;
 pub mod tunnel;
+
+pub use management::{ClientRecord, FleetRegistry, HealthStats, SessionRecord};
 
 use crate::config::{ClientCreationRequest, DEFAULT_CLIENT_UPGRADE_PATH_PREFIX, ServerCreationRequest};
 use crate::executor::{TokioExecutor, TokioExecutorRef};
@@ -219,6 +222,7 @@ pub async fn create_client(
         dns_resolver,
         http_proxy,
         webtransport,
+        client_id: args.client_id,
     };
 
     let client = Client::new(
@@ -582,6 +586,7 @@ async fn run_server_impl(args: ServerCreationRequest, executor: impl TokioExecut
         // wts:// on the server means "TLS, and also serve webtransport", so it implies the flag.
         // The TCP listener still runs, serving websocket and http2 as usual.
         enable_webtransport: args.enable_webtransport || is_webtransport,
+        management_api: args.management_api,
     };
     let server = Server::new(server_config, executor);
 

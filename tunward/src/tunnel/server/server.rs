@@ -70,18 +70,23 @@ pub struct ServerConfig {
     /// Additionally serve WebTransport over UDP on the same port as the TCP listener.
     /// Requires TLS, since QUIC mandates TLS 1.3.
     pub enable_webtransport: bool,
+    /// [Optional] Enable local REST management API on the specified socket address.
+    pub management_api: Option<SocketAddr>,
 }
 
 #[derive(Clone)]
 pub struct Server<E: crate::TokioExecutorRef = DefaultTokioExecutor> {
     pub config: Arc<ServerConfig>,
+    pub fleet_registry: Option<crate::management::FleetRegistry>,
     pub executor: E,
 }
 
 impl<E: crate::TokioExecutorRef> Server<E> {
     pub fn new(config: ServerConfig, executor: E) -> Self {
+        let fleet_registry = config.management_api.map(|_| crate::management::FleetRegistry::new());
         Self {
             config: Arc::new(config),
+            fleet_registry,
             executor,
         }
     }
@@ -146,7 +151,7 @@ impl<E: crate::TokioExecutorRef> Server<E> {
         info!("Tunnel accepted due to matched restriction: {}", restriction.name);
 
         let req_protocol = remote.protocol.clone();
-        let inject_cookie = req_protocol.is_dynamic_reverse_tunnel();
+        let was_ephemeral_reverse = req_protocol.is_reverse_tunnel() && remote.port == 0;
         let tunnel = self
             .exec_tunnel(restriction, remote, client_addr)
             .await
@@ -156,6 +161,8 @@ impl<E: crate::TokioExecutorRef> Server<E> {
             })?;
 
         let (remote_addr, local_rx, local_tx) = tunnel;
+        let inject_cookie =
+            req_protocol.is_dynamic_reverse_tunnel() || (was_ephemeral_reverse && remote_addr.port != 0);
         info!("connected to {:?} {}:{}", req_protocol, remote_addr.host, remote_addr.port);
         Ok((remote_addr, local_rx, local_tx, inject_cookie))
     }
@@ -229,7 +236,11 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                 let remote_port = find_mapped_port(remote.port, restriction);
                 let local_srv = (remote.host, remote_port);
                 let bind = try_to_sock_addr(local_srv.clone())?;
-                let listening_server = async { TcpDownstreamListener::new(bind, local_srv.clone(), false).await };
+                let listening_server = async {
+                    let l = TcpDownstreamListener::new(bind, local_srv.clone(), false).await?;
+                    let bound = l.bound_addr();
+                    Ok((l, bound))
+                };
                 let ((local_rx, local_tx), remote) = SERVERS
                     .run_listening_server(
                         &self.executor,
@@ -248,7 +259,10 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                 let remote_port = find_mapped_port(remote.port, restriction);
                 let local_srv = (remote.host, remote_port);
                 let bind = try_to_sock_addr(local_srv.clone())?;
-                let listening_server = async { UdpDownstreamListener::new(bind, local_srv.clone(), timeout).await };
+                let listening_server = async {
+                    let l = UdpDownstreamListener::new(bind, local_srv.clone(), timeout).await?;
+                    Ok((l, bind))
+                };
                 let ((local_rx, local_tx), remote) = SERVERS
                     .run_listening_server(
                         &self.executor,
@@ -266,7 +280,10 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                 let remote_port = find_mapped_port(remote.port, restriction);
                 let local_srv = (remote.host, remote_port);
                 let bind = try_to_sock_addr(local_srv.clone())?;
-                let listening_server = async { Socks5DownstreamListener::new(bind, timeout, credentials).await };
+                let listening_server = async {
+                    let l = Socks5DownstreamListener::new(bind, timeout, credentials).await?;
+                    Ok((l, bind))
+                };
                 let ((local_rx, mut local_tx), remote) = SERVERS
                     .run_listening_server(
                         &self.executor,
@@ -293,8 +310,10 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                 let remote_port = find_mapped_port(remote.port, restriction);
                 let local_srv = (remote.host, remote_port);
                 let bind = try_to_sock_addr(local_srv.clone())?;
-                let listening_server =
-                    async { HttpProxyDownstreamListener::new(bind, timeout, credentials, false).await };
+                let listening_server = async {
+                    let l = HttpProxyDownstreamListener::new(bind, timeout, credentials, false).await?;
+                    Ok((l, bind))
+                };
                 let ((local_rx, local_tx), remote) = SERVERS
                     .run_listening_server(
                         &self.executor,
@@ -321,7 +340,10 @@ impl<E: crate::TokioExecutorRef> Server<E> {
 
                 let local_srv = (host, 0);
                 let bind = try_to_sock_addr(local_srv.clone())?;
-                let listening_server = async { UnixDownstreamListener::new(path, local_srv, false).await };
+                let listening_server = async {
+                    let l = UnixDownstreamListener::new(path, local_srv, false).await?;
+                    Ok((l, bind))
+                };
                 let ((local_rx, local_tx), remote) = SERVERS
                     .run_listening_server(
                         &self.executor,
@@ -458,6 +480,15 @@ impl<E: crate::TokioExecutorRef> Server<E> {
             self.executor.spawn(async move {
                 if let Err(err) = handler_webtransport::run_webtransport_server(server, restrictions).await {
                     error!("Webtransport server stopped: {err:?}");
+                }
+            });
+        }
+
+        if let (Some(mgmt_addr), Some(reg)) = (self.config.management_api, &self.fleet_registry) {
+            let reg = reg.clone();
+            self.executor.spawn(async move {
+                if let Err(err) = crate::management::run_management_server(mgmt_addr, reg).await {
+                    error!("Management REST API stopped: {err:?}");
                 }
             });
         }

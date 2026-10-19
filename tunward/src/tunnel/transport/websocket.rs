@@ -296,6 +296,14 @@ pub async fn connect(
         headers.append(AUTHORIZATION, auth.clone());
     }
 
+    if let Some(val) = client_cfg
+        .client_id
+        .as_deref()
+        .and_then(|id| hyper::header::HeaderValue::from_str(id).ok())
+    {
+        headers.insert(hyper::header::HeaderName::from_static("x-client-id"), val);
+    }
+
     if let Some(headers_file_path) = &client_cfg.http_headers_file {
         let (host, headers_file) = headers_from_file(headers_file_path);
         for (k, v) in headers_file {

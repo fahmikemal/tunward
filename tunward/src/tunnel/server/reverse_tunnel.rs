@@ -60,7 +60,7 @@ impl<T: DownstreamListener> ReverseTunnelServer<T> {
         executor: &impl TokioExecutorRef,
         bind_addr: SocketAddr,
         idle_timeout: Duration,
-        gen_listening_server: impl Future<Output = anyhow::Result<T>>,
+        gen_listening_server: impl Future<Output = anyhow::Result<(T, SocketAddr)>>,
     ) -> anyhow::Result<(
         (<T as DownstreamListener>::Reader, <T as DownstreamListener>::Writer),
         RemoteAddr,
@@ -68,24 +68,26 @@ impl<T: DownstreamListener> ReverseTunnelServer<T> {
     where
         T: DownstreamListener + Send + 'static,
     {
-        let listening_server = self
-            .servers
-            .lock()
-            .get(&bind_addr)
-            .map(|server| server.get_cnx_awaiter());
+        let listening_server = if bind_addr.port() == 0 {
+            None
+        } else {
+            self.servers
+                .lock()
+                .get(&bind_addr)
+                .map(|server| server.get_cnx_awaiter())
+        };
         let cnx = if let Some(listening_server) = listening_server {
             listening_server
         } else {
-            let listening_server = gen_listening_server.await?;
+            let (listening_server, actual_bind_addr) = gen_listening_server.await?;
             let (tx, rx) = async_channel::bounded(10);
             let nb_seen_clients = Arc::new(AtomicUsize::new(0));
             let seen_clients = nb_seen_clients.clone();
             let server = self.servers.clone();
-            let local_srv2 = bind_addr;
 
             let fut = async move {
                 scopeguard::defer!({
-                    server.lock().remove(&local_srv2);
+                    server.lock().remove(&actual_bind_addr);
                 });
 
                 let mut timer = time::interval(idle_timeout);
@@ -131,7 +133,7 @@ impl<T: DownstreamListener> ReverseTunnelServer<T> {
                 server_task: executor.spawn(fut),
             };
             let cnx_awaiter = item.get_cnx_awaiter();
-            self.servers.lock().insert(bind_addr, item);
+            self.servers.lock().insert(actual_bind_addr, item);
             cnx_awaiter
         };
 

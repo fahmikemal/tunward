@@ -16,11 +16,12 @@ pub struct TcpDownstreamListener {
     listener: TcpListenerStream,
     dest: (Host, u16),
     proxy_protocol: bool,
+    bound_addr: SocketAddr,
 }
 
 impl TcpDownstreamListener {
     pub async fn new(bind_addr: SocketAddr, dest: (Host, u16), proxy_protocol: bool) -> anyhow::Result<Self> {
-        let listener = protocols::tcp::run_server(bind_addr, false)
+        let (listener, bound_addr) = protocols::tcp::run_server_with_addr(bind_addr, false)
             .await
             .with_context(|| anyhow!("Cannot start TCP server on {bind_addr}"))?;
 
@@ -28,7 +29,12 @@ impl TcpDownstreamListener {
             listener,
             dest,
             proxy_protocol,
+            bound_addr,
         })
+    }
+
+    pub fn bound_addr(&self) -> SocketAddr {
+        self.bound_addr
     }
 }
 
@@ -42,7 +48,10 @@ impl Stream for TcpDownstreamListener {
             Some(Ok(stream)) => {
                 let _ = configure_socket(SockRef::from(&stream), SoMark::new(None))
                     .inspect_err(|e| log::error!("TCP Downstream listener error: {e}"));
-                let (host, port) = this.dest.clone();
+                let (host, mut port) = this.dest.clone();
+                if port == 0 {
+                    port = this.bound_addr.port();
+                }
                 Some(anyhow::Ok((
                     stream.into_split(),
                     RemoteAddr {

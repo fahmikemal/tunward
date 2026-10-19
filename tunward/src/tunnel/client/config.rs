@@ -31,6 +31,8 @@ pub struct ClientConfig {
     /// Built in `create_client`, so a bad TLS setup fails at startup rather than on the
     /// first tunnel.
     pub webtransport: Option<Arc<WebTransportEndpoint>>,
+    /// Optional client / device identifier sent during handshake for fleet tracking
+    pub client_id: Option<String>,
 }
 
 impl ClientConfig {

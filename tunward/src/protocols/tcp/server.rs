@@ -209,12 +209,16 @@ pub async fn connect_with_http_proxy(
 }
 
 #[cfg_attr(not(target_os = "linux"), expect(unused_variables))]
-pub async fn run_server(bind: SocketAddr, ip_transparent: bool) -> Result<TcpListenerStream, anyhow::Error> {
+pub async fn run_server_with_addr(
+    bind: SocketAddr,
+    ip_transparent: bool,
+) -> Result<(TcpListenerStream, SocketAddr), anyhow::Error> {
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("Cannot create TCP server {bind:?}"))?;
 
-    info!("Starting TCP server listening cnx on {}", listener.local_addr().unwrap_or(bind));
+    let local_addr = listener.local_addr().unwrap_or(bind);
+    info!("Starting TCP server listening cnx on {}", local_addr);
 
     #[cfg(target_os = "linux")]
     if ip_transparent {
@@ -222,7 +226,12 @@ pub async fn run_server(bind: SocketAddr, ip_transparent: bool) -> Result<TcpLis
         socket2::SockRef::from(&listener).set_ip_transparent_v4(ip_transparent)?;
     }
 
-    Ok(TcpListenerStream::new(listener))
+    Ok((TcpListenerStream::new(listener), local_addr))
+}
+
+#[cfg_attr(not(target_os = "linux"), expect(unused_variables))]
+pub async fn run_server(bind: SocketAddr, ip_transparent: bool) -> Result<TcpListenerStream, anyhow::Error> {
+    run_server_with_addr(bind, ip_transparent).await.map(|(s, _)| s)
 }
 
 // there is no docker on OpenBSD

@@ -249,6 +249,19 @@ pub struct ClientCreationRequest {
         arg(long, default_value = "false", env = "TUNWARD_DNS_PREFER_IPV4", verbatim_doc_comment)
     )]
     pub dns_resolver_prefer_ipv4: bool,
+
+    /// [Optional] Client or device identifier sent during handshake for fleet tracking
+    #[cfg_attr(
+        feature = "clap",
+        arg(
+            long,
+            value_name = "STRING",
+            alias = "device-id",
+            env = "TUNWARD_CLIENT_ID",
+            verbatim_doc_comment
+        )
+    )]
+    pub client_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -411,6 +424,15 @@ pub struct ServerCreationRequest {
         verbatim_doc_comment,
     ))]
     pub remote_to_local_server_idle_timeout: Duration,
+
+    /// [Optional] Enable local REST management API on the specified socket address.
+    /// Example: --management-api 127.0.0.1:8081
+    /// Exposes endpoints for client registry, health check, and dynamic session management.
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, value_name = "IP:PORT", verbatim_doc_comment, env = "TUNWARD_MANAGEMENT_API")
+    )]
+    pub management_api: Option<SocketAddr>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
