@@ -246,12 +246,7 @@ pub struct ClientCreationRequest {
     /// If you don't have any IPv6 this does not change anything.
     #[cfg_attr(
         feature = "clap",
-        arg(
-            long,
-            default_value = "false",
-            env = "TUNWARD_DNS_PREFER_IPV4",
-            verbatim_doc_comment
-        )
+        arg(long, default_value = "false", env = "TUNWARD_DNS_PREFER_IPV4", verbatim_doc_comment)
     )]
     pub dns_resolver_prefer_ipv4: bool,
 }
@@ -318,12 +313,7 @@ pub struct ServerCreationRequest {
     /// If you don't have any IPv6 this does not change anything.
     #[cfg_attr(
         feature = "clap",
-        arg(
-            long,
-            default_value = "false",
-            env = "TUNWARD_DNS_PREFER_IPV4",
-            verbatim_doc_comment
-        )
+        arg(long, default_value = "false", env = "TUNWARD_DNS_PREFER_IPV4", verbatim_doc_comment)
     )]
     pub dns_resolver_prefer_ipv4: bool,
 
