@@ -3,7 +3,4 @@ useDefault = true
 
 [allowlist]
 description = "Ignore mTLS test/doc certificates and build target directory"
-paths = [
-    '''.*certs/mTLS/.*''',
-    '''.*target/.*'''
-]
+paths = ['''.*certs/mTLS/.*''', '''.*target/.*''']
