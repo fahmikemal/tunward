@@ -1,0 +1,244 @@
+on:
+  # Indicates I want to run this workflow on all branches, PR, and tags
+  push:
+    branches: [ "main", "draft" ]
+    tags: [ "*" ]
+  pull_request:
+    branches: [ "main" ]
+
+# A new push to a pull request supersedes the run still in flight. Pushes to branches and tags
+# are never cancelled, as they are what feeds the release.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  RUST_VERSION: 1.97
+  BIN_NAME: "tunward"
+
+jobs:
+  # Runs alongside the build matrix, so a formatting or test failure is reported without
+  # waiting on the cross-compilation of every platform.
+  check:
+    name: Check - format, lint & tests
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Git repo
+        uses: actions/checkout@v4
+
+      - name: Install rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "${{ env.RUST_VERSION }}"
+          components: rustfmt, clippy
+
+      - name: Install taplo-cli and cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: taplo-cli,cargo-nextest
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check TOML formatting
+        run: taplo fmt --check
+
+      - name: Lint
+        run: cargo clippy --all --all-features --locked -- -D warnings
+
+      # Not --all-features: it turns on both `aws-lc-rs` and `ring`, which forward the two
+      # mutually exclusive crypto providers of jsonwebtoken, and the tests then panic at runtime.
+      # Each provider gets its own run instead, as they are compiled in, never side by side.
+      - name: Test with aws-lc-rs
+        run: cargo nextest run --locked
+
+      # What the armv7, armv6, freebsd and windows-x86 builds ship with.
+      - name: Test with ring
+        run: cargo nextest run --locked --no-default-features --features ring
+
+  build:
+    name: Build - ${{ matrix.platform.name }}
+    # By default, runs on Ubuntu, otherwise, override with the desired os
+    runs-on: ${{ matrix.platform.os || 'ubuntu-24.04' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Set platforms you want to build your binaries on
+        platform:
+          # Linux
+          - name: Linux x86_64
+            target: x86_64-unknown-linux-musl
+            build-args: "--release --features=jemalloc"
+
+          - name: Linux x86
+            target: i686-unknown-linux-musl
+            build-args: "--release --features aws-lc-rs-bindgen"
+
+          - name: Linux aarch64
+            target: aarch64-unknown-linux-musl
+            build-args: "--release --features=jemalloc -vv"
+          - name: Linux armv7hf
+            target: armv7-unknown-linux-musleabihf
+            build-args: "--release --no-default-features --features ring"
+
+          - name: Linux armv6
+            target: arm-unknown-linux-musleabihf
+            build-args: "--release --no-default-features --features ring"
+
+          - name: Freebsd x86_64
+            target: x86_64-unknown-freebsd
+            build-args: "--release --no-default-features --features ring --features=jemalloc"
+
+          - name: Freebsd x86
+            target: i686-unknown-freebsd
+            build-args: "--release --no-default-features --features ring"
+
+          - name: Android aarch64
+            target: aarch64-linux-android
+            build-args: "--release --features=jemalloc"
+
+          - name: Android armv7
+            target: armv7-linux-androideabi
+            build-args: "--release --no-default-features --features ring"
+
+          #- name: Linux mips
+          #  target: mips-unknown-linux-musl
+
+          #- name: Linux mips64
+          #  target: mips64-unknown-linux-muslabi64
+
+          # Mac OS
+          - name: MacOS x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            build-args: "--release --features=jemalloc"
+
+          - name: MacOS aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            build-args: "--release --features=jemalloc"
+
+          # - name: iOS x86_64
+          #   target: x86_64-apple-ios
+
+
+          #- name: iOS aarch64
+          #  target: aarch64-apple-ios
+
+
+          # Windows
+          - name: Windows x86_64
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+            build-args: "--profile release-with-symbols"
+
+          - name: Windows x86
+            os: windows-2022
+            target: i686-pc-windows-msvc
+            build-args: "--profile release-with-symbols --no-default-features --features ring"
+
+          - name: Windows aarch64
+            os: windows-2022
+            target: aarch64-pc-windows-msvc
+            build-args: "--profile release-with-symbols"
+
+    steps:
+
+      - name: Install package for linux
+        if: contains(matrix.platform.target, 'linux')
+        run: sudo apt install musl-tools
+
+      - name: Install package for Android
+        if: contains(matrix.platform.target, 'android')
+        run: sudo apt install android-libunwind android-libunwind-dev libunwind-dev
+
+      - name: Set up JDK 17
+        if: contains(matrix.platform.target, 'android')
+        uses: actions/setup-java@v3
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        if: contains(matrix.platform.target, 'android')
+        uses: android-actions/setup-android@v4
+
+      - name: Checkout Git repo
+        uses: actions/checkout@v3
+
+      # Linux & Windows
+      - name: Install rust toolchain for Linux
+        uses: actions-rs/toolchain@v1
+        with:
+          # We setup Rust toolchain and the desired target
+          profile: minimal
+          toolchain: "${{ env.RUST_VERSION }}"
+          override: true
+          target: ${{ matrix.platform.target }}
+          components: rustfmt, clippy
+
+      - name: Install package for Android
+        if: contains(matrix.platform.target, 'android')
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Install bindgen-cli
+        if: contains(matrix.platform.build-args, 'aws-lc-rs-bindgen')
+        run: cargo install bindgen-cli
+
+      - name: Show command used for Cargo
+        run: |
+          echo "cargo command is: ${{ env.CARGO }}"
+          echo "target flag is: ${{ env.BUILD_ARGS }}"
+
+      - name: Build ${{ matrix.platform.name }} binary
+        uses: actions-rs/cargo@v1
+        env: 
+          JEMALLOC_SYS_WITH_LG_PAGE: ${{ contains(matrix.platform.target, 'aarch64') && '14' || '12' }}
+        # We use cross-rs if not running on x86_64 architecture on Linux
+        with:
+          command: build
+          use-cross: ${{ (!contains(matrix.platform.target, 'x86_64') && !contains(matrix.platform.target, 'windows')) || contains(matrix.platform.target, 'freebsd') }}
+          args: ${{ matrix.platform.build-args }} --bin tunward --target ${{ matrix.platform.target }}
+
+      - name: Store artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # Finally, we store the binary as GitHub artifact for later usage
+          name: ${{ env.BIN_NAME }}-${{ matrix.platform.target }}
+          path: target/${{ matrix.platform.target }}/release${{ contains(matrix.platform.target, 'windows') && '-with-symbols' || '' }}/${{ env.BIN_NAME }}${{ contains(matrix.platform.target, 'windows') && '.exe' || '' }}
+          retention-days: 1
+
+  release:
+    name: Release
+    needs: [ build ]
+    # We run the release job only if a tag starts with 'v' letter
+    if: startsWith( github.ref, 'refs/tags/v' )
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Git repo
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      # Download all artifacts
+      - uses: actions/download-artifact@v4.1.7
+        with:
+          path: artifacts
+
+      - name: list artifacts
+        run: find artifacts/
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v5
+        with:
+          distribution: goreleaser
+          version: '~> v1'
+          args: release --clean --skip=validate
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}

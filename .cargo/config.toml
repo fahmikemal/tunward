@@ -1,0 +1,6 @@
+[build]
+rustflags = ["--cfg", "uuid_unstable"]
+
+#rustflags = ["-C", "linker=ld.lld", "-C", "relocation-model=static", "-C", "strip=symbols", "--cfg", "uuid_unstable"]
+
+#[build]

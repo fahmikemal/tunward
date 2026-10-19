@@ -1,0 +1,106 @@
+[package]
+name = "tunward"
+version = "11.0.0"
+edition = "2024"
+authors = ["Fahmi Kemal <fahmi@kemal.id>"]
+repository = "https://github.com/fahmikemal/tunward.git"
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+ahash = { version = "0.8.12", features = [] }
+anyhow = "1.0.104"
+base64 = "0.23.1"
+scopeguard = "1.2.0"
+
+bb8 = { version = "0.9.1", features = [] }
+bytes = { version = "1.12.1", features = [] }
+clap = { version = "4.6.7", features = ["derive", "env"], optional = true }
+fast-socks5 = { version = "1.0.0", features = [] }
+fastwebsockets = { version = "0.10.0", features = ["upgrade", "simd", "unstable-split"] }
+futures-util = { version = "0.3.34" }
+ppp = { version = "2.3.0", features = [] }
+async-channel = { version = "2.5.0", features = [] }
+arc-swap = { version = "1.9.2", features = [] }
+
+# For config file parsing
+regex = { version = "1.13.1", default-features = false, features = ["std", "perf"] }
+serde_regex = "1.2.0"
+serde_yaml = { version = "0.9.34", features = [] }
+ipnet = { version = "2.12.2", features = ["serde"] }
+
+hyper = { version = "1.11.1", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1.20", features = ["tokio", "server", "server-auto"] }
+http-body-util = { version = "0.1.5" }
+jsonwebtoken = { version = "11.1.0", default-features = false }
+log = "0.4.34"
+nix = { version = "0.31.3", features = ["socket", "net", "uio"] }
+parking_lot = "0.12.5"
+pin-project = "1"
+notify = { version = "8.2.0", features = [] }
+httparse = { version = "1.10.1", features = [] }
+
+rustls-native-certs = { version = "0.8.4", features = [] }
+rustls-pemfile = { version = "2.2.0", features = [] }
+# WebTransport (HTTP/3 over QUIC) transport. Takes our own rustls config, so the
+# crypto provider follows from the aws-lc-rs/ring features below. Re-exports quinn.
+# Its default feature is aws-lc-rs, which would pull aws-lc-sys into the ring builds.
+web-transport-quinn = { version = "0.12.1", default-features = false, features = [] }
+x509-parser = "0.18.1"
+serde = { version = "1.0.229", features = ["derive"] }
+socket2 = { version = "0.6.5", features = ["all"] }
+tokio = { version = "1.53.1", features = ["io-std", "net", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1.19", features = ["net"] }
+
+tracing = { version = "0.1.44", features = ["log"] }
+url = "2.5.8"
+urlencoding = "2.1.3"
+uuid = { version = "1.26.1", features = ["v7", "serde"] }
+derive_more = { version = "2.1.1", features = ["display", "error"] }
+# Already compiled in the tree (hickory-resolver -> prefix-trie); declared directly for the
+# connection pool, whose connection is either a TCP stream or a webtransport session.
+either = { version = "1.18.0", default-features = false, features = ["use_std"] }
+
+tokio-rustls = { version = "0.26.5", default-features = false, features = ["logging", "tls12"] }
+rcgen = { version = "0.14.10", default-features = false, features = [] }
+# Already compiled in the tree (rcgen, x509-parser -> asn1-rs, which also turns on `std`);
+# declared directly so embedded_certificate can read the current year.
+time = { version = "0.3.55", default-features = false, features = ["std"] }
+hickory-resolver = { version = "0.26.3", default-features = false, features = ["system-config", "tokio"] }
+aws-lc-rs = { version = "*", optional = true }
+
+[target.'cfg(not(target_family = "unix"))'.dependencies]
+crossterm = { version = "0.29.0" }
+tokio-util = { version = "0.7.19", features = ["io"] }
+
+[target.'cfg(target_family = "unix")'.dependencies]
+tokio-fd = "0.3.0"
+
+[dev-dependencies]
+testcontainers = "0.28.0"
+test-case = "3.3.1"
+collection_macros = "0.2.0"
+rstest = "0.27.0"
+serial_test = "4.0.1"
+derive_more = { version = "2.1.1", features = ["from"] }
+get_if_addrs = "0.5.3"
+
+[features]
+default = ["aws-lc-rs"]
+clap = ["dep:clap"]
+aws-lc-rs = [
+  "tokio-rustls/aws-lc-rs",
+  "rcgen/aws_lc_rs",
+  "hickory-resolver/tls-aws-lc-rs",
+  "hickory-resolver/https-aws-lc-rs",
+  "jsonwebtoken/aws_lc_rs",
+  "web-transport-quinn/aws-lc-rs",
+]
+aws-lc-rs-bindgen = ["dep:aws-lc-rs", "aws-lc-rs/bindgen"]
+ring = [
+  "tokio-rustls/ring",
+  "rcgen/ring",
+  "hickory-resolver/tls-ring",
+  "hickory-resolver/https-ring",
+  "jsonwebtoken/rust_crypto",
+  "web-transport-quinn/ring",
+]

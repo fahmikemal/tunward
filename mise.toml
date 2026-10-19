@@ -1,0 +1,69 @@
+[tools]
+#docker-cli = "latest"
+#rust = "1.93"
+
+[tasks.test]
+description = "Run all the tests. Requires docker"
+# Not --all-features: it turns on both `aws-lc-rs` and `ring`, which forward the two mutually
+# exclusive crypto providers of jsonwebtoken, and the tests then panic at runtime.
+run = "cargo nextest run"
+
+[tasks.bump-deps]
+description = "Upgrade all libs versions for all packages"
+run = """
+  cargo upgrade --recursive true --incompatible allow
+  cargo update --recursive
+"""
+
+[tasks.linter-fix]
+description = "Fix linter issues when possible and format code"
+run = """
+   cargo clippy --fix --all-features --locked --allow-dirty
+   cargo fmt --all
+"""
+
+[tasks.docker-release]
+description = "Build and push tunward docker image"
+usage = '''
+arg "image_tag" "tag of the image"
+'''
+run = """
+ docker buildx create  --name builder  --driver=kubernetes --platform=linux/arm64   '--driver-opt="nodeselector=kubernetes.io/arch=arm64","tolerations=key=kubernetes.io/hostname,value=server","requests.cpu=16","requests.memory=16G"' --node=build-arm64
+ docker buildx create --append --name builder  --driver=kubernetes --platform=linux/amd64   '--driver-opt="nodeselector=kubernetes.io/arch=amd64","tolerations=key=kubernetes.io/hostname,value=toybox","requests.cpu=16","requests.memory=16G"' --node=build-amd64
+ docker buildx use builder
+ docker buildx build \
+   --platform linux/arm/v7,linux/arm64,linux/amd64 \
+   --cache-from type=registry,ref=ghcr.io/fahmikemal/tunward:cache \
+   --cache-to type=registry,mode=max,image-manifest=true,oci-mediatypes=true,ref=ghcr.io/fahmikemal/tunward:cache \
+   -t ghcr.io/fahmikemal/tunward:$usage_image_tag \
+   -t ghcr.io/fahmikemal/tunward:latest \
+   --push .
+ docker buildx rm builder
+"""
+
+[tasks.publish-release]
+description = "Push a new release of tunward"
+usage = '''
+arg "version" "version of tunward to release"
+flag "-f --force" default=""
+'''
+run = """
+if [ '$usage_force' = 'true' ]; then
+  export FORCE="-f"
+fi
+
+sed -i 's/^version = .*/version = "$usage_version"/g' tunward-cli/Cargo.toml tunward/Cargo.toml
+cargo fmt --all -- --check --color=always || (echo "Use cargo fmt to format your code"; exit 1)
+#cargo clippy --all -- -D warnings || (echo "Solve your clippy warnings to succeed"; exit 1)
+
+git add tunward/Cargo.* tunward-cli/Cargo.* Cargo.*
+git commit -m 'Bump version v'$usage_version
+git tag $FORCE v$usage_version -m 'version v'$usage_version
+git push $FORCE
+git push $FORCE origin v$usage_version
+"""
+
+[tasks.bench]
+description = "End-to-end benchmark with iperf3 (throughput, cpu, memory). See docs/BENCHMARKING.md"
+usage = 'flag "--args <args>" help="passed through to scripts/bench.sh"'
+run = "./scripts/bench.sh $usage_args"
