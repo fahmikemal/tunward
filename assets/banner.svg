@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 280" width="100%" height="100%">
+  <!-- Background -->
+  <rect width="880" height="280" rx="20" fill="#0B0C0E" />
+
+  <!-- Logomark (Option 02: The Data Tunnel) -->
+  <g transform="translate(172, 140) scale(0.82)">
+    <!-- Left Tunnel Bracket (Electric Blue) -->
+    <polygon points="-16,-102 -64,-102 -123,0 -64,102 -16,102 -30,78 -50,78 -95,0 -50,-78 -30,-78" fill="#2573FA" />
+
+    <!-- Right Tunnel Bracket (Stark White) -->
+    <polygon points="16,-102 64,-102 123,0 64,102 16,102 30,78 50,78 95,0 50,-78 30,-78" fill="#FFFFFF" />
+
+    <!-- Top Protocol Stream (White) -->
+    <polygon points="-55,-27 -42,-49 42,-49 55,-27" fill="#FFFFFF" />
+
+    <!-- Center Protocol Stream (Electric Blue) -->
+    <polygon points="-71,0 -64.5,-11 64.5,-11 71,0 64.5,11 -64.5,11" fill="#2573FA" />
+
+    <!-- Bottom Protocol Stream (White) -->
+    <polygon points="-55,27 55,27 42,49 -42,49" fill="#FFFFFF" />
+  </g>
+
+  <!-- Wordmark -->
+  <text x="312" y="128" fill="#FFFFFF" font-family="Inter, -apple-system, BlinkMacSystemFont, &#39;Segoe UI&#39;, Roboto, Helvetica, Arial, sans-serif" font-size="96" font-weight="800" letter-spacing="-2.5">tunward</text>
+
+  <!-- 2-Line Tagline -->
+  <text x="315" y="176" fill="#8492A6" font-family="Inter, -apple-system, BlinkMacSystemFont, &#39;Segoe UI&#39;, Roboto, Helvetica, Arial, sans-serif" font-size="24" font-weight="400">Fast and secure TCP/UDP tunneling over</text>
+  <text x="315" y="210" fill="#8492A6" font-family="Inter, -apple-system, BlinkMacSystemFont, &#39;Segoe UI&#39;, Roboto, Helvetica, Arial, sans-serif" font-size="24" font-weight="400">WS, HTTP/2, and WebTransport (Rust)</text>
+</svg>

@@ -1,10 +1,12 @@
-# Tunward
+<p align="center">
+  <img src="assets/banner.svg" alt="Tunward Banner" width="100%" />
+</p>
 
-Fast and secure reverse and forward tunneling over WebSocket, HTTP/2, and WebTransport (QUIC), written in Rust.
-
-[![CI](https://github.com/fahmikemal/tunward/actions/workflows/ci.yaml/badge.svg)](https://github.com/fahmikemal/tunward/actions/workflows/ci.yaml)
-[![Release](https://github.com/fahmikemal/tunward/actions/workflows/release.yaml/badge.svg)](https://github.com/fahmikemal/tunward/actions/workflows/release.yaml)
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+<p align="center">
+  <a href="https://github.com/fahmikemal/tunward/actions/workflows/ci.yaml"><img src="https://github.com/fahmikemal/tunward/actions/workflows/ci.yaml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/fahmikemal/tunward/actions/workflows/release.yaml"><img src="https://github.com/fahmikemal/tunward/actions/workflows/release.yaml/badge.svg" alt="Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
+</p>
 
 ---
 
