@@ -95,7 +95,13 @@ impl<T: DownstreamListener> ReverseTunnelServer<T> {
                     }
                 });
 
-                let mut timer = time::interval(idle_timeout);
+                let is_ephemeral = bind_addr.port() == 0;
+                let check_interval = if is_ephemeral {
+                    Duration::from_secs(5).min(idle_timeout)
+                } else {
+                    idle_timeout
+                };
+                let mut timer = time::interval(check_interval);
                 pin_mut!(listening_server);
                 loop {
                     select! {
@@ -119,11 +125,10 @@ impl<T: DownstreamListener> ReverseTunnelServer<T> {
                             }
                         },
                         _ = timer.tick() => {
-
                             // if no client connected to the reverse tunnel server, close it
                             // <= 1 because the server itself has a receiver
-                            if seen_clients.swap(0, Ordering::Relaxed) == 0 && tx.receiver_count() <= 1 {
-                                info!("No client connected to reverse tunnel server for {}s. Closing reverse tunnel server", idle_timeout.as_secs());
+                            if tx.receiver_count() <= 1 && (is_ephemeral || seen_clients.swap(0, Ordering::Relaxed) == 0) {
+                                info!("No active client connected to reverse tunnel server on {}. Closing reverse listener.", actual_bind_addr);
                                 break;
                             }
                         },
