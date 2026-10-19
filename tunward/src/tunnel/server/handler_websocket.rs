@@ -34,9 +34,14 @@ pub(super) async fn ws_server_upgrade(
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
 
-    if let (Some(id), Some(reg)) = (&client_id, &server.fleet_registry) {
+    let client_guard = if let (Some(id), Some(reg)) = (&client_id, &server.fleet_registry) {
         reg.register_client(id.clone(), client_addr);
-    }
+        Some(scopeguard::guard((id.clone(), reg.clone()), |(id, reg)| {
+            reg.unregister_client(&id);
+        }))
+    } else {
+        None
+    };
 
     let mask_frame = server.config.websocket_mask_frame;
     let (remote_addr, local_rx, local_tx, need_cookie) = match server
@@ -45,9 +50,6 @@ pub(super) async fn ws_server_upgrade(
     {
         Ok(ret) => ret,
         Err(err) => {
-            if let (Some(id), Some(reg)) = (&client_id, &server.fleet_registry) {
-                reg.unregister_client(id);
-            }
             return err;
         }
     };
@@ -56,12 +58,13 @@ pub(super) async fn ws_server_upgrade(
         Ok(ret) => ret,
         Err(err) => {
             warn!("Rejecting connection with bad upgrade request: {} {}", err, req.uri());
-            if let (Some(id), Some(reg)) = (&client_id, &server.fleet_registry) {
-                reg.unregister_client(id);
-            }
             return bad_request();
         }
     };
+
+    if let Some(guard) = client_guard {
+        scopeguard::ScopeGuard::into_inner(guard);
+    }
 
     let executor = server.executor.clone();
     let client_id_cleanup = client_id;

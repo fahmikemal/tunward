@@ -150,10 +150,16 @@ impl<E: crate::TokioExecutorRef> Server<E> {
         })?;
         info!("Tunnel accepted due to matched restriction: {}", restriction.name);
 
+        let client_id = req
+            .headers()
+            .get("x-client-id")
+            .or_else(|| req.headers().get("x-device-id"))
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
+
         let req_protocol = remote.protocol.clone();
-        let was_ephemeral_reverse = req_protocol.is_reverse_tunnel() && remote.port == 0;
         let tunnel = self
-            .exec_tunnel(restriction, remote, client_addr)
+            .exec_tunnel(restriction, remote, client_addr, client_id)
             .await
             .map_err(|err| {
                 warn!("Rejecting connection with bad upgrade request: {err} {}", req.uri());
@@ -161,8 +167,7 @@ impl<E: crate::TokioExecutorRef> Server<E> {
             })?;
 
         let (remote_addr, local_rx, local_tx) = tunnel;
-        let inject_cookie =
-            req_protocol.is_dynamic_reverse_tunnel() || (was_ephemeral_reverse && remote_addr.port != 0);
+        let inject_cookie = req_protocol.is_dynamic_reverse_tunnel();
         info!("connected to {:?} {}:{}", req_protocol, remote_addr.host, remote_addr.port);
         Ok((remote_addr, local_rx, local_tx, inject_cookie))
     }
@@ -172,6 +177,7 @@ impl<E: crate::TokioExecutorRef> Server<E> {
         restriction: &RestrictionConfig,
         remote: RemoteAddr,
         client_address: SocketAddr,
+        client_id: Option<String>,
     ) -> anyhow::Result<(RemoteAddr, Pin<Box<dyn AsyncRead + Send>>, Pin<Box<dyn AsyncWrite + Send>>)> {
         match remote.protocol {
             LocalProtocol::Udp { timeout, .. } => {
@@ -236,9 +242,20 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                 let remote_port = find_mapped_port(remote.port, restriction);
                 let local_srv = (remote.host, remote_port);
                 let bind = try_to_sock_addr(local_srv.clone())?;
-                let listening_server = async {
+                let reg = self.fleet_registry.clone();
+                let cid = client_id.clone();
+                let listening_server = async move {
                     let l = TcpDownstreamListener::new(bind, local_srv.clone(), false).await?;
                     let bound = l.bound_addr();
+                    if let Some(r) = &reg {
+                        r.register_session(
+                            bound.port().to_string(),
+                            cid.unwrap_or_else(|| "anonymous".to_string()),
+                            bound.port(),
+                            bound,
+                            remote_port,
+                        );
+                    }
                     Ok((l, bound))
                 };
                 let ((local_rx, local_tx), remote) = SERVERS
@@ -247,6 +264,7 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                         bind,
                         self.config.remote_server_idle_timeout,
                         listening_server,
+                        self.fleet_registry.clone(),
                     )
                     .await?;
 
@@ -269,6 +287,7 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                         bind,
                         self.config.remote_server_idle_timeout,
                         listening_server,
+                        self.fleet_registry.clone(),
                     )
                     .await?;
                 Ok((remote, Box::pin(local_rx), Box::pin(local_tx)))
@@ -290,6 +309,7 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                         bind,
                         self.config.remote_server_idle_timeout,
                         listening_server,
+                        self.fleet_registry.clone(),
                     )
                     .await?;
 
@@ -320,6 +340,7 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                         bind,
                         self.config.remote_server_idle_timeout,
                         listening_server,
+                        self.fleet_registry.clone(),
                     )
                     .await?;
 
@@ -350,6 +371,7 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                         bind,
                         self.config.remote_server_idle_timeout,
                         listening_server,
+                        self.fleet_registry.clone(),
                     )
                     .await?;
 

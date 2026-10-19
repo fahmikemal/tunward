@@ -12,6 +12,8 @@ pub struct ClientRecord {
     pub connected_at: u64,
     pub last_seen_at: u64,
     pub active_tunnels: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assigned_port: Option<u16>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -74,7 +76,15 @@ impl FleetRegistry {
                 connected_at: now,
                 last_seen_at: now,
                 active_tunnels: 1,
+                assigned_port: None,
             });
+    }
+
+    pub fn set_client_assigned_port(&self, id: &str, port: u16) {
+        let mut clients = self.clients.write();
+        if let Some(entry) = clients.get_mut(id) {
+            entry.assigned_port = Some(port);
+        }
     }
 
     pub fn unregister_client(&self, id: &str) {
@@ -111,6 +121,7 @@ impl FleetRegistry {
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        self.set_client_assigned_port(&client_id, assigned_port);
         self.add_session(SessionRecord {
             session_id,
             client_id,

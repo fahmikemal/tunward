@@ -61,6 +61,7 @@ impl<T: DownstreamListener> ReverseTunnelServer<T> {
         bind_addr: SocketAddr,
         idle_timeout: Duration,
         gen_listening_server: impl Future<Output = anyhow::Result<(T, SocketAddr)>>,
+        fleet_registry: Option<crate::management::FleetRegistry>,
     ) -> anyhow::Result<(
         (<T as DownstreamListener>::Reader, <T as DownstreamListener>::Writer),
         RemoteAddr,
@@ -84,10 +85,14 @@ impl<T: DownstreamListener> ReverseTunnelServer<T> {
             let nb_seen_clients = Arc::new(AtomicUsize::new(0));
             let seen_clients = nb_seen_clients.clone();
             let server = self.servers.clone();
+            let fleet_reg_cleanup = fleet_registry;
 
             let fut = async move {
                 scopeguard::defer!({
                     server.lock().remove(&actual_bind_addr);
+                    if let Some(reg) = &fleet_reg_cleanup {
+                        reg.remove_session(&actual_bind_addr.port().to_string());
+                    }
                 });
 
                 let mut timer = time::interval(idle_timeout);
