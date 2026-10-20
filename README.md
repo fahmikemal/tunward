@@ -22,6 +22,11 @@ Tunward encapsulates network traffic inside standard WebSocket, HTTP/2, or WebTr
 - **Static Forward Tunneling (`-L`):** Forward local ports to remote services (TCP, UDP, Unix sockets, Stdio).
 - **Dynamic Forward Tunneling (`-L`):** Run local SOCKS5 proxies, HTTP CONNECT proxies, or transparent TProxy (Linux).
 - **Reverse Tunneling (`-R`):** Expose local ports and services through the remote server (TCP, UDP, SOCKS5, HTTP proxy, Unix socket).
+- **Dynamic Ephemeral Port Allocation:** Request port `0` (`-R tcp://0:localhost:PORT`) to let the server kernel dynamically allocate available high ports, eliminating port collisions in multi-device deployments.
+- **Enterprise Fleet Registry & REST API:** Built-in management API (`--management-api`) exposing real-time device health, active client sessions, and tunnel mappings via JSON endpoints.
+- **Client Identity & Handshake:** Tag edge devices with persistent identifiers (`--client-id`) indexed in the fleet registry for O(1) device lookup.
+- **Anti-Thundering Herd Reconnection:** Full jitter exponential backoff on client reconnect loops, preventing network saturation during gateway restarts across large device fleets.
+- **RAII Listener Fast-Reclaim:** Automatically tears down server listening ports immediately upon client disconnection, preventing port leakage or binding conflicts.
 - **Authentication and Hardening:** Path prefix token verification, mutual TLS (mTLS) with live certificate reloading, and granular destination allowlists (`--restrict-to`, `restrictions.yaml`).
 - **Stealth and Evasion:** Custom SNI overrides, Encrypted Client Hello (ECH), and proxy protocol support.
 - **Single Static Binary:** Self-contained with zero runtime dependencies across Linux, macOS, Windows, Android, and FreeBSD.
@@ -170,6 +175,43 @@ tunward client -L socks5://127.0.0.1:1080 wts://server.example.com:8080
 
 ---
 
+### 7. Enterprise Fleet Management and Ephemeral Reverse Tunnels
+
+Manage fleets of IoT, POS, or MDM Android edge devices behind NAT with zero manual port management:
+
+**On your central gateway server:**
+```bash
+tunward server --management-api 127.0.0.1:8081 ws://0.0.0.0:8080
+```
+
+**On the edge client (requesting dynamic port `0` and reporting identity):**
+```bash
+tunward client \
+    --client-id "kiosk-tablet-01" \
+    -R tcp://0:localhost:5555 \
+    ws://gateway.example.com:8080
+```
+
+The gateway kernel dynamically assigns an available high port (e.g., `38491`), registers the mapping, and exposes it over the local REST API:
+
+```bash
+# Query health status and fleet counters
+curl -s http://127.0.0.1:8081/healthz | jq .
+
+# List all active fleet devices and their assigned ports
+curl -s http://127.0.0.1:8081/api/v1/clients | jq .
+
+# Inspect a specific client session
+curl -s http://127.0.0.1:8081/api/v1/clients/kiosk-tablet-01 | jq .
+
+# List all active reverse tunnel sessions
+curl -s http://127.0.0.1:8081/api/v1/sessions | jq .
+```
+
+When a device disconnects or restarts, its listening port is immediately reclaimed (RAII fast-reclaim) without port leakage or orphaned listeners.
+
+---
+
 ## CLI Reference
 
 ### Client Syntax
@@ -181,10 +223,13 @@ Usage: tunward client [OPTIONS] <ws[s]|http[s]|wts://server[:port]>
 | Option | Description |
 | :--- | :--- |
 | `-L, --local-to-remote <SPEC>` | Forward local listener to remote target (`tcp://`, `udp://`, `socks5://`, `http://`, `stdio://`, `unix://`). |
-| `-R, --remote-to-local <SPEC>` | Listen on server and forward incoming traffic to local machine. |
+| `-R, --remote-to-local <SPEC>` | Listen on server and forward incoming traffic to local machine. Port `0` enables dynamic ephemeral allocation (`-R tcp://0:localhost:PORT`). |
+| `--client-id, --device-id <STRING>` | Unique device or client identifier sent during handshake for fleet registry tracking. |
 | `-p, --http-proxy <URL>` | Connect to server through an intermediate HTTP CONNECT proxy. |
 | `-P, --http-upgrade-path-prefix <TOKEN>` | Custom path prefix used during upgrade request (authentication secret). |
 | `-c, --connection-min-idle <INT>` | Maintain idle connection pool to accelerate tunnel setup. |
+| `--retry-initial-delay <DUR>` | Initial backoff delay for client auto-reconnection (default: `1s`). |
+| `--retry-max-delay <DUR>` | Maximum backoff delay for client auto-reconnection (default: `30s`). |
 | `--tls-verify-certificate` | Enable strict TLS certificate validation (off by default for self-signed setups). |
 | `--tls-certificate / --tls-private-key` | Client certificate and key for mutual TLS (mTLS) authentication. |
 | `--tls-sni-override <DOMAIN>` | Override SNI hostname during TLS handshake. |
@@ -198,6 +243,7 @@ Usage: tunward server [OPTIONS] <ws[s]|wts://0.0.0.0[:port]>
 
 | Option | Description |
 | :--- | :--- |
+| `--management-api <IP:PORT>` | Enable local REST management API (e.g. `127.0.0.1:8081`) exposing `/healthz`, `/api/v1/clients`, and `/api/v1/sessions`. |
 | `--enable-webtransport` | Also listen on UDP for WebTransport (HTTP/3) clients on the same port. |
 | `-r, --restrict-http-upgrade-path-prefix <TOKEN>` | Require matching path prefix secret before accepting tunnels. |
 | `--restrict-to <HOST:PORT>` | Restrict destinations clients are allowed to connect to. |
@@ -205,6 +251,7 @@ Usage: tunward server [OPTIONS] <ws[s]|wts://0.0.0.0[:port]>
 | `--tls-certificate / --tls-private-key` | Custom TLS certificates (auto-reloads on file change). |
 | `--tls-client-ca-certs <FILE>` | CA bundle to enforce mTLS client certificate verification. |
 | `--websocket-ping-frequency <DUR>` | Keepalive ping interval (default: `30s`). |
+| `--log-lvl <LEVEL>` | Set log verbosity (`TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR`, `OFF`). |
 
 ---
 
