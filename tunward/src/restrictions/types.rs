@@ -6,11 +6,13 @@ use std::collections::HashMap;
 use std::ops::RangeInclusive;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RestrictionsRules {
     pub restrictions: Vec<RestrictionConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RestrictionConfig {
     pub name: String,
     #[serde(deserialize_with = "deserialize_non_empty_vec")]
@@ -35,6 +37,7 @@ pub enum AllowConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AllowTunnelConfig {
     #[serde(default)]
     pub protocol: Vec<TunnelProtocol>,
@@ -52,6 +55,7 @@ pub struct AllowTunnelConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AllowReverseTunnelConfig {
     #[serde(default)]
     pub protocol: Vec<ReverseTunnelProtocol>,
@@ -106,10 +110,13 @@ where
         .into_iter()
         .map(|s| {
             let range: Result<RangeInclusive<u16>, D::Error> = if let Some((l, r)) = s.split_once("..") {
-                Ok(RangeInclusive::new(
-                    l.parse().map_err(<D::Error as serde::de::Error>::custom)?,
-                    r.parse().map_err(<D::Error as serde::de::Error>::custom)?,
-                ))
+                let start = l.parse().map_err(<D::Error as serde::de::Error>::custom)?;
+                let end = r.parse().map_err(<D::Error as serde::de::Error>::custom)?;
+                if start > end {
+                    Err(serde::de::Error::custom("Port range start must not exceed its end"))
+                } else {
+                    Ok(RangeInclusive::new(start, end))
+                }
             } else {
                 let port = s.parse::<u16>().map_err(serde::de::Error::custom)?;
                 Ok(RangeInclusive::new(port, port))

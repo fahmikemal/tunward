@@ -2,7 +2,6 @@ use anyhow::{Context, anyhow};
 use std::fs::File;
 use tokio_rustls::rustls::client::{EchConfig, EchMode};
 
-use log::warn;
 use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
@@ -77,18 +76,14 @@ pub fn load_certificates_from_pem(path: &Path) -> anyhow::Result<Vec<Certificate
 
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
-    let certs = rustls_pemfile::certs(&mut reader);
-
-    Ok(certs
-        .into_iter()
-        .filter_map(|cert| match cert {
-            Ok(cert) => Some(cert),
-            Err(err) => {
-                warn!("Error while parsing tls certificate: {err:?}");
-                None
-            }
-        })
-        .collect())
+    let certs = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
+    anyhow::ensure!(!certs.is_empty(), "No certificates found in {}", path.display());
+    for cert in &certs {
+        let (remaining, _) = x509_parser::parse_x509_certificate(cert.as_ref())
+            .map_err(|_| anyhow!("Invalid X.509 certificate in {}", path.display()))?;
+        anyhow::ensure!(remaining.is_empty(), "Trailing certificate data in {}", path.display());
+    }
+    Ok(certs)
 }
 
 pub fn load_private_key_from_file(path: &Path) -> anyhow::Result<PrivateKeyDer<'static>> {
@@ -164,14 +159,37 @@ fn client_cert_verifier(tls_cfg: &TlsServerConfig) -> anyhow::Result<Arc<dyn Cli
         .map_err(|err| anyhow!("Failed to build mTLS client verifier: {err:?}"))
 }
 
-pub fn tls_acceptor(tls_cfg: &TlsServerConfig, alpn_protocols: Option<Vec<Vec<u8>>>) -> anyhow::Result<TlsAcceptor> {
-    let client_cert_verifier = client_cert_verifier(tls_cfg)?;
-
-    let mut config = rustls::ServerConfig::builder()
-        .with_client_cert_verifier(client_cert_verifier)
+fn server_tls_config(tls_cfg: &TlsServerConfig, quic: bool) -> anyhow::Result<rustls::ServerConfig> {
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .ok_or_else(|| anyhow!("No default crypto provider installed for rustls"))?
+        .clone();
+    let builder = rustls::ServerConfig::builder_with_provider(provider);
+    let builder = if quic {
+        builder.with_protocol_versions(&[&rustls::version::TLS13])
+    } else {
+        builder.with_safe_default_protocol_versions()
+    }?;
+    let mut config = builder
+        .with_client_cert_verifier(client_cert_verifier(tls_cfg)?)
         .with_single_cert(tls_cfg.tls_certificate.lock().clone(), tls_cfg.tls_key.lock().clone_key())
         .with_context(|| "invalid tls certificate or private key")?;
+    if quic {
+        config.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
+    }
+    Ok(config)
+}
 
+pub(crate) fn validate_server_config(tls_cfg: &TlsServerConfig, webtransport: bool) -> anyhow::Result<()> {
+    // KeyLogFile::new opens SSLKEYLOGFILE, so validation uses the builders without a key logger.
+    server_tls_config(tls_cfg, false)?;
+    if webtransport {
+        server_tls_config(tls_cfg, true)?;
+    }
+    Ok(())
+}
+
+pub fn tls_acceptor(tls_cfg: &TlsServerConfig, alpn_protocols: Option<Vec<Vec<u8>>>) -> anyhow::Result<TlsAcceptor> {
+    let mut config = server_tls_config(tls_cfg, false)?;
     config.key_log = Arc::new(KeyLogFile::new());
     if let Some(alpn_protocols) = alpn_protocols {
         config.alpn_protocols = alpn_protocols;
@@ -185,20 +203,8 @@ pub fn tls_acceptor(tls_cfg: &TlsServerConfig, alpn_protocols: Option<Vec<Vec<u8
 /// [`tls_acceptor`]'s config, which allows TLS 1.2 and advertises `h2`/`http/1.1`. The mTLS
 /// client verifier and certificate material are shared with the TCP path.
 pub fn quic_server_config(tls_cfg: &TlsServerConfig) -> anyhow::Result<rustls::ServerConfig> {
-    let crypto_provider = rustls::crypto::CryptoProvider::get_default()
-        .ok_or_else(|| anyhow!("No default crypto provider installed for rustls"))?
-        .clone();
-
-    let mut config = rustls::ServerConfig::builder_with_provider(crypto_provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .with_context(|| "QUIC requires TLS 1.3 support")?
-        .with_client_cert_verifier(client_cert_verifier(tls_cfg)?)
-        .with_single_cert(tls_cfg.tls_certificate.lock().clone(), tls_cfg.tls_key.lock().clone_key())
-        .with_context(|| "invalid tls certificate or private key")?;
-
+    let mut config = server_tls_config(tls_cfg, true)?;
     config.key_log = Arc::new(KeyLogFile::new());
-    config.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
-
     Ok(config)
 }
 

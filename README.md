@@ -62,6 +62,46 @@ Windows, Android, and FreeBSD build targets. Check the actual assets on the
 binary. A matrix entry does not establish runtime qualification on that platform.
 Privileged TProxy is Linux-specific, and Unix sockets require an appropriate OS.
 
+## Check server configuration
+
+Add `-t` (or `--test-config`) to the same server command you intend to run:
+
+~~~sh
+tunward server -t \
+  --tls-certificate /etc/tunward/tls/server.pem \
+  --tls-private-key /etc/tunward/tls/server.key \
+  --tls-client-ca-certs /etc/tunward/tls/client-ca.pem \
+  --restrict-config /etc/tunward/restrictions.yaml \
+  --tenant-config /etc/tunward/tenants.yaml \
+  --device-quota-config /etc/tunward/quotas.yaml \
+  --device-revocation-config /etc/tunward/revocations.yaml \
+  wts://0.0.0.0:8443
+~~~
+
+Success prints `tunward: configuration test is successful` to stderr and exits
+with code `0`. Invalid configuration exits with code `1`; CLI usage errors exit
+with code `2`. The check reads the selected YAML/PEM files, validates policy
+values and tenant/role/restriction references, checks the certificate/key match
+and client trust bundle, and checks TLS/mTLS and transport prerequisites.
+Restriction YAML rejects unknown fields and descending port ranges. These same
+checks apply at server startup; correct previously ignored field typos before upgrading.
+
+Run it as the service user, with the intended arguments, environment and file
+permissions. It does not bind ports, resolve addresses, contact peers, start
+watchers, create an inventory database, or write TLS key logs. It can run while
+the existing server continues serving connections. It does not apply changes or
+prove port availability, inventory writability/schema compatibility, DNS/network
+reachability, certificate expiry/hostname/issuer trust, or production readiness.
+Use the [certificate lifecycle checker](docs/DEPLOYMENT.md#validate-certificates-before-activation)
+for certificate deployment checks. Omitting server identity files still permits
+the development self-signed fallback; a successful check does not make it trusted.
+
+This validates the files supplied through existing server options; there is no
+unified `-c` configuration file. Full graceful configuration reload remains
+pending: quota/tenant/startup changes still need a restart. Validation reads files
+at that moment; keep candidates immutable until activation. See the
+[deployment procedure](docs/DEPLOYMENT.md).
+
 ## Containers
 
 The product [Dockerfile](Dockerfile) builds a Debian runtime image with a non-root

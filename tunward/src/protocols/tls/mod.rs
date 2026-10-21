@@ -1,4 +1,5 @@
 mod server;
+pub(crate) use server::validate_server_config;
 mod utils;
 
 pub use server::connect;

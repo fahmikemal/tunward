@@ -6,11 +6,13 @@ mod protocols;
 pub mod quotas;
 mod restrictions;
 mod revocation;
+mod server_config;
 mod somark;
 mod tenants;
 #[cfg(test)]
 mod test_integrations;
 pub mod tunnel;
+pub use server_config::check_server_config;
 
 pub use management::{
     ClientRecord, ConnectionRecord, DevicePage, DeviceRecord, FleetRegistry, HealthStats, SessionRecord,
@@ -20,7 +22,6 @@ use crate::config::{ClientCreationRequest, DEFAULT_CLIENT_UPGRADE_PATH_PREFIX, S
 use crate::executor::{TokioExecutor, TokioExecutorRef};
 use crate::protocols::dns::DnsResolver;
 use crate::protocols::tls;
-use crate::restrictions::types::RestrictionsRules;
 use crate::somark::SoMark;
 pub use crate::tunnel::LocalProtocol;
 pub use crate::tunnel::client::{Client, ClientConfig, TlsClientConfig};
@@ -28,7 +29,7 @@ use crate::tunnel::downstream_listeners::{
     HttpProxyDownstreamListener, Socks5DownstreamListener, TcpDownstreamListener, UdpDownstreamListener,
     new_stdio_listener,
 };
-use crate::tunnel::server::{Server, ServerConfig, TlsServerConfig};
+use crate::tunnel::server::{Server, ServerConfig};
 use crate::tunnel::transport::webtransport::WebTransportEndpoint;
 use crate::tunnel::transport::{TransportAddr, TransportScheme};
 use crate::tunnel::upstream_connectors::{Socks5UpstreamConnector, TcpUpstreamConnector, UdpUpstreamConnector};
@@ -38,7 +39,7 @@ use futures_util::future::BoxFuture;
 use hyper::header::HOST;
 use hyper::http::HeaderValue;
 use log::debug;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -510,72 +511,20 @@ pub async fn run_server(args: ServerCreationRequest, executor: impl TokioExecuto
 }
 
 async fn run_server_impl(args: ServerCreationRequest, executor: impl TokioExecutorRef) -> anyhow::Result<()> {
-    let device_quotas = args
-        .device_quota_config
-        .as_deref()
-        .map(crate::quotas::DeviceQuotaConfig::from_path)
-        .transpose()?;
-    // wts:// binds TLS on TCP exactly like wss://, and additionally serves webtransport over UDP.
+    let server_config::ServerConfigFiles {
+        tls: tls_config,
+        restrictions,
+        device_quotas,
+        http_proxy,
+    } = server_config::load_server_files(&args)?;
     let is_webtransport = args.remote_addr.scheme() == "wts";
-    let tls_config = if args.remote_addr.scheme() == "wss" || is_webtransport {
-        let tls_certificate = if let Some(cert_path) = &args.tls_certificate {
-            tls::load_certificates_from_pem(cert_path).expect("Cannot load tls certificate")
-        } else {
-            embedded_certificate::TLS_CERTIFICATE.0.clone()
-        };
-
-        let tls_key = if let Some(key_path) = &args.tls_private_key {
-            tls::load_private_key_from_file(key_path).expect("Cannot load tls private key")
-        } else {
-            embedded_certificate::TLS_CERTIFICATE.1.clone_key()
-        };
-
-        let tls_client_ca_certificates = args.tls_client_ca_certs.as_ref().map(|tls_client_ca| {
-            Mutex::new(
-                tls::load_certificates_from_pem(tls_client_ca).expect("Cannot load client CA certificate (mTLS)"),
-            )
-        });
-
-        Some(TlsServerConfig {
-            tls_certificate: Mutex::new(tls_certificate),
-            tls_key: Mutex::new(tls_key),
-            tls_client_ca_certificates,
-            tls_certificate_path: args.tls_certificate,
-            tls_key_path: args.tls_private_key,
-            tls_client_ca_certs_path: args.tls_client_ca_certs,
-        })
-    } else {
-        None
-    };
-
-    let restrictions = if let Some(path) = &args.restrict_config {
-        RestrictionsRules::from_config_file(path).expect("Cannot parse restriction file")
-    } else {
-        let restrict_to: Vec<(String, u16)> = args
-            .restrict_to
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .map(|x| {
-                let (host, port) = x.rsplit_once(':').expect("Invalid restrict-to format");
-                (
-                    host.trim_matches(['[', ']']).to_string(),
-                    port.parse::<u16>().expect("Invalid restrict-to port format"),
-                )
-            })
-            .collect();
-
-        RestrictionsRules::from_path_prefix(
-            args.restrict_http_upgrade_path_prefix.as_deref().unwrap_or(&[]),
-            &restrict_to,
-        )
-        .expect("Cannot convert restriction rules from path-prefix and restric-to")
-    };
-
-    let http_proxy = mk_http_proxy(args.http_proxy, args.http_proxy_login, args.http_proxy_password)?;
     let server_config = ServerConfig {
         socket_so_mark: SoMark::new(args.socket_so_mark),
-        bind: args.remote_addr.socket_addrs(|| Some(8080))?[0],
+        bind: *args
+            .remote_addr
+            .socket_addrs(|| Some(8080))?
+            .first()
+            .context("No listen address resolved")?,
         websocket_ping_frequency: args
             .websocket_ping_frequency
             .or(Some(Duration::from_secs(30)))
@@ -589,7 +538,7 @@ async fn run_server_impl(args: ServerCreationRequest, executor: impl TokioExecut
             SoMark::new(args.socket_so_mark),
             !args.dns_resolver_prefer_ipv4,
         )
-        .expect("Cannot create DNS resolver"),
+        .context("Cannot create DNS resolver")?,
         restriction_config: args.restrict_config,
         http_proxy,
         remote_server_idle_timeout: args.remote_to_local_server_idle_timeout,

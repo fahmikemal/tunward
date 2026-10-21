@@ -38,7 +38,7 @@ impl SystemCaReloader {
     }
 
     /// Safely initializes the process-wide default CryptoProvider exactly once
-    fn init_crypto_provider() {
+    pub(crate) fn init_crypto_provider() {
         #[cfg(feature = "aws-lc-rs")]
         {
             if tokio_rustls::rustls::crypto::aws_lc_rs::default_provider()

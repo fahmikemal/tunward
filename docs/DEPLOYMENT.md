@@ -26,6 +26,30 @@ under `/opt/tunward/releases`, and private persistent inventory under
 `/var/lib/tunward`. Server/device private keys and signing state are runtime or
 issuer secrets, never release artifacts. Keep a distinct disposable staging CA.
 
+## Validate server configuration before activation
+
+Run the candidate binary with the intended server arguments and add `-t` or
+`--test-config`, as shown in the [README](../README.md#check-server-configuration).
+Use the service account and the same environment and readable candidate files.
+The check returns `0` on success, `1` for invalid configuration, or `2` for CLI
+usage errors. It validates policy syntax/values/references, TLS key matching and
+client trust parsing, and transport/mTLS prerequisites through the startup readers.
+Unknown restriction fields and descending port ranges now fail validation and
+startup; review configurations that previously relied on ignored fields.
+
+The check does not bind listeners, resolve addresses, contact peers, start
+watchers, open/create the inventory database, or write TLS key logs. It does not
+validate database permissions/schema, OS capabilities, port availability, remote
+reachability, or certificate deployment trust/expiry. Check the certificate bundle
+separately below, then run a canary using the intended runtime environment.
+Keep each candidate file immutable between validation and activation: validation
+does not lock a set of files or commit a configuration transaction.
+
+This command does not reload a running process. Restrictions and revocations
+retain their existing automatic reload behavior; quotas and tenant policy still
+need a restart. Listener/startup changes also need a restart. Full graceful
+configuration reload and `systemctl reload tunward` are not implemented.
+
 ## Validate certificates before activation
 
 The checker accepts a PEM server leaf followed by intermediate certificates,
@@ -81,6 +105,12 @@ credentials; it does not rely on live source-path watching. Unit specifier `%d`
 is the private credentials directory. Keep the original key root-readable only.
 The template uses unprivileged ports and grants no capabilities. TProxy belongs
 in a separately qualified client/routing setup, not this server unit.
+
+`ExecStartPre` runs the offline configuration check before each start and prevents
+`ExecStart` when validation fails. Keep its arguments identical to `ExecStart`,
+apart from `--test-config`. This uses the credentials made available to the unit;
+it does not validate a future replacement credential snapshot or keep sessions
+alive during a restart. The template has no `ExecReload`.
 
 The service restricts filesystem writes to its managed state and private temporary
 directory. Configure any Unix reverse paths inside permitted private runtime/state

@@ -121,6 +121,8 @@ jobs:
           python3 -c "from pathlib import Path; import shutil; p = Path('target/qualification'); shutil.rmtree(p) if p.exists() else None"
       - name: Build release binary
         run: cargo build --release --locked -p tunward-cli
+      - name: Verify offline server configuration checks
+        run: python3 -m unittest discover -s scripts -p test_server_config.py -v
       - name: Smoke-test release image packaging without publication
         timeout-minutes: 5
         run: |

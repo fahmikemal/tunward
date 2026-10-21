@@ -57,11 +57,28 @@ pub struct Tunward {
 #[derive(clap::Subcommand, Debug)]
 pub enum Commands {
     Client(Box<ClientCreationRequest>),
-    Server(Box<ServerCreationRequest>),
+    Server(Box<ServerArgs>),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ServerArgs {
+    /// Validate server arguments and referenced files, then exit without starting services.
+    #[arg(short = 't', long)]
+    test_config: bool,
+    #[command(flatten)]
+    config: ServerCreationRequest,
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Tunward::parse();
+    if let Commands::Server(server) = &args.commands
+        && server.test_config
+    {
+        EnvFilter::builder().parse(&args.log_lvl)?;
+        tunward::check_server_config(&server.config)?;
+        eprintln!("tunward: configuration test is successful");
+        return Ok(());
+    }
 
     // Setup logging
     let mut env_filter = EnvFilter::builder().parse(&args.log_lvl).expect("Invalid log level");
@@ -110,7 +127,7 @@ fn main() -> anyhow::Result<()> {
 
         match args.commands {
             Commands::Client(args) => run_client(*args, DefaultTokioExecutor::default()).await?,
-            Commands::Server(args) => run_server(*args, DefaultTokioExecutor::default()).await?,
+            Commands::Server(args) => run_server(args.config, DefaultTokioExecutor::default()).await?,
         }
 
         Ok(())
