@@ -63,8 +63,19 @@ class RuntimeDatagramTests(unittest.IsolatedAsyncioTestCase):
         with socket.socket(type=socket.SOCK_DGRAM) as sock:
             sock.setblocking(False)
             sock.connect(transport.get_extra_info("sockname"))
-            # Above IPv4's maximum UDP payload, so the real host must reject it.
-            self.assertEqual(await udp_exchange(sock, 65508), 8192)
+            send = loop.sock_sendall
+            attempts = 0
+
+            async def reject_large_once(stream, data):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise OSError(errno.EMSGSIZE, "controlled host size limit")
+                return await send(stream, data)
+
+            with patch.object(loop, "sock_sendall", side_effect=reject_large_once):
+                self.assertEqual(await udp_exchange(sock), 8192)
+            self.assertEqual(attempts, 2)
 
     async def test_other_send_errors_are_not_hidden(self):
         loop = asyncio.get_running_loop()

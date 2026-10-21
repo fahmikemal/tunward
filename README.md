@@ -396,6 +396,8 @@ reused as a new run's output.
 If the host rejects a 40 KB UDP send with `EMSGSIZE`, the native runner records
 that large-datagram case as `not_run` and still verifies an 8 KiB datagram on
 each transport. This does not establish 40 KB UDP support on that host.
+Its fallback regression test injects the size-limit error and verifies a real
+UDP exchange, avoiding assumptions about how each OS rejects oversized sends.
 The [qualification guide](docs/STAGING_QUALIFICATION.md)
 describes reproducible gates and the unresolved historical WSS WAN timeout.
 
