@@ -2,6 +2,7 @@
 """Native Python/OpenSSL smoke checks without Linux /proc, Unix sockets, Docker, or root."""
 import argparse
 import asyncio
+import errno
 import hashlib
 import json
 import os
@@ -28,6 +29,20 @@ async def close(writer):
         await asyncio.wait_for(writer.wait_closed(), 1)
     except (OSError, asyncio.TimeoutError):
         pass
+
+
+async def udp_exchange(sock, payload_bytes=40000):
+    loop = asyncio.get_running_loop()
+    data = os.urandom(payload_bytes)
+    try:
+        await loop.sock_sendall(sock, data)
+    except OSError as exc:
+        if exc.errno != errno.EMSGSIZE or payload_bytes <= 8192:
+            raise
+        data = os.urandom(8192)
+        await loop.sock_sendall(sock, data)
+    assert await asyncio.wait_for(loop.sock_recv(sock, 65536), 5) == data
+    return len(data)
 
 
 class RuntimeChecks:
@@ -154,11 +169,11 @@ class RuntimeChecks:
                 with socket.socket(type=socket.SOCK_DGRAM) as sock:
                     sock.setblocking(False)
                     sock.connect(("127.0.0.1", local_udp))
-                    data = os.urandom(40000)
-                    loop = asyncio.get_running_loop()
-                    await loop.sock_sendall(sock, data)
-                    assert await asyncio.wait_for(loop.sock_recv(sock, 65536), 5) == data
-                    self.record(f"runtime/{scheme}/udp", datagram_bytes=40000, verified_mtls=True)
+                    size = await udp_exchange(sock)
+                    if size != 40000:
+                        self.record(f"runtime/{scheme}/large-udp", "not_run", requested_datagram_bytes=40000,
+                                    reason="host UDP send rejected the datagram with EMSGSIZE; testing 8192 bytes")
+                    self.record(f"runtime/{scheme}/udp", datagram_bytes=size, verified_mtls=True)
             context = ssl.create_default_context(cafile=self.certs / "ca.pem")
             context.load_cert_chain(self.certs / "client.pem", self.certs / "client.key")
             try:

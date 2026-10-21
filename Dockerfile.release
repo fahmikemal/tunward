@@ -1,0 +1,21 @@
+# syntax=docker/dockerfile:1
+FROM debian:trixie-slim
+
+RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin app && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates dumb-init && \
+    rm -rf /var/lib/apt/lists/*
+
+ARG TARGETARCH
+WORKDIR /home/app
+COPY --chmod=0555 artifacts/linux/${TARGETARCH}/tunward /home/app/tunward
+COPY LICENSE /usr/share/doc/tunward/LICENSE
+
+ENV RUST_LOG=INFO \
+    SERVER_PROTOCOL=wss \
+    SERVER_LISTEN=[::] \
+    SERVER_PORT=8080
+EXPOSE 8080
+USER 10001:10001
+ENTRYPOINT ["/usr/bin/dumb-init", "--"]
+CMD ["/bin/sh", "-c", "exec /home/app/tunward server ${SERVER_PROTOCOL}://${SERVER_LISTEN}:${SERVER_PORT}"]

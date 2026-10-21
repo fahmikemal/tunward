@@ -71,6 +71,9 @@ jobs:
       - name: Check TOML formatting
         run: taplo fmt --check
 
+      - name: Verify release tag guards
+        run: python3 -m unittest discover -s scripts -p test_check_release_tag.py
+
       - name: Lint with Clippy
         run: cargo clippy --all --all-features --locked -- -D warnings
 
@@ -114,6 +117,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary
         run: cargo build --release --locked -p tunward-cli
+      - name: Smoke-test release image packaging without publication
+        timeout-minutes: 5
+        run: |
+          context="$RUNNER_TEMP/tunward-image-context"
+          mkdir -p "$context/artifacts/linux/amd64"
+          cp target/release/tunward "$context/artifacts/linux/amd64/"
+          cp Dockerfile.release LICENSE "$context/"
+          docker build --build-arg TARGETARCH=amd64 -f "$context/Dockerfile.release" -t tunward-container:ci "$context"
+          test "$(docker image inspect tunward-container:ci --format '{{.Config.User}}')" = '10001:10001'
+          docker run --rm --network none --read-only --cap-drop ALL tunward-container:ci /home/app/tunward --version
+          docker run --rm --network none --read-only --cap-drop ALL tunward-container:ci /home/app/tunward --help > /dev/null
       - name: Qualify transports and security
         timeout-minutes: 15
         run: python3 scripts/qualify.py --sections protocols,fleet,security,extended,isolation,soak,lifecycle,rotation --devices 32 --idle 128 --hold 5

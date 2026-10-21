@@ -471,6 +471,13 @@ run/attempt-specific name, outside the cached Cargo target tree. This avoids
 keys/results from being saved in that cache. Local runners still refuse an
 existing `--output` directory: choose a fresh path to preserve earlier evidence.
 
+Some hosts, including the macOS 14 CI runner, reject the 40000-byte UDP send
+with `EMSGSIZE` before it enters the tunnel. Only for that explicit send error,
+the runner retries with 8192 bytes and records the 40000-byte case as `not_run`
+for that transport. Other errors still fail. A successful reduced-size exchange
+proves bounded UDP forwarding, not large-datagram support on the restricted host;
+the runner does not change system UDP limits.
+
 ## Physical-device working-hours acceptance
 
 When devices are available, select representative OS/versions, network providers,

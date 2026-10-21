@@ -144,11 +144,42 @@ requests targeting `main`, and manual dispatch. Its jobs include Gitleaks,
 Semgrep, formatting, Clippy, a RustSec audit, provider-specific Rust tests, and
 local qualification.
 
-The [release workflow](.github/workflows/release.yaml) runs on `v*` tags or
-manual dispatch. Checks gate its configured build matrix before release
-publishing. The matrix is a build configuration, not proof of hardware/runtime
-qualification on every OS. Publishing binaries or images is a separate
-maintainer operation; do not infer that the newest source is already released.
+The [release workflow](.github/workflows/release.yaml) runs only on pushed `v*`
+tags. `scripts/check_release_tag.py` requires `vMAJOR.MINOR.PATCH[-prerelease]`
+to match the version in both package manifests; build metadata (`+...`) is not
+accepted as a container tag. Branches, PRs, and manual branch dispatch cannot
+publish releases. Checks and the native runtime matrix gate binary builds.
+The matrix is a build configuration, not proof of runtime qualification on
+every OS.
+
+Before pushing a release tag, create the Docker Hub repository
+`oph1uchus/tunward`. In GitHub Settings → Secrets and variables → Actions, set:
+
+- Repository variable `DOCKERHUB_USERNAME`: the Docker Hub login with write
+  access to `oph1uchus/tunward` (normally `oph1uchus`).
+- Repository secret `DOCKERHUB_TOKEN`: a Docker Hub access token with the required
+  write permission. Enter it directly in GitHub, never in source or a chat.
+
+The release preflight fails if either is missing. The Docker Hub job downloads
+the workflow's Linux amd64/arm64 musl binary artifacts into a minimal image
+context containing only those binaries, the runtime Dockerfile, and LICENSE.
+It builds and smoke-tests both architecture images before registry login and
+publication. Smoke checks cover version, help, and non-root image configuration,
+not full networking, mounts, or ARM hardware qualification. QEMU provides the
+arm64 smoke runtime on the amd64 runner. The versioned multi-platform image
+includes build provenance and an SBOM; the job summary records its digest.
+PR CI also checks the amd64 image packaging with its native Linux binary and
+never logs in or pushes an image. Tagged release checks use the actual musl
+artifacts on both image architectures.
+
+Container tags exactly match the Git release tag, including `v` and any beta/RC
+suffix. No `latest` or stable alias is automatically updated. Prefer deployment
+by reviewed digest. GitHub release creation follows successful Docker Hub
+publication; these two remote operations are not an atomic transaction. Inspect
+the image digest and release assets before retrying a partial publication.
+`GITHUB_TOKEN` gets contents-write permission only in the GitHub release job;
+an optional existing `RELEASE_TOKEN` secret overrides it. No token is required
+in pull requests. Do not infer that the newest source is already released.
 
 ## Pull requests and reports
 

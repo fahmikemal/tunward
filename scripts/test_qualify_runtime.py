@@ -1,12 +1,13 @@
 import json
 from pathlib import Path
 import shutil
+import socket
 import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from qualify_runtime import RuntimeChecks
+from qualify_runtime import RuntimeChecks, udp_exchange
 
 
 @unittest.skipUnless(shutil.which("openssl"), "OpenSSL CLI required")
@@ -47,5 +48,34 @@ class RuntimeCertificateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("binary_sha256", metadata)
 
 
+class RuntimeDatagramTests(unittest.IsolatedAsyncioTestCase):
+    async def test_host_size_limit_still_exercises_udp(self):
+        class Echo(asyncio.DatagramProtocol):
+            def connection_made(self, transport):
+                self.transport = transport
+
+            def datagram_received(self, data, peer):
+                self.transport.sendto(data, peer)
+
+        loop = asyncio.get_running_loop()
+        transport, _ = await loop.create_datagram_endpoint(Echo, local_addr=("127.0.0.1", 0))
+        self.addCleanup(transport.close)
+        with socket.socket(type=socket.SOCK_DGRAM) as sock:
+            sock.setblocking(False)
+            sock.connect(transport.get_extra_info("sockname"))
+            # Above IPv4's maximum UDP payload, so the real host must reject it.
+            self.assertEqual(await udp_exchange(sock, 65508), 8192)
+
+    async def test_other_send_errors_are_not_hidden(self):
+        loop = asyncio.get_running_loop()
+        with socket.socket(type=socket.SOCK_DGRAM) as sock:
+            with patch.object(loop, "sock_sendall", side_effect=OSError(errno.ENETUNREACH, "fixture unreachable")):
+                with self.assertRaises(OSError) as raised:
+                    await udp_exchange(sock)
+        self.assertEqual(raised.exception.errno, errno.ENETUNREACH)
+
+
 if __name__ == "__main__":
     unittest.main()
+import asyncio
+import errno

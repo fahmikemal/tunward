@@ -80,6 +80,30 @@ through read-only runtime mounts; exclude the CA signing key from those mounts.
 Ensure the container UID can read its own key without making it world-readable.
 Local generated material is excluded from the image build context.
 
+Tagged releases also publish to [Docker Hub: `oph1uchus/tunward`](https://hub.docker.com/r/oph1uchus/tunward).
+The [release workflow](.github/workflows/release.yaml) runs only for pushed `v*`
+tags, validates that the version matches both Rust packages, and waits for its
+checks, native runtime matrix, and binary builds before publishing. It packages
+the same Linux release binaries for `linux/amd64` and `linux/arm64` using
+[Dockerfile.release](Dockerfile.release), smoke-tests both image architectures,
+and records the published digest. GitHub release publication waits for the
+Docker Hub job to succeed. Registry publication and GitHub release creation are
+separate operations, so inspect both after a failure or rerun.
+
+The image tag equals the Git tag; beta tags do not create a `latest` or stable
+alias. After `v0.1.0-beta` has actually been published, for example:
+
+~~~sh
+docker pull oph1uchus/tunward:v0.1.0-beta
+docker run --rm oph1uchus/tunward:v0.1.0-beta /home/app/tunward --version
+~~~
+
+Maintainers must configure the GitHub Actions variable `DOCKERHUB_USERNAME`
+and secret `DOCKERHUB_TOKEN` (a Docker Hub token with write access to this image).
+Without them, the release fails before builds start. Branch and PR CI never
+push images. This workflow change alone does not publish an image or qualify
+the release for production. See [release setup](CONTRIBUTING.md#ci-and-releases).
+
 Publish the TLS TCP port explicitly, and also UDP when using WebTransport.
 Choose a loopback host publication unless public access is intended. Addresses
 such as `127.0.0.1` inside a container refer to that container, not the host;
@@ -369,6 +393,9 @@ before starting tunnels, and records the OpenSSL version and setup failures.
 CI writes native evidence outside the Cargo target cache, to a temporary path
 unique to each workflow run and attempt; cached results and test keys are not
 reused as a new run's output.
+If the host rejects a 40 KB UDP send with `EMSGSIZE`, the native runner records
+that large-datagram case as `not_run` and still verifies an 8 KiB datagram on
+each transport. This does not establish 40 KB UDP support on that host.
 The [qualification guide](docs/STAGING_QUALIFICATION.md)
 describes reproducible gates and the unresolved historical WSS WAN timeout.
 

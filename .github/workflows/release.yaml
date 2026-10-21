@@ -4,7 +4,9 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -15,17 +17,39 @@ env:
   BIN_NAME: "tunward"
 
 jobs:
+  release-tag:
+    name: Validate release tag and publication credentials
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require a version tag matching both packages
+        id: tag
+        run: python3 scripts/check_release_tag.py >> "$GITHUB_OUTPUT"
+      - name: Require Docker Hub credentials
+        env:
+          DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          test -n "$DOCKERHUB_USERNAME" || { echo 'Set the DOCKERHUB_USERNAME repository variable'; exit 1; }
+          test -n "$DOCKERHUB_TOKEN" || { echo 'Set the DOCKERHUB_TOKEN Actions secret'; exit 1; }
+
   native-runtime:
+    needs: release-tag
     uses: ./.github/workflows/runtime-qualification.yaml
 
   # Runs alongside the build matrix, so a formatting or test failure is reported without
   # waiting on the cross-compilation of every platform.
   check:
     name: Check - format, lint & tests
+    needs: release-tag
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout Git repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -160,7 +184,7 @@ jobs:
 
       - name: Set up JDK 17
         if: contains(matrix.platform.target, 'android')
-        uses: actions/setup-java@v3
+        uses: actions/setup-java@v6
         with:
           java-version: '17'
           distribution: 'temurin'
@@ -172,39 +196,33 @@ jobs:
       - name: Checkout Git repo
         uses: actions/checkout@v4
 
-      # Linux & Windows
-      - name: Install rust toolchain for Linux
-        uses: actions-rs/toolchain@v1
+      - name: Install Rust toolchain and target
+        uses: dtolnay/rust-toolchain@master
         with:
-          # We setup Rust toolchain and the desired target
-          profile: minimal
           toolchain: "${{ env.RUST_VERSION }}"
-          override: true
-          target: ${{ matrix.platform.target }}
+          targets: ${{ matrix.platform.target }}
           components: rustfmt, clippy
 
-      - name: Install package for Android
-        if: contains(matrix.platform.target, 'android')
-        run: cargo install cross --git https://github.com/cross-rs/cross
+      - name: Install pinned cross compiler driver
+        if: (contains(matrix.platform.target, 'linux') && !contains(matrix.platform.target, 'x86_64')) || contains(matrix.platform.target, 'freebsd')
+        run: cargo install cross --locked --git https://github.com/cross-rs/cross --rev 526d03ddcd2f70e683074b3ea6f75ed300f33132
 
       - name: Install bindgen-cli
         if: contains(matrix.platform.build-args, 'aws-lc-rs-bindgen')
         run: cargo install bindgen-cli
 
-      - name: Show command used for Cargo
-        run: |
-          echo "cargo command is: ${{ env.CARGO }}"
-          echo "target flag is: ${{ env.BUILD_ARGS }}"
-
       - name: Build ${{ matrix.platform.name }} binary
-        uses: actions-rs/cargo@v1
-        env: 
+        shell: bash
+        env:
           JEMALLOC_SYS_WITH_LG_PAGE: ${{ contains(matrix.platform.target, 'aarch64') && '14' || '12' }}
-        # We use cross-rs if not running on x86_64 architecture on Linux
-        with:
-          command: build
-          use-cross: ${{ (!contains(matrix.platform.target, 'x86_64') && !contains(matrix.platform.target, 'windows')) || contains(matrix.platform.target, 'freebsd') }}
-          args: ${{ matrix.platform.build-args }} --locked --bin tunward --target ${{ matrix.platform.target }}
+          USE_CROSS: ${{ (contains(matrix.platform.target, 'linux') && !contains(matrix.platform.target, 'x86_64')) || contains(matrix.platform.target, 'freebsd') }}
+          BUILD_ARGS: ${{ matrix.platform.build-args }}
+          BUILD_TARGET: ${{ matrix.platform.target }}
+        run: |
+          driver=cargo
+          if [[ "$USE_CROSS" == true ]]; then driver=cross; fi
+          read -r -a build_args <<< "$BUILD_ARGS"
+          "$driver" build "${build_args[@]}" --locked --bin tunward --target "$BUILD_TARGET"
 
       - name: Store artifact
         uses: actions/upload-artifact@v4
@@ -214,11 +232,90 @@ jobs:
           path: target/${{ matrix.platform.target }}/release${{ contains(matrix.platform.target, 'windows') && '-with-symbols' || '' }}/${{ env.BIN_NAME }}${{ contains(matrix.platform.target, 'windows') && '.exe' || '' }}
           retention-days: 1
 
+  docker:
+    name: Publish Docker Hub image
+    needs: [ release-tag, build ]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      IMAGE: docker.io/oph1uchus/tunward
+      RELEASE_TAG: ${{ needs.release-tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: tunward-x86_64-unknown-linux-musl
+          path: target/docker-release/artifacts/linux/amd64
+      - uses: actions/download-artifact@v4
+        with:
+          name: tunward-aarch64-unknown-linux-musl
+          path: target/docker-release/artifacts/linux/arm64
+      - name: Prepare minimal image context
+        run: cp Dockerfile.release LICENSE target/docker-release/
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build amd64 image for smoke testing
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: target/docker-release
+          file: target/docker-release/Dockerfile.release
+          platforms: linux/amd64
+          load: true
+          tags: tunward-release-test:amd64
+      - name: Build arm64 image for smoke testing
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: target/docker-release
+          file: target/docker-release/Dockerfile.release
+          platforms: linux/arm64
+          load: true
+          tags: tunward-release-test:arm64
+      - name: Check both image architectures before publication
+        run: |
+          for arch in amd64 arm64; do
+            image="tunward-release-test:$arch"
+            test "$(docker image inspect "$image" --format '{{.Config.User}}')" = '10001:10001'
+            docker run --rm --platform "linux/$arch" --network none --read-only --cap-drop ALL \
+              "$image" /home/app/tunward --version | grep -Fx "tunward-cli ${RELEASE_TAG#v}"
+            docker run --rm --platform "linux/$arch" --network none --read-only --cap-drop ALL \
+              "$image" /home/app/tunward --help > /dev/null
+          done
+      - name: Log in to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Publish versioned multi-platform image
+        id: image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: target/docker-release
+          file: target/docker-release/Dockerfile.release
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.IMAGE }}:${{ env.RELEASE_TAG }}
+          provenance: mode=max
+          sbom: true
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.RELEASE_TAG }}
+            org.opencontainers.image.licenses=Apache-2.0
+      - name: Record published image digest
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          echo "Published $IMAGE:$RELEASE_TAG" >> "$GITHUB_STEP_SUMMARY"
+          echo "Digest: $DIGEST" >> "$GITHUB_STEP_SUMMARY"
+
   release:
     name: Release
-    needs: [ build ]
-    # We run the release job on tags starting with 'v' or manual dispatch
-    if: startsWith( github.ref, 'refs/tags/v' ) || github.event_name == 'workflow_dispatch'
+    needs: [ build, docker ]
+    if: startsWith( github.ref, 'refs/tags/v' )
+    permissions:
+      contents: write
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout Git repo
@@ -246,4 +343,4 @@ jobs:
           version: '~> v1'
           args: release --clean --skip=validate
         env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
