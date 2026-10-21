@@ -20,6 +20,8 @@ jobs:
         with:
           python-version: "3.13"
       - uses: Swatinem/rust-cache@v2
+      - name: Remove legacy qualification fixtures restored with the build cache
+        run: python -c "from pathlib import Path; import shutil; p = Path('target/qualification'); shutil.rmtree(p) if p.exists() else None"
       - name: Use Git OpenSSL on Windows
         if: runner.os == 'Windows'
         shell: pwsh

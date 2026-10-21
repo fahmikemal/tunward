@@ -470,6 +470,11 @@ run/attempt-specific name, outside the cached Cargo target tree. This avoids
 `FileExistsError` after a build-cache restore and prevents new native fixture
 keys/results from being saved in that cache. Local runners still refuse an
 existing `--output` directory: choose a fresh path to preserve earlier evidence.
+The Linux protocol/security qualification job likewise gives every profile a
+fresh path under its run/attempt temporary root, including privileged TProxy.
+CI removes the legacy `target/qualification` subtree after restoring Rust caches
+so old fixture keys/results are not reused or saved again. This cleanup runs
+only in disposable CI workspaces, not inside local qualification scripts.
 
 Some hosts, including the macOS 14 CI runner, reject the 40000-byte UDP send
 with `EMSGSIZE` before it enters the tunnel. Only for that explicit send error,

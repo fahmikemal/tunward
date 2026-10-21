@@ -115,6 +115,10 @@ jobs:
         with:
           toolchain: "${{ env.RUST_VERSION }}"
       - uses: Swatinem/rust-cache@v2
+      - name: Isolate qualification evidence from the build cache
+        run: |
+          echo "QUALIFICATION_ROOT=$RUNNER_TEMP/tw-q-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+          python3 -c "from pathlib import Path; import shutil; p = Path('target/qualification'); shutil.rmtree(p) if p.exists() else None"
       - name: Build release binary
         run: cargo build --release --locked -p tunward-cli
       - name: Smoke-test release image packaging without publication
@@ -130,45 +134,45 @@ jobs:
           docker run --rm --network none --read-only --cap-drop ALL tunward-container:ci /home/app/tunward --help > /dev/null
       - name: Qualify transports and security
         timeout-minutes: 15
-        run: python3 scripts/qualify.py --sections protocols,fleet,security,extended,isolation,soak,lifecycle,rotation --devices 32 --idle 128 --hold 5
+        run: python3 scripts/qualify.py --sections protocols,fleet,security,extended,isolation,soak,lifecycle,rotation --devices 32 --idle 128 --hold 5 --output "$QUALIFICATION_ROOT/main"
       - name: Qualify certificate identity and device isolation
         timeout-minutes: 5
-        run: python3 scripts/qualify_identity.py --output target/qualification/identity
+        run: python3 scripts/qualify_identity.py --output "$QUALIFICATION_ROOT/identity"
       - name: Verify delayed TLS pool deadline behavior
         timeout-minutes: 2
-        run: python3 scripts/qualify_pool_timeout.py --output target/qualification/pool-delay
+        run: python3 scripts/qualify_pool_timeout.py --output "$QUALIFICATION_ROOT/pool-delay"
       - name: Qualify authenticated device quotas
         timeout-minutes: 5
-        run: python3 scripts/qualify_quotas.py --output target/qualification/quotas
+        run: python3 scripts/qualify_quotas.py --output "$QUALIFICATION_ROOT/quotas"
       - name: Qualify live certificate and device revocation
         timeout-minutes: 5
-        run: python3 scripts/qualify_revocation.py --output target/qualification/revocation
+        run: python3 scripts/qualify_revocation.py --output "$QUALIFICATION_ROOT/revocation"
       - name: Qualify fleet transport parity and persistent inventory
         timeout-minutes: 5
-        run: python3 scripts/qualify_fleet.py --output target/qualification/fleet
+        run: python3 scripts/qualify_fleet.py --output "$QUALIFICATION_ROOT/fleet"
       - name: Qualify tenant scope and reverse ownership
         timeout-minutes: 5
-        run: python3 scripts/qualify_tenants.py --output target/qualification/tenants
+        run: python3 scripts/qualify_tenants.py --output "$QUALIFICATION_ROOT/tenants"
       - name: Check publication tree for PEM private keys
         run: python3 scripts/check_publication.py
       - name: Verify endurance evidence and supervisor shutdown
         run: python3 -m unittest discover -s scripts -p 'test_*endurance.py'
       - name: Qualify synthetic verified-device admission
-        run: python3 scripts/qualify_device_scale.py --devices 200 --output target/qualification/device-scale
+        run: python3 scripts/qualify_device_scale.py --devices 200 --output "$QUALIFICATION_ROOT/device-scale"
       - name: Qualify certificate renewal and rollback
         timeout-minutes: 5
-        run: python3 scripts/qualify_pki.py --output target/qualification/pki
+        run: python3 scripts/qualify_pki.py --output "$QUALIFICATION_ROOT/pki"
       - name: Install controlled DNS test dependencies
         run: python3 -m pip install -r scripts/requirements-qualification.txt
       - name: Qualify DNS and ECH edge cases
         timeout-minutes: 5
-        run: python3 scripts/qualify_dns.py --output target/qualification/dns
+        run: python3 scripts/qualify_dns.py --output "$QUALIFICATION_ROOT/dns"
       - name: Qualify isolated privileged IPv4 TProxy
         timeout-minutes: 5
         run: |
           status=0
-          sudo python3 scripts/qualify_tproxy.py --output target/qualification/tproxy || status=$?
-          sudo chown -R "$(id -u):$(id -g)" target/qualification/tproxy
+          sudo python3 scripts/qualify_tproxy.py --output "$QUALIFICATION_ROOT/tproxy" || status=$?
+          sudo chown -R "$(id -u):$(id -g)" "$QUALIFICATION_ROOT/tproxy"
           exit "$status"
       - name: Preserve qualification evidence
         if: always()
@@ -176,6 +180,6 @@ jobs:
         with:
           name: qualification-evidence
           path: |
-            target/qualification/**/results.json
-            target/qualification/**/metadata.json
-            target/qualification/**/*.log
+            ${{ env.QUALIFICATION_ROOT }}/**/results.json
+            ${{ env.QUALIFICATION_ROOT }}/**/metadata.json
+            ${{ env.QUALIFICATION_ROOT }}/**/*.log
