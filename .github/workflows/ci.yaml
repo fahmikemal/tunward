@@ -137,6 +137,9 @@ jobs:
       - name: Qualify transports and security
         timeout-minutes: 15
         run: python3 scripts/qualify.py --sections protocols,fleet,security,extended,isolation,soak,lifecycle,rotation --devices 32 --idle 128 --hold 5 --output "$QUALIFICATION_ROOT/main"
+      - name: Qualify acknowledged configuration reload under live traffic
+        timeout-minutes: 5
+        run: python3 scripts/qualify_reload.py --output "$QUALIFICATION_ROOT/reload"
       - name: Qualify certificate identity and device isolation
         timeout-minutes: 5
         run: python3 scripts/qualify_identity.py --output "$QUALIFICATION_ROOT/identity"

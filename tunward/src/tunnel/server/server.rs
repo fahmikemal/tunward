@@ -4,6 +4,7 @@ use crate::protocols;
 use crate::protocols::dns::DnsResolver;
 use crate::protocols::tls;
 use crate::quotas::{DeviceQuotaConfig, QuotaError, QuotaManager, QuotaSession, TunnelPermit};
+use crate::reload::{ReloadState, ServerReload};
 use crate::restrictions::config_reloader::RestrictionsRulesReloader;
 use crate::restrictions::types::{RestrictionConfig, RestrictionsRules};
 use crate::revocation::{RevocationGuard, RevocationManager};
@@ -121,6 +122,8 @@ pub struct Server<E: crate::TokioExecutorRef = DefaultTokioExecutor> {
     quotas: Option<QuotaManager>,
     revocations: Option<RevocationManager>,
     tenants: Option<Arc<TenantPolicy>>,
+    pub(crate) managed: Option<Arc<ReloadState>>,
+    reload: Option<ServerReload>,
     instance: uuid::Uuid,
 }
 
@@ -136,8 +139,21 @@ impl<E: crate::TokioExecutorRef> Server<E> {
             quotas,
             revocations: None,
             tenants: None,
+            managed: None,
+            reload: None,
             instance: uuid::Uuid::now_v7(),
         }
+    }
+
+    pub(crate) fn with_reload(mut self, state: Arc<ReloadState>, reload: ServerReload) -> Self {
+        self.quotas = self
+            .config
+            .device_quotas
+            .as_ref()
+            .map(|_| QuotaManager::live(state.live.clone()));
+        self.managed = Some(state);
+        self.reload = Some(reload);
+        self
     }
 
     pub(super) async fn connection_context(
@@ -147,7 +163,12 @@ impl<E: crate::TokioExecutorRef> Server<E> {
         peer_addr: SocketAddr,
         transport: &str,
     ) -> anyhow::Result<ConnectionContext> {
-        let tenant = match &self.tenants {
+        let snapshot = self.managed.as_ref().map(|state| state.snapshot());
+        let tenant_policy = snapshot
+            .as_ref()
+            .map(|snapshot| &snapshot.tenants)
+            .unwrap_or(&self.tenants);
+        let tenant = match tenant_policy {
             None => None,
             Some(policy) => Some(
                 policy.access(
@@ -192,6 +213,9 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                 Some(connection)
             }
         };
+        if let Some(state) = &self.managed {
+            state.register(path.as_deref(), &revocation, tenant.as_ref(), fleet.as_ref())?;
+        }
         Ok(ConnectionContext {
             path,
             quota,
@@ -209,11 +233,30 @@ impl<E: crate::TokioExecutorRef> Server<E> {
     pub(super) async fn handle_tunnel_request<B>(
         &self,
         restrictions: Arc<RestrictionsRules>,
-        restrict_path_prefix: ConnectionContext,
+        mut restrict_path_prefix: ConnectionContext,
         mut client_addr: SocketAddr,
         req: &Request<B>,
         pre_admitted: Option<TunnelPermit>,
     ) -> Result<EstablishedTunnel, Box<HttpResponse>> {
+        let snapshot = self.managed.as_ref().map(|state| state.snapshot());
+        let restrictions = snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.restrictions.clone())
+            .unwrap_or(restrictions);
+        if let Some(snapshot) = &snapshot {
+            restrict_path_prefix.tenant = snapshot
+                .tenants
+                .as_ref()
+                .map(|policy| {
+                    let identity = restrict_path_prefix
+                        .path
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("Verified tenant identity required"))?;
+                    policy.access(identity)
+                })
+                .transpose()
+                .map_err(|_| Box::new(bad_request()))?;
+        }
         let revocation = restrict_path_prefix.revocation.clone();
         if revocation.is_revoked() {
             return Err(Box::new(bad_request()));
@@ -591,7 +634,10 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                     && self.config.restriction_config.is_some(),
                 "tenant isolation requires verified mTLS and --restrict-config"
             );
-            self.tenants = Some(TenantPolicy::from_path(path, &restrictions)?);
+            self.tenants = match &self.managed {
+                Some(state) => state.snapshot().tenants.clone(),
+                None => Some(TenantPolicy::from_path(path, &restrictions)?),
+            };
         }
         if let Some(path) = &self.config.fleet_inventory {
             anyhow::ensure!(
@@ -631,6 +677,15 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                 task.abort()
             }))
         } else {
+            if self.managed.is_some()
+                && self
+                    .config
+                    .tls
+                    .as_ref()
+                    .is_some_and(|tls| tls.tls_client_ca_certificates.is_some())
+            {
+                self.revocations = Some(RevocationManager::empty());
+            }
             None
         };
         info!("Starting tunward server listening on {}", self.config.bind);
@@ -712,7 +767,11 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                     tls_config,
                     Some(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
                 )?),
-                tls_reloader: TlsReloader::new_for_server(self.config.clone())?,
+                tls_reloader: if self.managed.is_some() {
+                    None
+                } else {
+                    Some(TlsReloader::new_for_server(self.config.clone())?)
+                },
                 tls_config,
             };
             Some(tls_context)
@@ -721,10 +780,25 @@ impl<E: crate::TokioExecutorRef> Server<E> {
         };
 
         // Bind server and run forever to serve incoming connections.
-        let restrictions = RestrictionsRulesReloader::new(restrictions, self.config.restriction_config.clone())?;
+        let restrictions = RestrictionsRulesReloader::new(
+            restrictions,
+            if self.managed.is_some() {
+                None
+            } else {
+                self.config.restriction_config.clone()
+            },
+        )?;
         let listener = TcpListener::bind(&self.config.bind)
             .await
             .with_context(|| format!("Failed to bind to socket on {}", self.config.bind))?;
+
+        let _reload_task = if let (Some(state), Some(reload)) = (&self.managed, &self.reload) {
+            let requests = reload.take_receiver().await?;
+            let task = self.executor.spawn(state.clone().run(requests));
+            Some(scopeguard::guard(task, |task| task.abort()))
+        } else {
+            None
+        };
 
         // WebTransport needs its own UDP socket, so it runs as a sibling of the TCP accept loop
         // below. One server process then answers websocket, http2 and webtransport clients.
@@ -775,7 +849,10 @@ impl<E: crate::TokioExecutorRef> Server<E> {
             match tls_context.as_mut() {
                 Some(tls) => {
                     // Reload TLS certificate if needed
-                    let tls_acceptor = tls.tls_acceptor().clone();
+                    let tls_acceptor = match &server.managed {
+                        Some(state) => state.snapshot().tcp_tls.clone().expect("TLS mode is fixed at startup"),
+                        None => tls.tls_acceptor().clone(),
+                    };
                     let fut = async move {
                         info!("Doing TLS handshake");
                         let tls_stream = match tls_acceptor.accept(stream).await {
@@ -965,13 +1042,17 @@ where
 
 struct TlsContext<'a> {
     tls_acceptor: Arc<TlsAcceptor>,
-    tls_reloader: TlsReloader,
+    tls_reloader: Option<TlsReloader>,
     tls_config: &'a TlsServerConfig,
 }
 impl TlsContext<'_> {
     #[inline]
     pub fn tls_acceptor(&mut self) -> &Arc<TlsAcceptor> {
-        if self.tls_reloader.should_reload_certificate() {
+        if self
+            .tls_reloader
+            .as_ref()
+            .is_some_and(TlsReloader::should_reload_certificate)
+        {
             match tls::tls_acceptor(self.tls_config, Some(vec![b"h2".to_vec(), b"http/1.1".to_vec()])) {
                 Ok(acceptor) => self.tls_acceptor = Arc::new(acceptor),
                 Err(err) => error!("Cannot reload TLS certificate {:?}", err),

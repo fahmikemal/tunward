@@ -265,7 +265,7 @@ pub struct ClientCreationRequest {
     pub client_id: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[cfg_attr(feature = "clap", derive(clap::Args))]
 pub struct ServerCreationRequest {
     /// Address of the tunward server to bind to

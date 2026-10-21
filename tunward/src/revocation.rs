@@ -110,7 +110,25 @@ struct Session {
 #[derive(Clone, Default)]
 pub(crate) struct RevocationGuard(Option<Arc<Session>>);
 
+pub(crate) struct WeakRevocationGuard(Weak<Session>);
+
+impl WeakRevocationGuard {
+    pub(crate) fn upgrade(&self) -> Option<RevocationGuard> {
+        self.0.upgrade().map(|session| RevocationGuard(Some(session)))
+    }
+}
+
 impl RevocationGuard {
+    pub(crate) fn downgrade(&self) -> Option<WeakRevocationGuard> {
+        self.0
+            .as_ref()
+            .map(|session| WeakRevocationGuard(Arc::downgrade(session)))
+    }
+    pub(crate) fn revoke(&self) {
+        if let Some(session) = &self.0 {
+            session.revoked.send_replace(true);
+        }
+    }
     pub fn identity(&self) -> Option<Arc<str>> {
         self.0.as_ref().map(|session| session.identity.clone())
     }
@@ -148,6 +166,13 @@ struct State {
 pub(crate) struct RevocationManager(Arc<Mutex<State>>);
 
 impl RevocationManager {
+    pub fn empty() -> Self {
+        Self(Arc::new(Mutex::new(State {
+            policy: Policy::default(),
+            healthy: true,
+            sessions: Vec::new(),
+        })))
+    }
     pub fn from_path(path: &Path) -> anyhow::Result<Self> {
         let policy = Policy::parse(&read_policy(path)?)
             .with_context(|| format!("Cannot load revocation policy {}", path.display()))?;

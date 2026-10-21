@@ -58,6 +58,14 @@ pub struct Tunward {
 pub enum Commands {
     Client(Box<ClientCreationRequest>),
     Server(Box<ServerArgs>),
+    /// Reload a running server through its private Unix control socket and wait for acknowledgment.
+    Reload(ReloadArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ReloadArgs {
+    #[arg(long, value_name = "PATH")]
+    socket: std::path::PathBuf,
 }
 
 #[derive(clap::Args, Debug)]
@@ -65,12 +73,44 @@ pub struct ServerArgs {
     /// Validate server arguments and referenced files, then exit without starting services.
     #[arg(short = 't', long)]
     test_config: bool,
+    /// Reload policy and TLS files as one validated generation on SIGHUP (Unix).
+    #[arg(long)]
+    graceful_reload: bool,
+    /// Private Unix control socket for acknowledged reload. Implies --graceful-reload.
+    #[arg(long, value_name = "PATH")]
+    reload_socket: Option<std::path::PathBuf>,
     #[command(flatten)]
     config: ServerCreationRequest,
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Tunward::parse();
+    if let Commands::Reload(reload) = &args.commands {
+        #[cfg(unix)]
+        {
+            let status = tunward::reload_socket::request_reload(&reload.socket)?;
+            println!(
+                "tunward: configuration reload applied (generation {}, disconnected sessions {})",
+                status.generation, status.disconnected_sessions
+            );
+            return Ok(());
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = reload;
+            anyhow::bail!("The reload control socket is available on Unix servers only");
+        }
+    }
+    if let Commands::Server(server) = &args.commands {
+        #[cfg(not(unix))]
+        if server.graceful_reload || server.reload_socket.is_some() {
+            anyhow::bail!("CLI graceful reload is available on Unix servers; library users can use ServerReload");
+        }
+        #[cfg(unix)]
+        if let Some(socket) = &server.reload_socket {
+            tunward::reload_socket::validate_reload_socket_path(socket)?;
+        }
+    }
     if let Commands::Server(server) = &args.commands
         && server.test_config
     {
@@ -127,7 +167,31 @@ fn main() -> anyhow::Result<()> {
 
         match args.commands {
             Commands::Client(args) => run_client(*args, DefaultTokioExecutor::default()).await?,
-            Commands::Server(args) => run_server(args.config, DefaultTokioExecutor::default()).await?,
+            Commands::Server(args) => {
+                if args.graceful_reload || args.reload_socket.is_some() {
+                    let reload = tunward::reload::ServerReload::default();
+                    #[cfg(unix)]
+                    {
+                        if let Some(path) = &args.reload_socket {
+                            let socket = tunward::reload_socket::ReloadSocket::bind(path)?;
+                            tokio::spawn(socket.serve(reload.clone()));
+                        }
+                        let mut signals = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+                        let control = reload.clone();
+                        tokio::spawn(async move {
+                            while signals.recv().await.is_some() {
+                                if let Err(error) = control.reload().await {
+                                    tracing::warn!("SIGHUP reload failed: {error:#}");
+                                }
+                            }
+                        });
+                    }
+                    tunward::run_server_with_reload(args.config, DefaultTokioExecutor::default(), reload).await?;
+                } else {
+                    run_server(args.config, DefaultTokioExecutor::default()).await?;
+                }
+            }
+            Commands::Reload(_) => unreachable!("reload handled before runtime startup"),
         }
 
         Ok(())

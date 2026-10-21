@@ -12,13 +12,13 @@ Group=tunward
 UMask=0077
 StateDirectory=tunward
 StateDirectoryMode=0700
-LoadCredential=server-cert.pem:/etc/tunward/tls/server.pem
-LoadCredential=server-key.pem:/etc/tunward/tls/server.key
-LoadCredential=client-ca.pem:/etc/tunward/tls/client-ca.pem
+RuntimeDirectory=tunward
+RuntimeDirectoryMode=0700
 ExecStartPre=/opt/tunward/current/tunward server --test-config \
-  --tls-certificate %d/server-cert.pem \
-  --tls-private-key %d/server-key.pem \
-  --tls-client-ca-certs %d/client-ca.pem \
+  --reload-socket %t/tunward/reload.sock \
+  --tls-certificate /etc/tunward/tls/server.pem \
+  --tls-private-key /etc/tunward/tls/server.key \
+  --tls-client-ca-certs /etc/tunward/tls/client-ca.pem \
   --restrict-config /etc/tunward/restrictions.yaml \
   --tenant-config /etc/tunward/tenants.yaml \
   --device-quota-config /etc/tunward/quotas.yaml \
@@ -27,9 +27,10 @@ ExecStartPre=/opt/tunward/current/tunward server --test-config \
   --management-api 127.0.0.1:8081 \
   wts://0.0.0.0:8443
 ExecStart=/opt/tunward/current/tunward server \
-  --tls-certificate %d/server-cert.pem \
-  --tls-private-key %d/server-key.pem \
-  --tls-client-ca-certs %d/client-ca.pem \
+  --reload-socket %t/tunward/reload.sock \
+  --tls-certificate /etc/tunward/tls/server.pem \
+  --tls-private-key /etc/tunward/tls/server.key \
+  --tls-client-ca-certs /etc/tunward/tls/client-ca.pem \
   --restrict-config /etc/tunward/restrictions.yaml \
   --tenant-config /etc/tunward/tenants.yaml \
   --device-quota-config /etc/tunward/quotas.yaml \
@@ -37,6 +38,7 @@ ExecStart=/opt/tunward/current/tunward server \
   --fleet-inventory /var/lib/tunward/devices.sqlite3 \
   --management-api 127.0.0.1:8081 \
   wts://0.0.0.0:8443
+ExecReload=/opt/tunward/current/tunward reload --socket %t/tunward/reload.sock
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30

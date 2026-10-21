@@ -34,6 +34,9 @@ jobs:
         run: python -m unittest discover -s scripts -p test_server_config.py -v
       - name: Exercise native transport runtime
         run: python scripts/qualify_runtime.py --output "${{ runner.temp }}/tunward-native-${{ github.run_id }}-${{ github.run_attempt }}"
+      - name: Exercise native Unix configuration reload
+        if: runner.os != 'Windows'
+        run: python scripts/qualify_reload.py --output "${{ runner.temp }}/tunward-native-${{ github.run_id }}-${{ github.run_attempt }}/reload"
       - name: Preserve native evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -43,3 +46,6 @@ jobs:
             ${{ runner.temp }}/tunward-native-${{ github.run_id }}-${{ github.run_attempt }}/results.json
             ${{ runner.temp }}/tunward-native-${{ github.run_id }}-${{ github.run_attempt }}/metadata.json
             ${{ runner.temp }}/tunward-native-${{ github.run_id }}-${{ github.run_attempt }}/*.log
+            ${{ runner.temp }}/tunward-native-${{ github.run_id }}-${{ github.run_attempt }}/reload/results.json
+            ${{ runner.temp }}/tunward-native-${{ github.run_id }}-${{ github.run_attempt }}/reload/metadata.json
+            ${{ runner.temp }}/tunward-native-${{ github.run_id }}-${{ github.run_attempt }}/reload/*.log

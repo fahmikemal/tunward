@@ -8,6 +8,7 @@ use crate::tunnel::ca_reloader::SystemCaReloader;
 use crate::tunnel::server::TlsServerConfig;
 use anyhow::{Context, ensure};
 use parking_lot::Mutex;
+use std::sync::Arc;
 use url::Url;
 
 pub(crate) struct ServerConfigFiles {
@@ -15,6 +16,7 @@ pub(crate) struct ServerConfigFiles {
     pub restrictions: RestrictionsRules,
     pub device_quotas: Option<DeviceQuotaConfig>,
     pub http_proxy: Option<Url>,
+    pub tenants: Option<Arc<TenantPolicy>>,
 }
 
 /// Validate server arguments and referenced policy/TLS files without starting services.
@@ -135,14 +137,17 @@ pub(crate) fn load_server_files(args: &ServerCreationRequest) -> anyhow::Result<
     if let Some(path) = &args.device_revocation_config {
         RevocationManager::from_path(path)?;
     }
-    if let Some(path) = &args.tenant_config {
+    let tenants = if let Some(path) = &args.tenant_config {
         ensure!(args.restrict_config.is_some(), "tenant isolation requires --restrict-config");
-        TenantPolicy::from_path(path, &restrictions)?;
-    }
+        Some(TenantPolicy::from_path(path, &restrictions)?)
+    } else {
+        None
+    };
     Ok(ServerConfigFiles {
         tls,
         restrictions,
         device_quotas,
         http_proxy,
+        tenants,
     })
 }

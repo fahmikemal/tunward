@@ -4,6 +4,9 @@ pub mod executor;
 pub mod management;
 mod protocols;
 pub mod quotas;
+pub mod reload;
+#[cfg(unix)]
+pub mod reload_socket;
 mod restrictions;
 mod revocation;
 mod server_config;
@@ -500,23 +503,53 @@ async fn create_client_tunnels(
 }
 
 pub async fn run_server(args: ServerCreationRequest, executor: impl TokioExecutor) -> anyhow::Result<()> {
+    run_server_inner(args, executor, None).await
+}
+
+/// Enable explicit, acknowledged reload of the configured policy and TLS file paths.
+pub async fn run_server_with_reload(
+    args: ServerCreationRequest,
+    executor: impl TokioExecutor,
+    reload: reload::ServerReload,
+) -> anyhow::Result<()> {
+    run_server_inner(args, executor, Some(reload)).await
+}
+
+async fn run_server_inner(
+    args: ServerCreationRequest,
+    executor: impl TokioExecutor,
+    reload: Option<reload::ServerReload>,
+) -> anyhow::Result<()> {
     let (tx, rx) = oneshot::channel();
     let exec = executor.ref_clone();
     executor.spawn(async move {
-        let ret = run_server_impl(args, exec).await;
+        let ret = run_server_impl(args, exec, reload).await;
         let _ = tx.send(ret);
     });
 
     rx.await?
 }
 
-async fn run_server_impl(args: ServerCreationRequest, executor: impl TokioExecutorRef) -> anyhow::Result<()> {
+async fn run_server_impl(
+    args: ServerCreationRequest,
+    executor: impl TokioExecutorRef,
+    reload: Option<reload::ServerReload>,
+) -> anyhow::Result<()> {
+    let files = server_config::load_server_files(&args)?;
+    let managed = reload
+        .as_ref()
+        .map(|_| {
+            reload::ReloadSnapshot::prepare(&args, &files, 1)
+                .map(|snapshot| Arc::new(reload::ReloadState::new(args.clone(), snapshot)))
+        })
+        .transpose()?;
     let server_config::ServerConfigFiles {
         tls: tls_config,
         restrictions,
         device_quotas,
         http_proxy,
-    } = server_config::load_server_files(&args)?;
+        ..
+    } = files;
     let is_webtransport = args.remote_addr.scheme() == "wts";
     let server_config = ServerConfig {
         socket_so_mark: SoMark::new(args.socket_so_mark),
@@ -552,7 +585,10 @@ async fn run_server_impl(args: ServerCreationRequest, executor: impl TokioExecut
         fleet_inventory_max_devices: args.fleet_inventory_max_devices,
         tenant_config: args.tenant_config,
     };
-    let server = Server::new(server_config, executor);
+    let mut server = Server::new(server_config, executor);
+    if let (Some(state), Some(reload)) = (managed, reload) {
+        server = server.with_reload(state, reload);
+    }
 
     info!(
         "Starting tunward server v{} with config {:?}",

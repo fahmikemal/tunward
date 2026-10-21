@@ -98,10 +98,53 @@ for certificate deployment checks. Omitting server identity files still permits
 the development self-signed fallback; a successful check does not make it trusted.
 
 This validates the files supplied through existing server options; there is no
-unified `-c` configuration file. Full graceful configuration reload remains
-pending: quota/tenant/startup changes still need a restart. Validation reads files
-at that moment; keep candidates immutable until activation. See the
-[deployment procedure](docs/DEPLOYMENT.md).
+unified `-c` configuration file. Validation reads files at that moment; keep
+candidates immutable until activation. See the [deployment procedure](docs/DEPLOYMENT.md).
+
+## Graceful file configuration reload
+
+On a Unix server, add `--graceful-reload` to enable explicit reload through
+SIGHUP, or add `--reload-socket /run/tunward/reload.sock` for acknowledged reload
+(which also enables SIGHUP). The socket's parent must already exist with mode
+`0700`; the server creates a mode-`0600` socket and refuses to overwrite an
+existing path. The [systemd template](deploy/tunward.service) sets up that private
+runtime directory and enables this mode.
+
+~~~sh
+tunward reload --socket /run/tunward/reload.sock
+# With the installed service template:
+sudo systemctl reload tunward
+~~~
+
+The command waits for validation and activation, prints the applied generation,
+and exits `0`. A rejected candidate exits nonzero and leaves the active
+restriction/quota/tenant/TLS generation intact. SIGHUP reports its result in the
+server log; use the socket command when completion must be acknowledged.
+
+| Change at the configured file paths | Managed reload behavior |
+| --- | --- |
+| Restriction rules | Validated with tenant references and used for new tunnel requests; existing forwarding stays open |
+| Device quotas | Existing counts and token credit are preserved; new admissions use new caps, existing payload streams use new shaping rates |
+| Tenant membership, roles, and resource scope | New requests use the current policy; removed, moved, or reduced grants disconnect that device's sessions and retained reverse listeners; equivalent/expanded grants and other devices stay connected |
+| Server certificate/key and client CA | TCP and QUIC acceptors switch for new handshakes; established sessions retain their original TLS authentication |
+| Device revocation | Keeps its independent one-second fail-closed reload and can terminate active work even when a grouped reload is rejected |
+| Listener address/port, transport enablement, file paths, inventory options, proxy/DNS/heartbeat/startup arguments | Restart required |
+
+In managed mode, restriction and TLS file watchers are disabled: edit all
+candidates, validate them with `server -t`, then request one reload. The default
+mode retains its earlier restriction/TLS automatic watching and startup-only
+quotas/tenants. Reload does not reread environment variables or change CLI
+arguments. Removing a CA or tightening a destination restriction does not revoke
+already-admitted streams; use explicit device/certificate revocation when they
+must close immediately.
+
+This is an in-process generation switch, not an atomic filesystem publication
+or a distributed transaction. Publish reviewed, immutable candidates before
+reloading. Validate certificate expiry/hostname/issuer trust separately. A
+control timeout leaves the outcome unconfirmed; inspect the server generation
+log before retrying. The portable library API is `ServerReload` with
+`run_server_with_reload`; CLI control sockets and SIGHUP require a Unix server.
+Qualification remains beta; see [reload deployment and limits](docs/DEPLOYMENT.md).
 
 ## Containers
 
@@ -412,7 +455,8 @@ CNs to one tenant and explicit tunnel roles. Add
 replacing `--restrict-to`. Adapt the [tenant policy](tenant-policy.example.yaml)
 and its [named restriction rules](tenant-restrictions.example.yaml) together. Roles, tenant rule scope, existing destination rules, and reserved
 reverse endpoints must all permit a request. Unknown devices are denied;
-header labels cannot choose roles or tenants. Policy changes require restart.
+header labels cannot choose roles or tenants. Policy contents support managed
+reload; changing startup file paths requires restart.
 
 Reverse listeners cannot be reused by another verified device, even without
 these optional policies. Tenant mode also separates bind pools and exact Unix

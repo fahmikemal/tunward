@@ -45,10 +45,64 @@ separately below, then run a canary using the intended runtime environment.
 Keep each candidate file immutable between validation and activation: validation
 does not lock a set of files or commit a configuration transaction.
 
-This command does not reload a running process. Restrictions and revocations
-retain their existing automatic reload behavior; quotas and tenant policy still
-need a restart. Listener/startup changes also need a restart. Full graceful
-configuration reload and `systemctl reload tunward` are not implemented.
+This command does not reload a running process. For activation without a process
+restart, enable the managed reload mode below. Listener/startup arguments still
+need a restart.
+
+## Managed reload
+
+Add `--graceful-reload` for Unix SIGHUP handling, or `--reload-socket PATH` for
+acknowledged reload and SIGHUP. The socket path must be absolute and its parent
+must already be a private directory with mode `0700` or stricter. The socket is
+created with mode `0600`. Existing paths are refused rather than deleted; after
+an unmanaged crash, remove a stale socket only after confirming its old owner
+is gone. The systemd template manages its runtime directory automatically.
+
+~~~sh
+tunward reload --socket /run/tunward/reload.sock
+sudo systemctl reload tunward
+~~~
+
+The socket command waits for validation and activation and reports the applied
+generation and number of sessions disconnected by reduced tenant grants. A
+rejected candidate returns nonzero and retains the active restriction, quota,
+tenant, and TLS snapshot. File parsing runs off the I/O workers; reload requests
+are serialized, and concurrent requests receive distinct generation numbers.
+The control service bounds concurrent clients, request size, and I/O deadlines.
+A timeout means the result is unconfirmed; check the server generation log and
+actual policy behavior before retrying. Raw SIGHUP logs success/failure and does
+not acknowledge completion to its sender.
+
+Prepare all file contents, run the offline check, and trigger reload only after
+publishing a stable candidate set. Runtime snapshots are atomic; filesystem
+publication across several files is not. Keep candidate directories immutable
+or coordinate one reviewed version-directory switch. In managed mode the
+individual restriction/TLS watchers are disabled, so partial file publication
+does not activate those changes before the explicit reload.
+
+Quota counters and token credit survive reload. Lower session/tunnel caps keep
+existing work counted and deny new admissions until usage permits them. Existing
+stream shapers observe changed rates; blocked bandwidth waits recheck within
+100 ms. Equivalent or expanded tenant grants preserve sessions. A removed
+device, tenant move, or reduced effective role/resource grant cancels that
+device's authenticated sessions and retained reverse listeners; this can close
+its otherwise-permitted streams as part of enforcing the new device grant.
+Other devices keep their sessions. Live fleet metadata follows retained grants.
+
+Destination restriction changes apply to new tunnel requests. TLS identity and
+client-CA changes apply to new handshakes, including QUIC; established streams
+retain their original admission and authentication. Use device/certificate
+revocation to terminate already-admitted work immediately. Revocation keeps its
+independent one-second fail-closed reload, including when a managed candidate is
+rejected; it is not rolled back with that candidate.
+
+The configured file paths, listener address/port, enabled transports, inventory
+settings, DNS/proxy/heartbeat options, environment, and other startup arguments
+do not change through reload. Change them through a controlled restart or
+canary/drain deployment. The default server mode retains legacy automatic
+restriction/TLS watching and startup-only quotas/tenants. The library API
+`ServerReload` with `run_server_with_reload` is portable; CLI sockets/SIGHUP are
+Unix-server features. This does not qualify production rollout or WAN endurance.
 
 ## Validate certificates before activation
 
@@ -74,11 +128,12 @@ the renewal/recovery budget. A renewal failure must leave the current valid
 bundle intact and alert its owner.
 
 Publish a new certificate and matching key as one versioned candidate. Validate
-before replacing any live path. Native file reload exists, including a five-minute
+before replacing any live path. In default mode, native file reload includes a five-minute
 poll fallback for symlink changes, but independent file updates can briefly
 produce a mismatched pair. Invalid TLS rebuilds retain the active acceptor;
 that is recovery behavior, not an atomic multi-file deployment transaction.
-Prove successful fresh handshakes after activation on every enabled transport.
+Managed mode validates the whole candidate before switching acceptors on TCP
+and QUIC. Prove successful fresh handshakes after activation on every enabled transport.
 
 For a server issuer migration, distribute overlapping old/new trust to clients
 first, then switch the server certificate, then remove old trust only after
@@ -99,18 +154,26 @@ Adapt the [restriction](../tenant-restrictions.example.yaml),
 and [revocation](../device-revocations.example.yaml) examples before installation.
 Do not deploy the example CNs/grants as an enrollment policy.
 
-`LoadCredential` snapshots server identity and client trust when the service
-starts. Renewal in this layout requires a controlled restart to load new
-credentials; it does not rely on live source-path watching. Unit specifier `%d`
-is the private credentials directory. Keep the original key root-readable only.
+The template reads TLS files directly so reload can read their new contents.
+Provision `/etc/tunward/tls` as `root:tunward` mode `0750`, with the private key
+`root:tunward` mode `0640` (or an equivalent service-readable private ACL).
+Keep policy/trust files and their parent directories administrator-owned and
+readable by the service account. The service must not be able to publish its own
+replacement policy or keys. The CA signing key stays outside the server.
+`RuntimeDirectory=tunward` creates a private `/run/tunward` directory; `%t` is
+the manager's runtime root. The socket command in `ExecReload` waits for the
+running process to acknowledge the new generation. It does not run a second
+tunnel server or replace the main PID.
 The template uses unprivileged ports and grants no capabilities. TProxy belongs
 in a separately qualified client/routing setup, not this server unit.
 
 `ExecStartPre` runs the offline configuration check before each start and prevents
 `ExecStart` when validation fails. Keep its arguments identical to `ExecStart`,
-apart from `--test-config`. This uses the credentials made available to the unit;
-it does not validate a future replacement credential snapshot or keep sessions
-alive during a restart. The template has no `ExecReload`.
+apart from `--test-config`. When migrating an older installed unit, remove its
+`LoadCredential` directives and `%d` paths, provision the direct-file permissions,
+then daemon-reload and perform one controlled restart to enable the new mode.
+Keeping start-time credential snapshots requires restarting to replace those
+snapshots, even though the process now supports file reload.
 
 The service restricts filesystem writes to its managed state and private temporary
 directory. Configure any Unix reverse paths inside permitted private runtime/state
@@ -170,5 +233,8 @@ python3 scripts/qualify_pki.py --output target/qualification/pki-review
 ## Contracts
 
 - [systemd credentials](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#LoadCredential=ID:PATH)
+- [systemd synchronous reload commands](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html#ExecReload=)
+- [ArcSwap snapshot consistency](https://docs.rs/arc-swap/latest/arc_swap/docs/patterns/index.html)
+- [Tokio Unix signal handling](https://docs.rs/tokio/latest/tokio/signal/unix/index.html)
 - [OpenSSL certificate verification](https://docs.openssl.org/master/man1/openssl-verification-options/)
 - [ACME protocol, RFC 8555](https://www.rfc-editor.org/rfc/rfc8555.html)

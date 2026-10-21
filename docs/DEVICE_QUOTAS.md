@@ -44,8 +44,13 @@ devices:
     download_bytes_per_second: 2097152
 ~~~
 
-The file is loaded and validated at startup. Changes require a server restart;
-there is no hot reload of limits or accounting. The CLI also accepts
+The file is loaded and validated at startup. With [managed reload](DEPLOYMENT.md#managed-reload),
+edited limits can be activated without restarting. Existing session/tunnel
+counts and depleted token credit are preserved, including across a no-op reload.
+Lower caps keep active work counted and reject new admissions until usage drops;
+existing stream shapers observe new rates, with blocked waits rechecking within
+100 ms. Default mode still requires restart to change quota limits. Changing the
+startup quota file path also requires restart. The CLI accepts
 `TUNWARD_DEVICE_QUOTA_CONFIG`. Configuring quotas on cleartext or without the
 client-CA verifier fails before the server listens.
 

@@ -1,6 +1,7 @@
 //! Process-local quotas keyed by the verified mTLS Common Name.
 
 use anyhow::{Context, ensure};
+use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -139,50 +140,82 @@ impl fmt::Display for QuotaError {
 impl std::error::Error for QuotaError {}
 
 #[derive(Clone)]
+enum QuotaSource {
+    Static(Arc<DeviceQuotaConfig>),
+    Live(Arc<ArcSwap<crate::reload::ReloadSnapshot>>),
+}
+
+impl QuotaSource {
+    fn config(&self) -> Arc<DeviceQuotaConfig> {
+        match self {
+            Self::Static(config) => config.clone(),
+            Self::Live(config) => config
+                .load()
+                .device_quotas
+                .as_ref()
+                .expect("quota source is fixed at startup")
+                .clone(),
+        }
+    }
+
+    fn limits(&self, identity: &str) -> DeviceQuotaLimits {
+        let config = self.config();
+        config
+            .devices
+            .get(identity)
+            .map(|limits| limits.inherit(&config.default))
+            .unwrap_or_else(|| config.default.clone())
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct QuotaManager {
-    config: Arc<DeviceQuotaConfig>,
+    config: QuotaSource,
     devices: Arc<Mutex<HashMap<String, Arc<DeviceState>>>>,
 }
 
 impl QuotaManager {
     pub fn new(config: DeviceQuotaConfig) -> Self {
         Self {
-            config: Arc::new(config),
+            config: QuotaSource::Static(Arc::new(config)),
+            devices: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn live(config: Arc<ArcSwap<crate::reload::ReloadSnapshot>>) -> Self {
+        Self {
+            config: QuotaSource::Live(config),
             devices: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub fn open_session(&self, identity: &str) -> Result<QuotaSession, QuotaError> {
+        let config = self.config.config();
+        let limits = config
+            .devices
+            .get(identity)
+            .map(|limits| limits.inherit(&config.default))
+            .unwrap_or_else(|| config.default.clone());
         let device = {
             let mut devices = self.devices.lock();
             if let Some(device) = devices.get(identity) {
                 device.clone()
             } else {
-                if devices.len() >= self.config.max_tracked_devices.get() as usize {
+                if devices.len() >= config.max_tracked_devices.get() as usize {
                     // Retain depleted buckets across reconnects; evict only inactive, refilled entries.
                     devices.retain(|_, device| Arc::strong_count(device) != 1 || !device.can_evict());
                 }
-                if devices.len() >= self.config.max_tracked_devices.get() as usize {
+                if devices.len() >= config.max_tracked_devices.get() as usize {
                     return Err(QuotaError::limit("tracked_device_limit"));
                 }
-                let limits = self
-                    .config
-                    .devices
-                    .get(identity)
-                    .map(|limits| limits.inherit(&self.config.default))
-                    .unwrap_or_else(|| self.config.default.clone());
-                let device = Arc::new(DeviceState::new(limits, Arc::from(identity)));
+                let device = Arc::new(DeviceState::new(self.config.clone(), Arc::from(identity)));
                 devices.insert(identity.to_owned(), device.clone());
                 device
             }
         };
         {
             let mut counts = device.counts.lock();
-            if device
-                .limits
-                .max_sessions
-                .is_some_and(|max| counts.sessions >= max.get())
-            {
+            if limits.max_sessions.is_some_and(|max| counts.sessions >= max.get()) {
                 return Err(QuotaError::limit("session_limit"));
             }
             counts.sessions = counts
@@ -202,7 +235,7 @@ struct Counts {
 
 struct DeviceState {
     identity: Arc<str>,
-    limits: DeviceQuotaLimits,
+    source: QuotaSource,
     counts: Mutex<Counts>,
     requests: Option<RateLimiter>,
     upload: Option<RateLimiter>,
@@ -210,20 +243,26 @@ struct DeviceState {
 }
 
 impl DeviceState {
-    fn new(limits: DeviceQuotaLimits, identity: Arc<str>) -> Self {
-        let requests = limits
+    fn new(source: QuotaSource, identity: Arc<str>) -> Self {
+        let limits = source.limits(&identity);
+        let mut requests = limits
             .requests_per_second
             .map(|rate| RateLimiter::new(u64::from(rate.get()), u64::from(limits.request_burst.unwrap_or(rate).get())));
         let burst = limits.bandwidth_burst_bytes.map_or(RECORD_BYTES, NonZeroU64::get);
-        let upload = limits
+        let mut upload = limits
             .upload_bytes_per_second
             .map(|rate| RateLimiter::new(rate.get(), burst));
-        let download = limits
+        let mut download = limits
             .download_bytes_per_second
             .map(|rate| RateLimiter::new(rate.get(), burst));
+        if matches!(source, QuotaSource::Live(_)) {
+            requests = Some(RateLimiter::live(source.clone(), identity.clone(), Direction::Requests));
+            upload = Some(RateLimiter::live(source.clone(), identity.clone(), Direction::Upload));
+            download = Some(RateLimiter::live(source.clone(), identity.clone(), Direction::Download));
+        }
         Self {
             identity,
-            limits,
+            source,
             counts: Mutex::new(Counts::default()),
             requests,
             upload,
@@ -271,7 +310,12 @@ impl QuotaSession {
     pub fn open_tunnel(&self) -> Result<TunnelPermit, QuotaError> {
         let device = &self.0.device;
         let mut counts = device.counts.lock();
-        if device.limits.max_tunnels.is_some_and(|max| counts.tunnels >= max.get()) {
+        if device
+            .source
+            .limits(&device.identity)
+            .max_tunnels
+            .is_some_and(|max| counts.tunnels >= max.get())
+        {
             return Err(QuotaError::limit("tunnel_limit"));
         }
         counts.tunnels = counts
@@ -329,22 +373,83 @@ impl Bucket {
 }
 
 #[derive(Clone)]
-pub(crate) struct RateLimiter(Arc<Mutex<Bucket>>);
+pub(crate) struct RateLimiter(Arc<Mutex<Bucket>>, Option<(QuotaSource, Arc<str>, Direction)>);
+
+#[derive(Clone, Copy)]
+enum Direction {
+    Requests,
+    Upload,
+    Download,
+}
 
 impl RateLimiter {
     fn new(rate: u64, burst: u64) -> Self {
         let capacity = u128::from(burst) * TOKEN_SCALE;
-        Self(Arc::new(Mutex::new(Bucket {
-            rate,
-            capacity,
-            credit: capacity,
-            updated: Instant::now(),
-        })))
+        Self(
+            Arc::new(Mutex::new(Bucket {
+                rate,
+                capacity,
+                credit: capacity,
+                updated: Instant::now(),
+            })),
+            None,
+        )
+    }
+
+    fn live(source: QuotaSource, identity: Arc<str>, direction: Direction) -> Self {
+        let mut limiter = Self::new(0, 0);
+        limiter.1 = Some((source, identity, direction));
+        limiter.refresh(&mut limiter.0.lock());
+        limiter
+    }
+
+    fn refresh(&self, bucket: &mut Bucket) {
+        let Some((source, identity, direction)) = &self.1 else {
+            return;
+        };
+        let limits = source.limits(identity);
+        let (rate, burst) = match direction {
+            Direction::Requests => (
+                limits.requests_per_second.map(|n| u64::from(n.get())),
+                limits
+                    .request_burst
+                    .or(limits.requests_per_second)
+                    .map(|n| u64::from(n.get())),
+            ),
+            Direction::Upload => (
+                limits.upload_bytes_per_second.map(NonZeroU64::get),
+                limits.bandwidth_burst_bytes.map(NonZeroU64::get),
+            ),
+            Direction::Download => (
+                limits.download_bytes_per_second.map(NonZeroU64::get),
+                limits.bandwidth_burst_bytes.map(NonZeroU64::get),
+            ),
+        };
+        let rate = rate.unwrap_or(0);
+        let capacity = if rate == 0 {
+            0
+        } else {
+            u128::from(burst.unwrap_or(RECORD_BYTES)) * TOKEN_SCALE
+        };
+        if bucket.rate != rate || bucket.capacity != capacity {
+            bucket.refill();
+            bucket.credit = if bucket.rate == 0 {
+                capacity
+            } else {
+                bucket.credit.min(capacity)
+            };
+            bucket.rate = rate;
+            bucket.capacity = capacity;
+        }
     }
 
     // A failed attempt reserves no future credit, so cancellation cannot strand a reservation.
     fn try_take(&self, amount: u64) -> Option<Duration> {
         let mut bucket = self.0.lock();
+        self.refresh(&mut bucket);
+        if bucket.rate == 0 {
+            return None;
+        }
         bucket.refill();
         let requested = u128::from(amount) * TOKEN_SCALE;
         if requested <= bucket.credit {
@@ -358,6 +463,7 @@ impl RateLimiter {
 
     fn is_full(&self) -> bool {
         let mut bucket = self.0.lock();
+        self.refresh(&mut bucket);
         bucket.refill();
         bucket.credit == bucket.capacity
     }
@@ -385,7 +491,14 @@ impl BandwidthWait {
             }
             match limiter.try_take(bytes as u64) {
                 None => return Poll::Ready(()),
-                Some(delay) => self.sleep = Some(Box::pin(tokio::time::sleep(delay))),
+                Some(delay) => {
+                    let delay = if limiter.1.is_some() {
+                        delay.min(Duration::from_millis(100))
+                    } else {
+                        delay
+                    };
+                    self.sleep = Some(Box::pin(tokio::time::sleep(delay)));
+                }
             }
         }
     }
@@ -400,6 +513,88 @@ mod tests {
         let config: DeviceQuotaConfig = serde_yaml::from_str(yaml).unwrap();
         config.validate().unwrap();
         config
+    }
+
+    fn live_config(config: DeviceQuotaConfig) -> (QuotaManager, Arc<ArcSwap<crate::reload::ReloadSnapshot>>) {
+        let snapshot = crate::reload::ReloadSnapshot {
+            generation: 1,
+            restrictions: Arc::new(crate::restrictions::types::RestrictionsRules::from_path_prefix(&[], &[]).unwrap()),
+            tenants: None,
+            device_quotas: Some(Arc::new(config)),
+            tcp_tls: None,
+            quic_tls: None,
+        };
+        let source = Arc::new(ArcSwap::from_pointee(snapshot));
+        (QuotaManager::live(source.clone()), source)
+    }
+
+    fn replace_live(source: &ArcSwap<crate::reload::ReloadSnapshot>, config: DeviceQuotaConfig) {
+        let mut snapshot = (*source.load_full()).clone();
+        snapshot.generation += 1;
+        snapshot.device_quotas = Some(Arc::new(config));
+        source.store(Arc::new(snapshot));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reload_preserves_counts_and_depleted_request_credit() {
+        let initial =
+            config("version: 1\ndefault: {max_sessions: 2, max_tunnels: 2, requests_per_second: 1, request_burst: 1}");
+        let (manager, source) = live_config(initial.clone());
+        let first = manager.open_session("a").unwrap();
+        let second = manager.open_session("a").unwrap();
+        let one = first.open_tunnel().unwrap();
+        let two = second.open_tunnel().unwrap();
+        first.check_request().unwrap();
+        replace_live(&source, initial);
+        assert!(first.check_request().is_err(), "no-op reload must not refill request tokens");
+        assert!(manager.open_session("a").is_err());
+        assert!(first.open_tunnel().is_err());
+        replace_live(
+            &source,
+            config(
+                "version: 1\ndefault: {max_sessions: 1, max_tunnels: 1, requests_per_second: 10, request_burst: 10}",
+            ),
+        );
+        assert!(first.check_request().is_err(), "larger capacity must not grant a fresh burst");
+        assert!(manager.open_session("a").is_err());
+        assert!(first.open_tunnel().is_err());
+        drop(two);
+        drop(second);
+        assert!(
+            first.open_tunnel().is_err(),
+            "existing tunnel remains counted at the lower limit"
+        );
+        tokio::time::advance(Duration::from_millis(100)).await;
+        first.check_request().unwrap();
+        drop(one);
+        first.open_tunnel().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reload_changes_bandwidth_for_existing_permits_without_resetting_credit() {
+        let (manager, source) = live_config(config("version: 1\ndefault: {max_tunnels: 4}"));
+        let session = manager.open_session("a").unwrap();
+        let permit = session.open_tunnel().unwrap();
+        let upload = permit.upload().unwrap();
+        assert!(upload.try_take(65536).is_none());
+        let limited = config(
+            "version: 1\ndefault: {max_tunnels: 4, upload_bytes_per_second: 65536, bandwidth_burst_bytes: 65536}",
+        );
+        replace_live(&source, limited.clone());
+        assert!(upload.try_take(65536).is_none());
+        assert!(upload.try_take(1).is_some());
+        replace_live(&source, limited);
+        assert!(
+            upload.try_take(1).is_some(),
+            "no-op reload must retain depleted bandwidth credit"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(upload.try_take(65536).is_none());
+        replace_live(&source, config("version: 1\ndefault: {max_tunnels: 4}"));
+        assert!(
+            upload.try_take(65536).is_none(),
+            "removing shaping reaches the already-cloned limiter"
+        );
     }
 
     #[tokio::test]

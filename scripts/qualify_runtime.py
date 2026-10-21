@@ -91,13 +91,13 @@ class RuntimeChecks:
             await self.command("openssl", "verify", "-x509_strict", "-CAfile", self.certs / "ca.pem",
                 "-purpose", "sslserver" if name == "server" else "sslclient", self.certs / f"{name}.pem")
 
-    async def spawn(self, label, *args):
+    async def spawn(self, label, *args, log_level="WARN"):
         env = {k: v for k, v in os.environ.items() if not k.startswith("TUNWARD_") and k not in
                ("NO_COLOR", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "RUST_LOG")}
         env.update(NO_COLOR="true", SSL_CERT_FILE=str(self.certs / "ca.pem"), SSL_CERT_DIR="")
         with (self.out / f"{label}.log").open("wb") as log:
             process = await asyncio.create_subprocess_exec(str(self.binary), *map(str, args),
-                "--nb-worker-threads", "1", "--log-lvl", "WARN", stdout=log, stderr=log, env=env)
+                "--nb-worker-threads", "1", "--log-lvl", log_level, stdout=log, stderr=log, env=env)
         self.processes.append(process)
         self.process_logs[process.pid] = f"{label}.log"
         return process

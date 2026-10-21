@@ -371,7 +371,18 @@ impl Drop for ConnectionState {
 }
 #[derive(Clone)]
 pub(crate) struct ConnectionLease(Arc<ConnectionState>);
+pub(crate) struct WeakConnectionLease(std::sync::Weak<ConnectionState>);
+
+impl WeakConnectionLease {
+    pub fn upgrade(&self) -> Option<ConnectionLease> {
+        self.0.upgrade().map(ConnectionLease)
+    }
+}
+
 impl ConnectionLease {
+    pub fn downgrade(&self) -> WeakConnectionLease {
+        WeakConnectionLease(Arc::downgrade(&self.0))
+    }
     pub fn set_tenant(&self, tenant: Option<&str>, roles: &[String]) {
         if let Some(record) = self.0.registry.connections.write().get_mut(&self.0.id) {
             record.tenant_id = tenant.map(str::to_string);

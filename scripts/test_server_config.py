@@ -130,6 +130,21 @@ class ServerConfigTests(unittest.TestCase):
                              env={**self.env, "TUNWARD_DEVICE_QUOTA_CONFIG": str(self.root / "missing-quota.yaml")})
         self.assertIn("missing-quota.yaml", result.stderr)
 
+    def test_managed_reload_validation_prerequisites(self):
+        if os.name != "posix":
+            result = self.invoke("-t", "--graceful-reload", "ws://127.0.0.1:8443", valid=False)
+            self.assertIn("Unix", result.stderr)
+            return
+        with tempfile.TemporaryDirectory(dir=self.root) as directory:
+            directory = Path(directory)
+            directory.chmod(0o700)
+            control = directory / "control.sock"
+            self.invoke("-t", "--reload-socket", control, "wss://127.0.0.1:8443")
+            self.assertEqual(list(directory.iterdir()), [])
+            directory.chmod(0o755)
+            result = self.invoke("-t", "--reload-socket", control, "ws://127.0.0.1:8443", valid=False)
+            self.assertIn("private parent directory", result.stderr)
+
     def test_error_exit_codes(self):
         invalid_file = self.invoke("-t", "--restrict-config", self.root / "missing.yaml",
                                    "ws://127.0.0.1:8443", valid=False)

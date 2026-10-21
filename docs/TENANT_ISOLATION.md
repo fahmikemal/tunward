@@ -1,6 +1,6 @@
 # Device ownership and tenant authorization
 
-`--tenant-config FILE` enables startup-loaded tenant membership and roles for
+`--tenant-config FILE` enables verified tenant membership and roles for
 verified mTLS device identities. It applies to WSS, HTTP/2, and WebTransport.
 It is disabled by default and requires both actual mTLS and `--restrict-config`.
 Unknown devices are denied even when their certificates have a trusted issuer.
@@ -135,7 +135,7 @@ port outside required forwarding destinations. This is not a transitive egress
 firewall against a permitted destination acting as another proxy.
 
 Live connection records add `tenant_id` and `roles`; tunnel and reverse-listener
-records add `tenant_id`. These fields come from the startup policy. The additive
+records add `tenant_id`. These fields come from the active policy. The additive
 JSON fields default to absent/empty when reading older records. The
 [SQLite inventory](FLEET_INVENTORY.md) schema is unchanged and does not persist
 authoritative tenant membership or role history. Unknown tenant identities are
@@ -143,13 +143,22 @@ rejected before inventory observation.
 
 ## Policy operations and deployment limits
 
-Tenant membership, roles, and reserved resources are loaded only at startup.
-Changes require restart and do not hot-reload. Use the separate live revocation
-file for urgent device/session termination. A device removed from tenant policy
-must reconnect after the new server policy starts to be evaluated again.
+Tenant membership, roles, and reserved resources load at startup and support
+[managed reload](DEPLOYMENT.md#managed-reload). A candidate is validated against
+the candidate named restriction rules before either snapshot is activated.
+Equivalent or expanded effective grants preserve sessions and update their
+fleet metadata. Removing a device, moving it to another tenant, or reducing its
+effective role/resource grants cancels its transport sessions and retained
+reverse resources. This deliberately closes all sessions of the affected device,
+including otherwise-permitted streams; other devices stay connected. New tunnel
+requests on retained HTTP/2 and WebTransport sessions use the current tenant
+policy. Default mode still requires restart for tenant changes. Changing the
+startup tenant file path also requires restart. The independent live revocation
+file remains the mechanism for urgent certificate/CN denial.
 
-The named restriction file retains its existing reload behavior; scope is
-checked against its current rules for each new tunnel request. Changing a
+In managed mode, named restrictions switch with tenant policy through explicit
+reload; default mode retains automatic restriction watching. Scope is
+checked against the current rules for each new tunnel request. Changing a
 restriction does not retroactively terminate admitted forwarding. Preserve
 unique names and review shared-name grants when publishing restriction changes.
 Protect both policy files and their parent directories as authorization state.

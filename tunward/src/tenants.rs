@@ -258,6 +258,50 @@ pub(crate) struct TenantAccess {
 }
 
 impl TenantAccess {
+    /// A restrictive grant change invalidates the device's retained listeners and transport sessions.
+    pub(crate) fn retains(&self, previous: &Self) -> bool {
+        if self.tenant_id() != previous.tenant_id() {
+            return false;
+        }
+        let current = &self.policy.tenants[self.tenant_id()];
+        let old = &previous.policy.tenants[previous.tenant_id()];
+        let permissions = self
+            .membership
+            .roles
+            .iter()
+            .flat_map(|role| &self.policy.roles[role])
+            .collect::<HashSet<_>>();
+        old.restrictions.is_subset(&current.restrictions)
+            && old.unix_paths.is_subset(&current.unix_paths)
+            && previous
+                .membership
+                .roles
+                .iter()
+                .flat_map(|role| &previous.policy.roles[role])
+                .all(|permission| permissions.contains(permission))
+            && old.bindings.iter().all(|binding| {
+                let mut granted = current
+                    .bindings
+                    .iter()
+                    .filter(|new| binding.address == new.address && (!binding.allow_ephemeral || new.allow_ephemeral))
+                    .flat_map(|new| &new.ports)
+                    .collect::<Vec<_>>();
+                granted.sort_unstable_by_key(|range| *range.start());
+                binding.ports.iter().all(|range| {
+                    let mut next = u32::from(*range.start());
+                    for grant in &granted {
+                        if u32::from(*grant.start()) > next {
+                            break;
+                        }
+                        next = next.max(u32::from(*grant.end()) + 1);
+                        if next > u32::from(*range.end()) {
+                            return true;
+                        }
+                    }
+                    false
+                })
+            })
+    }
     pub fn tenant_id(&self) -> &str {
         &self.membership.tenant
     }
@@ -331,6 +375,28 @@ mod tests {
         serde_yaml::from_str("restrictions:\n - name: alpha\n   match: [Any]\n   allow: []\n - name: beta\n   match: [Any]\n   allow: []").unwrap()
     }
     const POLICY: &str = "version: 1\nroles: {reader: [forward_tcp], agent: [reverse_tcp]}\ntenants:\n alpha:\n  restrictions: [alpha]\n  reverse_bindings: [{address: 127.0.0.1, ports: ['20000..20031'], allow_ephemeral: true}]\n beta:\n  restrictions: [beta]\n  reverse_bindings: [{address: 127.0.0.1, ports: ['21000..21031']}]\ndevices:\n a: {tenant: alpha, roles: [reader]}\n b: {tenant: beta, roles: [agent]}\n";
+
+    #[test]
+    fn reload_retains_equivalent_or_expanded_grants_and_rejects_reductions() {
+        let access = |text: &str| {
+            Arc::new(TenantPolicy::parse(text.as_bytes(), &restrictions()).unwrap())
+                .access("a")
+                .unwrap()
+        };
+        let original = access(POLICY);
+        let renamed = access(&POLICY.replace("reader", "renamed"));
+        assert!(renamed.retains(&original));
+        let expanded = access(&POLICY.replace("roles: [reader]", "roles: [reader, agent]"));
+        assert!(expanded.retains(&original));
+        assert!(!original.retains(&expanded));
+        assert!(!access(&POLICY.replace("reader: [forward_tcp]", "reader: [forward_udp]")).retains(&original));
+        assert!(!access(&POLICY.replace("20000..20031", "20000..20015")).retains(&original));
+        assert!(access(&POLICY.replace("20000..20031", "20000..20063")).retains(&original));
+        assert!(access(&POLICY.replace("'20000..20031'", "'20000..20015','20016..20031'")).retains(&original));
+        assert!(!access(&POLICY.replace("'20000..20031'", "'20000..20014','20016..20031'")).retains(&original));
+        assert!(!access(&POLICY.replace("allow_ephemeral: true", "allow_ephemeral: false")).retains(&original));
+        assert!(!access(&POLICY.replace("a: {tenant: alpha", "a: {tenant: beta")).retains(&original));
+    }
 
     #[test]
     fn role_action_and_tenant_scope_are_both_required() {

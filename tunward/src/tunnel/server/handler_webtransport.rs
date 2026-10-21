@@ -38,9 +38,19 @@ pub(super) async fn run_webtransport_server(
     };
 
     let bind = server.config.bind;
-    let mut endpoint = web_transport_quinn::Server::new(mk_quic_endpoint(&server, tls_config)?);
-    let tls_reloader = TlsReloader::new_for_server(server.config.clone())
-        .with_context(|| "Cannot create the tls reloader for webtransport")?;
+    let endpoint = mk_quic_endpoint(&server, tls_config)?;
+    if let Some(state) = &server.managed {
+        state.register_endpoint(endpoint.clone());
+    }
+    let mut endpoint = web_transport_quinn::Server::new(endpoint);
+    let tls_reloader = if server.managed.is_some() {
+        None
+    } else {
+        Some(
+            TlsReloader::new_for_server(server.config.clone())
+                .with_context(|| "Cannot create the tls reloader for webtransport")?,
+        )
+    };
 
     info!("Starting tunward webtransport server listening on udp://{bind}");
     let mut reload_tick = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -51,7 +61,7 @@ pub(super) async fn run_webtransport_server(
             _ = reload_tick.tick() => {
                 // accept() waits for a successful TLS/H3 handshake. A new trust anchor must
                 // be installed even when every pending handshake rejects the old certificate.
-                if tls_reloader.should_reload_certificate() {
+                if tls_reloader.as_ref().is_some_and(TlsReloader::should_reload_certificate) {
                     match mk_quic_server_config(&server, tls_config) {
                         Ok(config) => endpoint.set_server_config(Some(config)),
                         Err(err) => error!("Cannot reload the webtransport TLS certificate {err:?}"),
@@ -88,6 +98,13 @@ fn mk_quic_server_config(
     server: &Server<impl TokioExecutorRef>,
     tls_config: &crate::tunnel::server::TlsServerConfig,
 ) -> anyhow::Result<quinn::ServerConfig> {
+    if let Some(state) = &server.managed {
+        return state
+            .snapshot()
+            .quic_tls
+            .clone()
+            .context("Missing managed QUIC configuration");
+    }
     let tls = tls::quic_server_config(tls_config).with_context(|| "Cannot create the TLS config for webtransport")?;
     let tls = QuicServerConfig::try_from(tls)
         .with_context(|| "Cannot use the TLS config for QUIC, TLS 1.3 with a supported cipher suite is required")?;
@@ -178,10 +195,15 @@ async fn handle_session(
         return Ok(());
     }
 
+    let policy = server.managed.as_ref().map(|state| state.snapshot());
+    let session_restrictions = policy
+        .as_ref()
+        .map(|snapshot| snapshot.restrictions.clone())
+        .unwrap_or_else(|| restrictions.load_full());
     let allowed = matches_any_restriction(
         path_prefix,
         session_headers.get(AUTHORIZATION).and_then(|auth| auth.to_str().ok()),
-        &restrictions.load(),
+        &session_restrictions,
     );
     if !allowed {
         warn!("Rejecting webtransport session from {client_addr}: no restriction matches path prefix '{path_prefix}'");

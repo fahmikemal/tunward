@@ -147,7 +147,7 @@ The repository's [restrictions.yaml](../restrictions.yaml) demonstrates the
 schema and contains broad examples. Review each rule before adapting it; do not
 assume it is a restrictive deployment policy. Forward rule fields include
 protocol, port, host regex, and CIDR; reverse rules include protocol, bind CIDR,
-ports/mappings, and Unix path regex. Device quotas use a separate startup-loaded
+ports/mappings, and Unix path regex. Device quotas use a separate
 [quota configuration](DEVICE_QUOTAS.md), enabled with `--device-quota-config`;
 they do not grant or replace destination access.
 
@@ -193,8 +193,10 @@ development certificate generator does not configure them.
 
 Use the [deployment lifecycle runbook](DEPLOYMENT.md) for certificate candidate
 validation, renewal, issuer migration, canary rollout, and rollback. The example
-systemd service uses start-time credential snapshots and a controlled restart
-for renewal. That layout is distinct from live source-file reload.
+systemd service uses direct, service-readable TLS files and an acknowledged
+managed reload command. Older units using `LoadCredential` must migrate or
+restart to replace their start-time snapshots. See the runbook for permissions
+and the distinction between new-handshake trust and active-session revocation.
 
 ## Git, images, and private key handling
 

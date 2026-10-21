@@ -39,12 +39,22 @@ dependencies in `scripts/requirements-qualification.txt`. Standalone generation 
 | `scripts/qualify_tproxy.py` | Privileged IPv4 TCP/UDP interception inside three disposable Linux network namespaces |
 | `scripts/qualify_dns.py` | Controlled UDP DNS/DoT/DoH, address fallback, resolver-name denial and ECH edge cases |
 | `scripts/qualify_runtime.py` | Native cross-platform TCP/reverse TCP/UDP smoke checks with verified mTLS |
+| `scripts/qualify_reload.py` | Unix acknowledged/SIGHUP reload, live streams, atomic rejection, preserved quotas, tenant cleanup, and TCP/QUIC trust rotation |
 | `scripts/qualify_device_scale.py` | Up to 256 distinct synthetic CN sessions, tenant tags, quotas, inventory and disconnect cleanup |
 | `scripts/qualify_pki.py` | Distinct server key/issuer renewal, old-only trust denial, and rollback |
 | `Dockerfile.qualification` | Python/OpenSSL container environment for the local runner |
 
 The runner snapshots the supplied executable. Rebuilding the original path
 during a run does not change that snapshot. Output directories must be new.
+
+For managed reload, use `python3 scripts/qualify_reload.py --output
+target/qualification/reload-review`. On a Linux host with a running user service
+manager, add `--systemd-user` to test a uniquely named disposable user unit. It
+checks that successful, rejected, and recovered `systemctl reload` operations
+retain the main PID and an active stream, then stops only that test unit.
+This does not qualify the production system unit's user/group, filesystem sandbox,
+real issuer, or file permissions. Native CI exercises the socket/SIGHUP suite on
+Linux and macOS; Windows remains covered by the portable baseline runtime suite.
 Keep `metadata.json`, `results.json`, logs, resource samples, and hashes.
 Suite/resource rows are included in counts; they are not all independent tests.
 
