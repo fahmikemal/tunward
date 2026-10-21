@@ -1,0 +1,72 @@
+name: Recover prerelease assets
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing prerelease tag whose GitHub release packaging failed
+        required: true
+        type: string
+      source_run_id:
+        description: Failed Release run with successful checks, binary builds, and Docker publication
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: Release-refs/tags/${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Checkout recovery controls
+        uses: actions/checkout@v4
+        with:
+          path: control
+      - name: Checkout existing tag source
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.release_tag }}
+          fetch-depth: 0
+          path: release-source
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Validate tag, source run, prerequisites, and absence of an existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          python3 control/scripts/check_release_artifacts.py --source release-source \
+            --tag "$RELEASE_TAG" --run-id "$SOURCE_RUN_ID"
+          cd release-source
+          python3 scripts/check_publication.py --history
+      - name: Download only the previously built binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: tunward-*
+          merge-multiple: false
+          path: release-source/artifacts
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify downloaded set and restore executable permissions
+        run: python3 control/scripts/check_release_artifacts.py --artifacts release-source/artifacts
+      - name: Package and publish the existing prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          python3 control/scripts/package_release.py --source release-source \
+            --artifacts release-source/artifacts --output release-source/dist \
+            --tag "$RELEASE_TAG" --run-id "$SOURCE_RUN_ID" --publish
