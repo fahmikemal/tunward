@@ -396,6 +396,7 @@ reused as a new run's output.
 All protocol/security qualification CI profiles also use a run-specific
 temporary root. CI removes legacy generated qualification fixtures restored
 inside the build cache; local scripts keep their refusal to overwrite evidence.
+CI uploads qualification artifacts only after the per-run output root is set.
 If the host rejects a 40 KB UDP send with `EMSGSIZE`, the native runner records
 that large-datagram case as `not_run` and still verifies an 8 KiB datagram on
 each transport. This does not establish 40 KB UDP support on that host.
