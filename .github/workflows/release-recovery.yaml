@@ -61,16 +61,12 @@ jobs:
           github-token: ${{ github.token }}
       - name: Verify downloaded set and restore executable permissions
         run: python3 control/scripts/check_release_artifacts.py --artifacts release-source/artifacts
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '>=1.21'
       - name: Package and publish the existing prerelease
-        uses: goreleaser/goreleaser-action@v5
-        with:
-          distribution: goreleaser
-          version: '~> v1'
-          workdir: release-source
-          args: release --clean --skip=validate
         env:
-          GITHUB_TOKEN: ${{ github.token }}
-          GORELEASER_CURRENT_TAG: ${{ inputs.release_tag }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          python3 control/scripts/package_release.py --source release-source \
+            --artifacts release-source/artifacts --output release-source/dist \
+            --tag "$RELEASE_TAG" --run-id "$SOURCE_RUN_ID" --publish

@@ -72,7 +72,9 @@ jobs:
         run: taplo fmt --check
 
       - name: Verify release tag guards
-        run: python3 -m unittest discover -s scripts -p 'test_check_release*.py'
+        run: |
+          python3 -m unittest discover -s scripts -p 'test_check_release*.py'
+          python3 -m unittest discover -s scripts -p test_package_release.py
 
       - name: Lint with Clippy
         run: cargo clippy --all --all-features --locked -- -D warnings

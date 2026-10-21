@@ -189,6 +189,15 @@ packaging selects only `tunward-*`, keeps target directories separate, verifies
 the exact fourteen-binary set, and restores executable permissions lost during
 artifact upload/download. Keep the artifact target list in
 `scripts/check_release_artifacts.py` aligned with the build matrix; CI checks it.
+`scripts/package_release.py` archives all fourteen original binaries directly,
+including Android ARMv7, with normalized modes, ownership, and tag-commit
+timestamps. It verifies each archived binary against its downloaded artifact
+and emits archive checksums plus a manifest of binary hashes, source commit,
+and run ID. Repeating packaging with identical input bytes and packaging runtime
+is deterministic; this does not prove reproducibility of the Rust compilation.
+The active workflow no longer uses the legacy Go placeholder build/hooks, which
+omitted the Android ARMv7 archive. GitHub prereleases are marked explicitly and
+publication never replaces an existing release or automatically marks it latest.
 Docker's [build record guidance](https://github.com/docker/build-push-action#summaries)
 describes the download-all failure.
 

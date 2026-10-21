@@ -185,7 +185,10 @@ separate operations, so inspect both after a failure or rerun.
 GitHub release packaging downloads only `tunward-*` binary artifacts; Docker
 build records (`*.dockerbuild`) and native qualification evidence are excluded.
 The packaging check verifies all fourteen binaries and restores executable file
-modes before archiving. If only GitHub packaging failed after image publication,
+modes before archiving, including Android ARMv7. Archives contain the original
+Rust binaries, LICENSE, and the tagged README; packaging needs no Go placeholder
+builds. `checksums.txt` and `release-manifest.json` record archive/binary hashes,
+the source commit, and build run ID. If only GitHub packaging failed after image publication,
 the guarded [prerelease recovery workflow](.github/workflows/release-recovery.yaml)
 can reuse that tag's successful build artifacts. See
 [recovery prerequisites and limits](CONTRIBUTING.md#recover-a-partial-prerelease).
