@@ -181,6 +181,44 @@ the image digest and release assets before retrying a partial publication.
 an optional existing `RELEASE_TOKEN` secret overrides it. No token is required
 in pull requests. Do not infer that the newest source is already released.
 
+### Recover a partial prerelease
+
+Docker build-push uploads `*.dockerbuild` records as well as publishing an image.
+These records must not be passed to a generic ZIP artifact downloader. Release
+packaging selects only `tunward-*`, keeps target directories separate, verifies
+the exact fourteen-binary set, and restores executable permissions lost during
+artifact upload/download. Keep the artifact target list in
+`scripts/check_release_artifacts.py` aligned with the build matrix; CI checks it.
+Docker's [build record guidance](https://github.com/docker/build-push-action#summaries)
+describes the download-all failure.
+
+An existing tag retains its original workflow when a job is rerun; changing
+`main` does not patch that tagged run. After a partial publication, do not move
+the tag or republish its image merely to rerun GitHub packaging. The
+[recovery workflow](.github/workflows/release-recovery.yaml) runs manually from
+`main` with an existing prerelease tag and the original Release run ID:
+
+~~~sh
+gh workflow run release-recovery.yaml --ref main \
+  -f release_tag=v0.1.0-beta -f source_run_id=39564724170
+~~~
+
+The guard requires a completed failed tag-push run in this repository matching
+the checked-out tag commit. Version checks, all native runtimes, fourteen binary
+builds, and Docker publication must have succeeded; only the final Release job
+may have failed. All binary artifacts must remain available and belong to that
+commit. Recovery refuses an existing GitHub release, including drafts, rather
+than silently replacing published assets. It packages the original tag source
+and binaries; it does not rebuild Rust, push an image, or change the tag. The
+`GITHUB_TOKEN` needs actions-read and contents-write only for that job.
+
+Use the actual failed run ID, not an unrelated successful run. Build artifacts
+currently expire after one day. Expired artifacts, failed prerequisites, or a
+partially created release require operator review; this workflow refuses them.
+After recovery, verify the prerelease flag, archive contents/executable modes,
+checksums, and existing image digest. The original failed run remains as evidence;
+a successful recovery does not turn its historical result green.
+
 ## Pull requests and reports
 
 Keep changes focused and describe the concrete before/after behavior. Include

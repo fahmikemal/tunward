@@ -323,13 +323,19 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Download all artifacts
-      - uses: actions/download-artifact@v4.1.7
+      - name: Download release binaries only
+        uses: actions/download-artifact@v4
         with:
+          pattern: tunward-*
+          merge-multiple: false
           path: artifacts
 
-      - name: list artifacts
-        run: find artifacts/
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Verify binary set and restore executable permissions
+        run: python3 scripts/check_release_artifacts.py --artifacts artifacts
 
       - name: Set up Go
         uses: actions/setup-go@v5

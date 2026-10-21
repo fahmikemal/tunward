@@ -17,6 +17,13 @@ Production qualification is incomplete. Completed 24–72 hour WAN evidence,
 representative physical-device tests, and deployment-specific certificate and
 rollback validation are still required before a production sign-off.
 
+The v0.1 beta has a sufficient feature baseline for controlled evaluation. The
+next milestone is secure defaults and qualification: public-listener
+TLS/authentication/access-policy requirements, explicit development exceptions,
+default-deny tunnel access, initial resource limits, and negative startup tests.
+These default-policy changes are **planned, not implemented in `v0.1.0-beta`**.
+See the [roadmap and stable-release gates](ROADMAP.md).
+
 The public `main` history was rewritten on 2026-10-21 to remove the three old
 development private keys. If you cloned earlier, use a fresh clone and reapply
 reviewed source changes without merging old history. Cache/fork cleanup and
@@ -28,6 +35,7 @@ with the qualification gates above still open.
 
 | Guide | Contents |
 | --- | --- |
+| [Roadmap](ROADMAP.md) | v0.1 beta scope, planned secure defaults, acceptance criteria, and stable-release gates |
 | [mTLS and certificates](docs/using_mtls.md) | Generate local certificates, configure trust, and separate deployment keys |
 | [Protocol v2](docs/PROTOCOL_V2.md) | Framing, readiness, shutdown, migration, and implementation limits |
 | [Device quotas](docs/DEVICE_QUOTAS.md) | Verified identities, session/tunnel admission, request rate, and bandwidth shaping |
@@ -173,6 +181,14 @@ the same Linux release binaries for `linux/amd64` and `linux/arm64` using
 and records the published digest. GitHub release publication waits for the
 Docker Hub job to succeed. Registry publication and GitHub release creation are
 separate operations, so inspect both after a failure or rerun.
+
+GitHub release packaging downloads only `tunward-*` binary artifacts; Docker
+build records (`*.dockerbuild`) and native qualification evidence are excluded.
+The packaging check verifies all fourteen binaries and restores executable file
+modes before archiving. If only GitHub packaging failed after image publication,
+the guarded [prerelease recovery workflow](.github/workflows/release-recovery.yaml)
+can reuse that tag's successful build artifacts. See
+[recovery prerequisites and limits](CONTRIBUTING.md#recover-a-partial-prerelease).
 
 The image tag equals the Git tag; beta tags do not create a `latest` or stable
 alias. After `v0.1.0-beta` has actually been published, for example:
