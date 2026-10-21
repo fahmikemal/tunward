@@ -361,8 +361,11 @@ They do not establish enterprise certification, maximum device counts, or a
 24-hour WAN SLO. Dedicated runners now cover isolated privileged IPv4 TProxy,
 controlled DNS/DoT/DoH and ECH edge cases, certificate key/issuer renewal and
 rollback, and portable native runtime smoke checks. Native macOS/Windows CI
-gates are configured but need actual successful runs; real CDN/ECH, physical
+gates require actual successful runs; real CDN/ECH, physical
 MDM devices, and completed long-duration evidence remain deployment gates.
+The native runner uses an explicit OpenSSL configuration to keep host-default
+extensions out of its test CA and CSRs, checks certificate chains and purposes
+before starting tunnels, and records the OpenSSL version and setup failures.
 The [qualification guide](docs/STAGING_QUALIFICATION.md)
 describes reproducible gates and the unresolved historical WSS WAN timeout.
 

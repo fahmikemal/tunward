@@ -26,6 +26,8 @@ jobs:
         run: '"C:\Program Files\Git\usr\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append'
       - name: Build native ring binary
         run: cargo build --release --locked -p tunward-cli --no-default-features --features ring
+      - name: Verify portable certificate generation and setup evidence
+        run: python -m unittest discover -s scripts -p test_qualify_runtime.py
       - name: Exercise native transport runtime
         run: python scripts/qualify_runtime.py --output target/qualification/native-runtime
       - name: Preserve native evidence

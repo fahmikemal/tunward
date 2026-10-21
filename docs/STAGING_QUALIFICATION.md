@@ -452,6 +452,19 @@ portable runner on Linux, macOS and Windows; configuration alone is not a
 successful remote run. Android, FreeBSD, architecture-specific runtimes, IPv6
 TProxy, and deployment-specific CDN/ECH remain separate gates.
 
+The first beta CI run passed native Linux and Windows but failed on macOS while
+loading the test client CA (`ExtensionValueInvalid`). The fixture combined
+host-default extensions with `req -addext`; OpenSSL 1.1.1 can append duplicate
+extensions instead of replacing them. The runner now uses its own explicit
+`-config`/`-extensions` sections for the CA and CSRs and checks chains and
+certificate purposes with `verify -x509_strict` before starting tunnels.
+Metadata records the OpenSSL version, and preparation failures produce a
+`runtime/setup` failure report. The native matrix also tests generation with
+conflicting ambient OpenSSL extensions. A passing run on the corrected commit
+is still required for each OS; the fixture fix does not qualify every feature.
+See the [OpenSSL request options](https://docs.openssl.org/master/man1/openssl-req/)
+for configuration and extension-section selection.
+
 ## Physical-device working-hours acceptance
 
 When devices are available, select representative OS/versions, network providers,

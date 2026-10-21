@@ -37,7 +37,8 @@ class RuntimeChecks:
         self.out.mkdir(parents=True, exist_ok=False, mode=0o700)
         self.binary = self.out / ("tunward-under-test.exe" if os.name == "nt" else "tunward-under-test")
         shutil.copy2(args.binary, self.binary)
-        self.results, self.processes = [], []
+        self.results, self.processes, self.process_logs = [], [], {}
+        self.openssl_version = None
 
     def record(self, name, status="pass", **details):
         self.results.append({"name": name, "status": status, **details})
@@ -50,20 +51,30 @@ class RuntimeChecks:
         return stdout
 
     async def prepare(self):
+        self.openssl_version = (await self.command("openssl", "version")).decode().strip()
         self.certs = self.out / "certificates"
         self.certs.mkdir(mode=0o700)
-        await self.command("openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
-            "-nodes", "-days", "4", "-subj", "/CN=Runtime Test CA", "-addext", "basicConstraints=critical,CA:TRUE",
-            "-addext", "keyUsage=critical,keyCertSign,cRLSign", "-keyout", self.certs / "ca.key", "-out", self.certs / "ca.pem")
+        config = self.certs / "openssl.cnf"
+        # OpenSSL 1.1.1 appends -addext to configured extensions, allowing duplicate CA constraints.
+        config.write_text("[req]\nprompt=no\ndistinguished_name=dn\n[dn]\n"
+                          "[ca]\nbasicConstraints=critical,CA:TRUE\n"
+                          "keyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\n")
+        await self.command("openssl", "req", "-config", config, "-extensions", "ca", "-x509", "-newkey", "ec",
+            "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-days", "4", "-subj", "/CN=Runtime Test CA",
+            "-keyout", self.certs / "ca.key", "-out", self.certs / "ca.pem")
+        (self.certs / "ca.key").chmod(0o600)
         for name, cn, purpose in (("server", "localhost", "serverAuth"), ("client", "runtime-device", "clientAuth")):
-            await self.command("openssl", "req", "-new", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
+            await self.command("openssl", "req", "-config", config, "-new", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
                 "-subj", f"/CN={cn}", "-keyout", self.certs / f"{name}.key", "-out", self.certs / f"{name}.csr")
             ext = self.certs / f"{name}.ext"
-            ext.write_text(f"basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage={purpose}\nsubjectAltName=DNS:localhost,IP:127.0.0.1\n")
+            ext.write_text(f"basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage={purpose}\n"
+                           "subjectAltName=DNS:localhost,IP:127.0.0.1\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n")
             await self.command("openssl", "x509", "-req", "-in", self.certs / f"{name}.csr", "-CA", self.certs / "ca.pem",
                 "-CAkey", self.certs / "ca.key", "-set_serial", "101" if name == "server" else "102", "-days", "4",
                 "-extfile", ext, "-out", self.certs / f"{name}.pem")
             (self.certs / f"{name}.key").chmod(0o600)
+            await self.command("openssl", "verify", "-x509_strict", "-CAfile", self.certs / "ca.pem",
+                "-purpose", "sslserver" if name == "server" else "sslclient", self.certs / f"{name}.pem")
 
     async def spawn(self, label, *args):
         env = {k: v for k, v in os.environ.items() if not k.startswith("TUNWARD_") and k not in
@@ -73,11 +84,12 @@ class RuntimeChecks:
             process = await asyncio.create_subprocess_exec(str(self.binary), *map(str, args),
                 "--nb-worker-threads", "1", "--log-lvl", "WARN", stdout=log, stderr=log, env=env)
         self.processes.append(process)
+        self.process_logs[process.pid] = f"{label}.log"
         return process
 
     async def ready(self, endpoint, process):
         for _ in range(100):
-            assert process.returncode is None, "fixture exited; inspect logs"
+            assert process.returncode is None, f"fixture exited ({process.returncode}); inspect {self.process_logs[process.pid]}"
             try:
                 _, writer = await asyncio.open_connection("127.0.0.1", endpoint)
                 await close(writer)
@@ -97,7 +109,12 @@ class RuntimeChecks:
             await close(writer)
 
     async def run(self):
-        await self.prepare()
+        try:
+            await self.prepare()
+        except Exception as exc:
+            self.record("runtime/setup", "fail", error=f"{type(exc).__name__}: {exc}")
+            self.metadata()
+            return True
         async def echo(reader, writer):
             try:
                 while data := await reader.read(65536):
@@ -165,12 +182,16 @@ class RuntimeChecks:
             target.close()
             await target.wait_closed()
             udp.close()
-            (self.out / "metadata.json").write_text(json.dumps({"platform": platform.platform(),
+            self.metadata()
+        return any(r["status"] == "fail" for r in self.results)
+
+    def metadata(self):
+        (self.out / "metadata.json").write_text(json.dumps({"platform": platform.platform(),
+                "openssl_version": self.openssl_version,
                 "binary_sha256": hashlib.sha256(self.binary.read_bytes()).hexdigest(),
                 "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                 "scope": "native TCP/reverse TCP/UDP with mTLS; no privileged routing or platform-wide feature qualification"
             }, indent=2) + "\n")
-        return any(r["status"] == "fail" for r in self.results)
 
 
 if __name__ == "__main__":
