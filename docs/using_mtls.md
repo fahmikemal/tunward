@@ -1,279 +1,239 @@
-# Using mTLS with tunward
+# mTLS and certificate ownership
 
-## Generating keys and certificates
+This guide describes the current CN-to-path authorization scheme and the
+development generator. The production boundary is explicit: the generator
+creates unencrypted local keys and one example device; it does not manage device
+enrollment, renewal, revocation, hardware key storage, or fleet quotas.
 
-WARNING: The following instructions are intended for using in a development / testing environment. They are **not**
-intended for setting up a production environment. In a production environment you could use a solution such
-as [OpenBao](https://openbao.org/) (opensource fork of Hashicorp Vault), [EJBCA](https://www.ejbca.org/)
-or [Dogtag PKI](https://www.dogtagpki.org/) for example.
+## Generate a local bundle
 
-These steps are based on: https://jamielinux.com/docs/openssl-certificate-authority/
+From the repository root, install Python 3 and OpenSSL, then run:
 
-In order to setup tunward to authenticate clients with certificates (mTLS) one must have a certificate authority for
-signing client certificates. In this example we will create a certificate authority using OpenSSL.
+~~~sh
+python3 scripts/generate_mtls.py
+~~~
 
-Run these commands from a directory which we will use to store the CA's files. For example under `~/tunward/client_ca`
+The default output is `certs/mTLS/generated/`. The script refuses to overwrite
+an existing directory. Choose a new `--output` path for an independent bundle;
+rerunning into a different directory creates a different CA, not a renewal.
 
-```shell
-$ mkdir -p $HOME/tunward/ca/{certs,csr,crl,newcerts,private}
-$ cd $HOME/tunward/ca/
-$ echo 1000 > serial
-$ touch index.txt
-```
+| File relative to the output directory | Purpose |
+| --- | --- |
+| `certs/ca.cert.pem` | Public CA certificate used as a trust anchor |
+| `private/ca.key.pem` | CA signing key; keep with the issuer |
+| `certs/tunward-server.cert.pem` | Server certificate with DNS/IP SANs |
+| `private/tunward-server.pem` | Server private key |
+| `certs/tunward-client-1.cert.pem` | Example client certificate |
+| `private/tunward-client-1.pem` | Example client's private key |
+| `csr/`, `newcerts/`, `index.txt*`, `serial*`, `crlnumber` | Local CA issuance state |
+| `openssl.cnf` | Copy of the template containing this bundle's SAN configuration |
 
-Create the OpenSSL CA configuration. Beware some entries are escaped so they can be easily written out with `cat`:
+The development CA uses RSA-4096 and lasts 3650 days. Server/client keys use
+RSA-3072 and their certificates last 365 days. On POSIX systems, generated
+directories and files are restricted by the process umask; private key files
+have owner-only permissions. Windows deployments need equivalent filesystem ACLs.
 
-```shell
-$ cat > ./openssl.cnf << END_OF_FILE
-[ ca ]
-default_ca = CA_default
+Defaults are server SANs `localhost`, `127.0.0.1`, and `::1`, with client CN
+`tunward_client_1`. To generate another development bundle:
 
-[ CA_default ]
-# Directory and file locations.
-dir               = $HOME/tunward/ca
-certs             = \$dir/certs
-crl_dir           = \$dir/crl
-new_certs_dir     = \$dir/newcerts
-database          = \$dir/index.txt
-serial            = \$dir/serial
-RANDFILE          = \$dir/private/.rand
+~~~sh
+python3 scripts/generate_mtls.py --output certs/mTLS/development-device-001 \
+  --dns tunnel.example.test --ip 192.0.2.10 --client-id device-001
+~~~
 
-# The root key and root certificate.
-private_key       = \$dir/private/ca.key.pem
-certificate       = \$dir/certs/ca.cert.pem
+Replace the example names with addresses under your control. Repeat `--dns`
+and `--ip` for more SANs. Explicit SAN arguments replace the localhost defaults.
+DNS inputs must be hostnames, not URLs, ports, or wildcard expressions. Client
+identities accept 1..64 letters/digits with dots, underscores, or hyphens.
 
-# For certificate revocation lists.
-crlnumber         = \$dir/crlnumber
-crl               = \$dir/crl/ca.crl.pem
-crl_extensions    = crl_ext
-default_crl_days  = 30
+The generator verifies key matches, chain validity, server SANs, and
+`serverAuth`/`clientAuth` purposes before copying the bundle to the output.
+It does not prove that a firewall, DNS record, application restriction, or
+certificate renewal process is configured correctly.
 
-# SHA-1 is deprecated, so use SHA-2 instead.
-default_md        = sha256
+## Connect using the default bundle
 
-name_opt          = ca_default
-cert_opt          = ca_default
-default_days      = 375
-preserve          = no
-policy            = policy_loose
+See [the README quickstart](../README.md#quickstart-verified-local-mtls) for a
+complete three-process example. From the repository root, assuming a target
+service at server-side `127.0.0.1:3000`:
 
-[ policy_loose ]
-countryName             = optional
-stateOrProvinceName     = optional
-localityName            = optional
-organizationName        = optional
-organizationalUnitName  = optional
-commonName              = optional
-emailAddress            = optional
+~~~sh
+tunward server \
+  --tls-certificate certs/mTLS/generated/certs/tunward-server.cert.pem \
+  --tls-private-key certs/mTLS/generated/private/tunward-server.pem \
+  --tls-client-ca-certs certs/mTLS/generated/certs/ca.cert.pem \
+  --restrict-to 127.0.0.1:3000 wss://127.0.0.1:8443
+~~~
 
-[ req ]
-# Configuration for a certificate signing request.
-default_bits        = 2048
-distinguished_name  = req_distinguished_name
-string_mask         = utf8only
-# SHA-1 is deprecated, so use SHA-2 instead.
-default_md          = sha256
-# Extension to add when the -x509 option is used.
-x509_extensions     = v3_ca
+In another terminal, on Linux/POSIX:
 
-[ req_distinguished_name ]
-# See <https://en.wikipedia.org/wiki/Certificate_signing_request>.
-countryName                     = Country Name (2 letter code)
-stateOrProvinceName             = State or Province Name
-localityName                    = Locality Name
-0.organizationName              = Organization Name
-organizationalUnitName          = Organizational Unit Name
-commonName                      = Common Name
-emailAddress                    = Email Address
+~~~sh
+SSL_CERT_FILE="$PWD/certs/mTLS/generated/certs/ca.cert.pem" SSL_CERT_DIR= \
+tunward client --tls-verify-certificate \
+  --tls-certificate certs/mTLS/generated/certs/tunward-client-1.cert.pem \
+  --tls-private-key certs/mTLS/generated/private/tunward-client-1.pem \
+  -P tunward_client_1 \
+  -L tcp://127.0.0.1:8088:127.0.0.1:3000 wss://127.0.0.1:8443
+~~~
 
-# Optionally, specify some defaults.
-countryName_default             = GB
-stateOrProvinceName_default     = England
-localityName_default            =
-0.organizationName_default      = tunward development
-#organizationalUnitName_default =
-#emailAddress_default           =
+Server verification defaults to true. Configuring the server's
+`--tls-client-ca-certs` does not automatically install that CA into the client's
+trust store. Configure trust separately on each participating platform.
+`--tls-verify-certificate=false` is only an explicit opt-out for isolated
+development; it removes server authentication.
 
-[ v3_ca ]
-# Configuration for a certificate authority.
-subjectKeyIdentifier = hash
-authorityKeyIdentifier = keyid:always,issuer
-basicConstraints = critical, CA:true
-keyUsage = critical, digitalSignature, cRLSign, keyCertSign
+For HTTP/2 use `https://` on the client with the same TLS server. For
+WebTransport enable `--enable-webtransport` on a `wss://` server, or use
+`wts://` for both peers. Make UDP reachable on that port as well as TCP.
 
-[ client_cert ]
-# Configuration for client certificates.
-basicConstraints = CA:FALSE
-nsCertType = client, email
-nsComment = "OpenSSL Generated Client Certificate"
-subjectKeyIdentifier = hash
-authorityKeyIdentifier = keyid,issuer
-keyUsage = critical, nonRepudiation, digitalSignature, keyEncipherment
-extendedKeyUsage = clientAuth, emailProtection
+## Application identity and path binding
 
-[ server_cert ]
-# Configuration for server certificates.
-basicConstraints = CA:FALSE
-nsCertType = server
-nsComment = "OpenSSL Generated Server Certificate"
-subjectKeyIdentifier = hash
-authorityKeyIdentifier = keyid,issuer:always
-keyUsage = critical, digitalSignature, keyEncipherment
-extendedKeyUsage = serverAuth
+With mTLS enabled, the server requires exactly one nonempty, readable Common
+Name on the verified client leaf certificate. WSS, HTTP/2, and WebTransport bind
+that CN to the requested path prefix. A trusted certificate with missing or
+ambiguous CN is rejected. SAN-only client identity is not implemented.
 
-[ crl_ext ]
-# Configuration for CRLs.
-authorityKeyIdentifier=keyid:always
-END_OF_FILE
-```
+The client normally derives its path from the certificate CN. Explicit `-P`
+must agree with that identity; the examples set it to make the relationship
+visible. The implementation treats the default prefix value `v1` as the
+signal to derive CN, even if that value is explicitly supplied.
 
-Generate the private key of the certificate authority. Normally you would encrypt it and set a passphrase on it but for
-development purposes we will leave it unencrypted.
+This is application authorization, separate from TLS server name validation.
+Server DNS/IP verification uses SANs. A `--client-id` or `--device-id` value
+is a caller-controlled registry label and cannot grant access or establish
+device ownership.
 
-```shell
-$ cd $HOME/tunward/ca/
-$ openssl genrsa -out private/ca.key.pem 4096
-```
+## Destination and reverse-listener policy
 
-The certificate of the root certificate authority is self-signed (since it is the root of trust):
+`--restrict-to` builds forward-destination restrictions. A supplied
+`--restrict-config` file replaces those CLI-generated rules; include all
+required forward and reverse permissions in that YAML.
 
-```shell
-$ openssl req -config openssl.cnf \
-      -key private/ca.key.pem \
-      -new -x509 -days 7300 -sha256 -extensions v3_ca \
-      -out certs/ca.cert.pem
----8<------
-Country Name (2 letter code) [GB]:
-State or Province Name [England]:
-Locality Name []:
-Organization Name [Alice Ltd]:
-Organizational Unit Name []:
-Common Name []:tunward Development Root CA
-Email Address []:
-```
+For the default development identity, this example allows one forward target
+and loopback reverse TCP binds on ports 0 and 9000. It is not a tenant or quota
+policy. Save it in an operator-owned configuration file:
 
-Generate a key for the tunward server, generate a certificate signing request (CSR) and create a certificate with our
-CA for the CSR:
+~~~yaml
+restrictions:
+  - name: Local development client
+    match:
+      - !PathPrefix '^tunward_client_1$'
+    allow:
+      - !Tunnel
+        protocol: [Tcp]
+        host: '^127[.]0[.]0[.]1$'
+        port: ["3000"]
+        cidr: [127.0.0.1/32]
+      - !ReverseTunnel
+        protocol: [Tcp]
+        port: ["0", "9000"]
+        cidr: [127.0.0.1/32]
+~~~
 
-```shell
-$ openssl genrsa -out private/tunward-server.pem 2048
-$ openssl req -config openssl.cnf \
-      -key private/tunward-server.pem \
-      -new -sha256 -out csr/tunward-server.csr.pem
----8<------
-Country Name (2 letter code) [GB]:
-State or Province Name [England]:
-Locality Name []:
-Organization Name [Alice Ltd]:
-Organizational Unit Name []:
-Common Name []:tunward Development Server
-Email Address []:
+Use `--restrict-config /path/to/your-restrictions.yaml` instead of
+`--restrict-to` in the server example. Then a client can use
+`-R tcp://127.0.0.1:0:127.0.0.1:3000` with its existing TLS options.
+The reverse destination is reached from the client. Port zero requests an
+OS-assigned listener; lifecycle and observation limits are described in the
+[README](../README.md#fleet-observation-api).
 
-$ openssl ca -config openssl.cnf \
-      -extensions server_cert -days 375 -notext -md sha256 \
-      -in csr/tunward-server.csr.pem \
-      -out certs/tunward-server.cert.pem
----8<------
-Sign the certificate? [y/n]:y
-1 out of 1 certificate requests certified, commit? [y/n]y
-```
+For persistent observations keyed by verified device CN, enable the separate
+[fleet inventory](FLEET_INVENTORY.md) with `--fleet-inventory FILE`. The database
+records certificate observations; it does not enroll devices, authorize access,
+or store their private keys. Keep CNs unique within the server's trusted-issuer
+scope and stable during routine certificate/key renewal.
 
-Next we do the same thing (generate key, create request, sign request) but then for a tunward client:
+The repository's [restrictions.yaml](../restrictions.yaml) demonstrates the
+schema and contains broad examples. Review each rule before adapting it; do not
+assume it is a restrictive deployment policy. Forward rule fields include
+protocol, port, host regex, and CIDR; reverse rules include protocol, bind CIDR,
+ports/mappings, and Unix path regex. Device quotas use a separate
+[quota configuration](DEVICE_QUOTAS.md), enabled with `--device-quota-config`;
+they do not grant or replace destination access.
 
-```shell
-$ openssl genrsa -out private/tunward-client-1.pem 2048
-$ openssl req -config openssl.cnf \
-      -key private/tunward-client-1.pem \
-      -new -sha256 -out csr/tunward-client-1.csr.pem
----8<------
-Country Name (2 letter code) [GB]:
-State or Province Name [England]:
-Locality Name []:
-Organization Name [Alice Ltd]:
-Organizational Unit Name []:
-Common Name []:tunward_client_1   # must contains only url valid characters
-Email Address []:
+For several groups on one server, use [tenant authorization](TENANT_ISOLATION.md)
+with `--tenant-config` and uniquely named restriction rules. It adds verified
+CN membership, tunnel roles, and reserved reverse endpoint scope; client labels
+cannot choose a tenant. Tenant mode allocates port-zero listeners from its own
+reserved pools instead of the OS ephemeral range.
 
-$ openssl ca -config openssl.cnf \
-      -extensions client_cert -days 375 -notext -md sha256 \
-      -in csr/tunward-client-1.csr.pem \
-      -out certs/tunward-client-1.cert.pem
----8<------
-Sign the certificate? [y/n]:y
-1 out of 1 certificate requests certified, commit? [y/n]y
-```
+## Production ownership and renewal
 
-## Using mTLS on the tunward server side
+Provision server certificates for the domain/IP devices actually use. The
+server's public certificate may come from a public CA while device certificates
+come from a private CA. These are independent trust relationships.
 
-This section assumes you have generated the certificate authority, keys, certificates, etc. as outlined in the "
-Generating keys and certificates" section.
+Keep the CA signing key outside tunnel servers and client devices. Deploy only:
 
-Start a `tunward` server and make it use the server key pair certificate (`--tls-certificate` and `--tls-private-key`)
-and configure it to authenticate clients via mTLS (`--tls-client-ca-certs`):
+- On the server: its own key/certificate and the trusted client CA bundle.
+- On a device: its own key/certificate and the server trust anchor as needed.
+- At the issuer: the CA key and issuance state, with an appropriate backup and
+  access-control policy.
 
-```shell
-$ tunward server \
-   --tls-certificate ./certs/tunward-server.cert.pem \
-   --tls-private-key ./private/tunward-server.pem \
-   --tls-client-ca-certs ./certs/ca.cert.pem \
-   wss://0.0.0.0:8443
-```
+Generate a distinct device key and an identity mapped to its intended access
+policy. Preserve that identity during ordinary key/certificate renewal. A CA
+change requires an explicit overlap and trust-bundle migration; it is not
+required for every binary deployment or certificate renewal.
 
-### Testing
+Certificate/key/CA file reload paths exist, and invalid server replacements
+retain the last usable configuration. Existing sessions can survive server
+certificate rotation. Reloading does not establish revocation of active
+sessions, automatic CN remapping, or a complete CA migration. Qualify your exact
+file replacement layout, reconnect behavior, and trust updates before rollout.
 
-You can use `openssl` to test connecting with the client certificate to the tunward server:
+The client verifier has no configurable X.509 CRL/OCSP input. Removing a CA
+changes trust for subsequent handshakes after reload, not automatically the
+authorization of every existing stream. Use the separate
+[live revocation policy](DEVICE_REVOCATION.md) to block a leaf-certificate
+fingerprint or verified device CN and terminate its active work. It requires
+`--device-revocation-config FILE` and applies across the three TLS transports.
+Session/tunnel, attempt-rate, and directional payload quotas can
+be configured using the [verified CN quota guide](DEVICE_QUOTAS.md); the
+development certificate generator does not configure them.
 
-```shell
-$ openssl s_client -connect 127.0.0.1:8443 \
-   -key ./private/tunward-client-1.pem \
-   -cert ./certs/tunward-client-1.cert.pem \
-   -cert_chain ./certs/ca.cert.pem \
-   -state -debug
----8<-----
-Acceptable client certificate CA names
-C = GB, ST = England, O = Alice Ltd, CN = tunward Development Root CA
----8<-----
-```
+Use the [deployment lifecycle runbook](DEPLOYMENT.md) for certificate candidate
+validation, renewal, issuer migration, canary rollout, and rollback. The example
+systemd service uses direct, service-readable TLS files and an acknowledged
+managed reload command. Older units using `LoadCredential` must migrate or
+restart to replace their start-time snapshots. See the runbook for permissions
+and the distinction between new-handshake trust and active-session revocation.
 
-Similarly, you can use `openssl` to test what happens if you try to connect with a client certificate which is not
-signed by our CA by generating a self-signed certificate:
+## Git, images, and private key handling
 
-```shell
-$ openssl req -nodes -x509 -sha256 -newkey rsa:4096 \
-  -keyout faux.key.pem \
-  -out faux.crt.pem \
-  -days 356 \
-  -subj "/C=GB/ST=England/L=London/O=ACME Corp/OU=IT Dept/CN=Development Faux Client"
-$ openssl s_client -connect 127.0.0.1:8443 \
-   -key faux.key.pem \
-   -cert faux.crt.pem \
-   -cert_chain ./certs/ca.cert.pem \
-   -state -debug
-----8<----
-SSL3 alert read:fatal:certificate unknown
----8<-----
-```
+Only `certs/mTLS/.gitignore`, `README.md`, and `openssl.cnf` belong in Git in
+that directory. Generated material, including local backups and CA databases,
+is ignored. The whole directory is excluded by the root `.dockerignore`.
+Custom output directories need equivalent exclusions.
 
-Trying to connect without the client presenting any certificate at all will also fail (the `--cacert` flag only
-tells `curl` which CA certificate to use to verify the certificate of the **server** with):
+A CA certificate is public; a CA private key is secret. Never put server,
+device, or CA private keys in a public repository, image layer, issue, or test
+artifact. Keep runtime keys in operator-controlled mounts or a secret store.
+A read-only runtime mount prevents container writes; it does not make a key
+unreadable to the process that must use it.
 
-```shell
-$ curl -vvv --cacert ./certs/ca.cert.pem https://127.0.0.1:8443
-```
+The advertised branch history was rewritten on 2026-10-21 to remove the old
+committed development keys. Old clones, hosted caches, or downloaded copies may
+still contain them. Treat any published key as exposed and replace it anywhere
+it was deployed. The [publication guide](PUBLICATION.md) records the cutover,
+fresh-clone instructions, and remaining host/copy cleanup.
 
-## Using mTLS on the tunward client side
+## Verification and references
 
-This section assumes you have generated the certificate authority, keys, certificates, etc. as outlined in the "
-Generating keys and certificates" section. It also assumes you have a running tunward server with mTLS configured. For
-example as setup in the `Using mTLS on the tunward server side` section.
+~~~sh
+python3 scripts/qualify_identity.py --output target/qualification/identity-review
+~~~
 
-```shell
-$ tunward client \
-   --tls-certificate ./certs/tunward-client-1.cert.pem \
-   --tls-private-key ./private/tunward-client-1.pem \
-   -L tcp://1212:localhost:1313 \
-   wss://127.0.0.1:8443
-   
- $ nc 127.0.0.1 1212
-```
+This checks application identity/path/destination behavior with disposable
+certificates. Quotas are deliberately disabled in that identity suite, so its
+quota row is `not_run`, not a quota pass. Verify configured enforcement separately:
+
+~~~sh
+python3 scripts/qualify_quotas.py --output target/qualification/quota-review
+~~~
+
+- [OpenSSL requests](https://docs.openssl.org/master/man1/openssl-req/)
+- [OpenSSL CA signing](https://docs.openssl.org/master/man1/openssl-ca/)
+- [OpenSSL certificate verification](https://docs.openssl.org/master/man1/openssl-verification-options/)
+- [Rustls client trust and CRLs](https://docs.rs/rustls/latest/rustls/server/struct.WebPkiClientVerifier.html)
+- [Docker context exclusions](https://docs.docker.com/build/concepts/context/#dockerignore-files)
 

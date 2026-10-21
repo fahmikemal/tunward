@@ -1,20 +1,25 @@
 use crate::executor::DefaultTokioExecutor;
+use crate::management::registry::{ConnectionLease, TunnelLease};
 use crate::protocols;
 use crate::protocols::dns::DnsResolver;
 use crate::protocols::tls;
+use crate::quotas::{DeviceQuotaConfig, QuotaError, QuotaManager, QuotaSession, TunnelPermit};
+use crate::reload::{ReloadState, ServerReload};
 use crate::restrictions::config_reloader::RestrictionsRulesReloader;
 use crate::restrictions::types::{RestrictionConfig, RestrictionsRules};
+use crate::revocation::{RevocationGuard, RevocationManager};
 use crate::somark::SoMark;
+use crate::tenants::{TenantAccess, TenantPolicy};
 use crate::tunnel::downstream_listeners::{
     HttpProxyDownstreamListener, Socks5DownstreamListener, TcpDownstreamListener, UdpDownstreamListener,
 };
 use crate::tunnel::server::handler_http2::http_server_upgrade;
 use crate::tunnel::server::handler_websocket::ws_server_upgrade;
 use crate::tunnel::server::handler_webtransport;
-use crate::tunnel::server::reverse_tunnel::ReverseTunnelServer;
+use crate::tunnel::server::reverse_tunnel::{ListenerOwner, ReverseTunnelServer};
 use crate::tunnel::server::utils::{
     HttpResponse, bad_request, extract_authorization, extract_path_prefix, extract_tunnel_info,
-    extract_x_forwarded_for, find_mapped_port, validate_tunnel,
+    extract_x_forwarded_for, find_mapped_port, quota_rejection, validate_tunnel, validate_tunnel_with_scope,
 };
 use crate::tunnel::tls_reloader::TlsReloader;
 use crate::tunnel::upstream_connectors::{TcpUpstreamConnector, UdpUpstreamConnector, UpstreamConnector};
@@ -72,6 +77,41 @@ pub struct ServerConfig {
     pub enable_webtransport: bool,
     /// [Optional] Enable local REST management API on the specified socket address.
     pub management_api: Option<SocketAddr>,
+    pub device_quotas: Option<DeviceQuotaConfig>,
+    pub device_revocation_config: Option<PathBuf>,
+    pub fleet_inventory: Option<PathBuf>,
+    pub fleet_inventory_max_devices: std::num::NonZeroU32,
+    pub tenant_config: Option<PathBuf>,
+}
+
+#[derive(Clone, Default)]
+pub(super) struct ConnectionContext {
+    pub path: Option<String>,
+    pub quota: Option<QuotaSession>,
+    pub revocation: RevocationGuard,
+    pub fleet: Option<ConnectionLease>,
+    pub tenant: Option<TenantAccess>,
+}
+
+impl ConnectionContext {
+    pub fn admit_tunnel(&self) -> Result<Option<TunnelPermit>, QuotaError> {
+        self.quota
+            .as_ref()
+            .map(|quota| {
+                quota.check_request()?;
+                quota.open_tunnel()
+            })
+            .transpose()
+    }
+}
+
+pub(super) struct EstablishedTunnel {
+    pub remote_addr: RemoteAddr,
+    pub local_rx: Pin<Box<dyn AsyncRead + Send>>,
+    pub local_tx: Pin<Box<dyn AsyncWrite + Send>>,
+    pub need_cookie: bool,
+    pub quota: Option<TunnelPermit>,
+    pub fleet: Option<TunnelLease>,
 }
 
 #[derive(Clone)]
@@ -79,16 +119,110 @@ pub struct Server<E: crate::TokioExecutorRef = DefaultTokioExecutor> {
     pub config: Arc<ServerConfig>,
     pub fleet_registry: Option<crate::management::FleetRegistry>,
     pub executor: E,
+    quotas: Option<QuotaManager>,
+    revocations: Option<RevocationManager>,
+    tenants: Option<Arc<TenantPolicy>>,
+    pub(crate) managed: Option<Arc<ReloadState>>,
+    reload: Option<ServerReload>,
+    instance: uuid::Uuid,
 }
 
 impl<E: crate::TokioExecutorRef> Server<E> {
     pub fn new(config: ServerConfig, executor: E) -> Self {
-        let fleet_registry = config.management_api.map(|_| crate::management::FleetRegistry::new());
+        let fleet_registry = (config.management_api.is_some() || config.fleet_inventory.is_some())
+            .then(crate::management::FleetRegistry::new);
+        let quotas = config.device_quotas.clone().map(QuotaManager::new);
         Self {
             config: Arc::new(config),
             fleet_registry,
             executor,
+            quotas,
+            revocations: None,
+            tenants: None,
+            managed: None,
+            reload: None,
+            instance: uuid::Uuid::now_v7(),
         }
+    }
+
+    pub(crate) fn with_reload(mut self, state: Arc<ReloadState>, reload: ServerReload) -> Self {
+        self.quotas = self
+            .config
+            .device_quotas
+            .as_ref()
+            .map(|_| QuotaManager::live(state.live.clone()));
+        self.managed = Some(state);
+        self.reload = Some(reload);
+        self
+    }
+
+    pub(super) async fn connection_context(
+        &self,
+        path: Option<String>,
+        certificates: Option<&[CertificateDer<'_>]>,
+        peer_addr: SocketAddr,
+        transport: &str,
+    ) -> anyhow::Result<ConnectionContext> {
+        let snapshot = self.managed.as_ref().map(|state| state.snapshot());
+        let tenant_policy = snapshot
+            .as_ref()
+            .map(|snapshot| &snapshot.tenants)
+            .unwrap_or(&self.tenants);
+        let tenant = match tenant_policy {
+            None => None,
+            Some(policy) => Some(
+                policy.access(
+                    path.as_deref()
+                        .ok_or_else(|| anyhow!("verified tenant identity required"))?,
+                )?,
+            ),
+        };
+        let revocation = match &self.revocations {
+            None => RevocationGuard::default(),
+            Some(manager) => manager.register(
+                path.as_deref()
+                    .ok_or_else(|| anyhow!("verified device identity required"))?,
+                certificates
+                    .and_then(|certs| certs.first())
+                    .ok_or_else(|| anyhow!("verified client certificate required"))?,
+            )?,
+        };
+        let quota = match &self.quotas {
+            None => None,
+            Some(manager) => Some(
+                manager.open_session(
+                    path.as_deref()
+                        .ok_or_else(|| anyhow!("verified device identity required"))?,
+                )?,
+            ),
+        };
+        let fleet = match &self.fleet_registry {
+            None => None,
+            Some(registry) => {
+                let fingerprint = certificates
+                    .and_then(|certs| certs.first())
+                    .map(crate::revocation::certificate_fingerprint)
+                    .transpose()?;
+                let connection = registry
+                    .connection(path.clone(), fingerprint, peer_addr, transport)
+                    .await?;
+                connection.set_tenant(
+                    tenant.as_ref().map(TenantAccess::tenant_id),
+                    tenant.as_ref().map(TenantAccess::roles).unwrap_or(&[]),
+                );
+                Some(connection)
+            }
+        };
+        if let Some(state) = &self.managed {
+            state.register(path.as_deref(), &revocation, tenant.as_ref(), fleet.as_ref())?;
+        }
+        Ok(ConnectionContext {
+            path,
+            quota,
+            revocation,
+            fleet,
+            tenant,
+        })
     }
 
     /// Validate an incoming tunnel request and open the tunnel to its destination.
@@ -99,18 +233,38 @@ impl<E: crate::TokioExecutorRef> Server<E> {
     pub(super) async fn handle_tunnel_request<B>(
         &self,
         restrictions: Arc<RestrictionsRules>,
-        restrict_path_prefix: Option<String>,
+        mut restrict_path_prefix: ConnectionContext,
         mut client_addr: SocketAddr,
         req: &Request<B>,
-    ) -> Result<
-        (
-            RemoteAddr,
-            Pin<Box<dyn AsyncRead + Send>>,
-            Pin<Box<dyn AsyncWrite + Send>>,
-            bool,
-        ),
-        HttpResponse,
-    > {
+        pre_admitted: Option<TunnelPermit>,
+    ) -> Result<EstablishedTunnel, Box<HttpResponse>> {
+        let snapshot = self.managed.as_ref().map(|state| state.snapshot());
+        let restrictions = snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.restrictions.clone())
+            .unwrap_or(restrictions);
+        if let Some(snapshot) = &snapshot {
+            restrict_path_prefix.tenant = snapshot
+                .tenants
+                .as_ref()
+                .map(|policy| {
+                    let identity = restrict_path_prefix
+                        .path
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("Verified tenant identity required"))?;
+                    policy.access(identity)
+                })
+                .transpose()
+                .map_err(|_| Box::new(bad_request()))?;
+        }
+        let revocation = restrict_path_prefix.revocation.clone();
+        if revocation.is_revoked() {
+            return Err(Box::new(bad_request()));
+        }
+        let quota = match pre_admitted {
+            Some(permit) => Some(permit),
+            None => restrict_path_prefix.admit_tunnel().map_err(quota_rejection)?,
+        };
         if let Some((x_forward_for, x_forward_for_str)) = extract_x_forwarded_for(req) {
             info!("Request X-Forwarded-For: {x_forward_for:?}");
             Span::current().record("forwarded_for", x_forward_for_str);
@@ -122,13 +276,13 @@ impl<E: crate::TokioExecutorRef> Server<E> {
             bad_request()
         })?;
 
-        if let Some(restrict_path) = restrict_path_prefix
+        if let Some(restrict_path) = restrict_path_prefix.path.as_deref()
             && path_prefix != restrict_path
         {
             warn!(
                 "Client requested upgrade path '{path_prefix}' does not match upgrade path restriction '{restrict_path}' (mTLS, etc.)"
             );
-            return Err(bad_request());
+            return Err(Box::new(bad_request()));
         }
 
         let jwt = extract_tunnel_info(req).map_err(|err| {
@@ -144,10 +298,51 @@ impl<E: crate::TokioExecutorRef> Server<E> {
         })?;
 
         let authorization = extract_authorization(req);
-        let restriction = validate_tunnel(&remote, path_prefix, authorization, &restrictions).ok_or_else(|| {
+        let restriction = match &restrict_path_prefix.tenant {
+            Some(tenant) => validate_tunnel_with_scope(&remote, path_prefix, authorization, &restrictions, |rule| {
+                tenant.allows(&remote.protocol, &rule.name)
+            }),
+            None => validate_tunnel(&remote, path_prefix, authorization, &restrictions),
+        }
+        .ok_or_else(|| {
             warn!("Rejecting connection with not allowed destination: {remote:?}");
             bad_request()
         })?;
+        if let Some(tenant) = &restrict_path_prefix.tenant {
+            if !remote.protocol.is_reverse_tunnel()
+                && self
+                    .config
+                    .management_api
+                    .is_some_and(|address| address.port() == remote.port)
+            {
+                warn!(
+                    tenant = tenant.tenant_id(),
+                    "Rejecting tenant forwarding to reserved management port"
+                );
+                return Err(Box::new(bad_request()));
+            }
+            tenant
+                .authorize_reverse(&remote, find_mapped_port(remote.port, restriction))
+                .map_err(|err| {
+                    warn!(
+                        tenant = tenant.tenant_id(),
+                        device = restrict_path_prefix.path.as_deref(),
+                        "Rejecting tenant reverse resource: {err}"
+                    );
+                    bad_request()
+                })?;
+        }
+        let owner = ListenerOwner {
+            instance: self.instance,
+            tenant: restrict_path_prefix
+                .tenant
+                .as_ref()
+                .map(|tenant| Arc::from(tenant.tenant_id())),
+            device: revocation
+                .identity()
+                .or_else(|| quota.as_ref().map(TunnelPermit::identity))
+                .or_else(|| restrict_path_prefix.path.as_deref().map(Arc::from)),
+        };
         info!("Tunnel accepted due to matched restriction: {}", restriction.name);
 
         let client_id = req
@@ -155,11 +350,27 @@ impl<E: crate::TokioExecutorRef> Server<E> {
             .get("x-client-id")
             .or_else(|| req.headers().get("x-device-id"))
             .and_then(|h| h.to_str().ok())
+            .filter(|s| !s.is_empty() && s.len() <= 256)
             .map(|s| s.to_string());
 
+        if let Some(connection) = &restrict_path_prefix.fleet {
+            connection.set_tcp_transport(if req.version() == Version::HTTP_2 { "http" } else { "ws" });
+        }
+        let fleet = self
+            .fleet_registry
+            .as_ref()
+            .map(|registry| registry.tunnel(restrict_path_prefix.fleet.as_ref(), client_id, client_addr, remote.port));
+
         let req_protocol = remote.protocol.clone();
-        let tunnel = self
-            .exec_tunnel(restriction, remote, client_addr, client_id)
+        let tunnel = revocation
+            .run(self.exec_tunnel(
+                restriction,
+                remote,
+                client_addr,
+                (quota.as_ref(), &revocation, fleet.as_ref()),
+                &owner,
+                restrict_path_prefix.tenant.as_ref(),
+            ))
             .await
             .map_err(|err| {
                 warn!("Rejecting connection with bad upgrade request: {err} {}", req.uri());
@@ -167,9 +378,19 @@ impl<E: crate::TokioExecutorRef> Server<E> {
             })?;
 
         let (remote_addr, local_rx, local_tx) = tunnel;
+        if let Some(fleet) = &fleet {
+            fleet.ready(remote_addr.port);
+        }
         let inject_cookie = req_protocol.is_dynamic_reverse_tunnel();
         info!("connected to {:?} {}:{}", req_protocol, remote_addr.host, remote_addr.port);
-        Ok((remote_addr, local_rx, local_tx, inject_cookie))
+        Ok(EstablishedTunnel {
+            remote_addr,
+            local_rx,
+            local_tx,
+            need_cookie: inject_cookie,
+            quota,
+            fleet,
+        })
     }
 
     async fn exec_tunnel(
@@ -177,8 +398,11 @@ impl<E: crate::TokioExecutorRef> Server<E> {
         restriction: &RestrictionConfig,
         remote: RemoteAddr,
         client_address: SocketAddr,
-        client_id: Option<String>,
+        resources: (Option<&TunnelPermit>, &RevocationGuard, Option<&TunnelLease>),
+        owner: &ListenerOwner,
+        tenant: Option<&TenantAccess>,
     ) -> anyhow::Result<(RemoteAddr, Pin<Box<dyn AsyncRead + Send>>, Pin<Box<dyn AsyncWrite + Send>>)> {
+        let (quota, revocation, fleet) = resources;
         match remote.protocol {
             LocalProtocol::Udp { timeout, .. } => {
                 let connector = UdpUpstreamConnector::new(
@@ -242,29 +466,22 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                 let remote_port = find_mapped_port(remote.port, restriction);
                 let local_srv = (remote.host, remote_port);
                 let bind = try_to_sock_addr(local_srv.clone())?;
-                let reg = self.fleet_registry.clone();
-                let cid = client_id.clone();
-                let listening_server = async move {
-                    let l = TcpDownstreamListener::new(bind, local_srv.clone(), false).await?;
-                    let bound = l.bound_addr();
-                    if let Some(r) = &reg {
-                        r.register_session(
-                            bound.port().to_string(),
-                            cid.unwrap_or_else(|| "anonymous".to_string()),
-                            bound.port(),
-                            bound,
-                            remote_port,
-                        );
+                let listening_server = bind_reverse(bind, tenant, |candidate| {
+                    let destination = (local_srv.0.clone(), candidate.port());
+                    async move {
+                        let listener = TcpDownstreamListener::new(candidate, destination, false).await?;
+                        let bound = listener.bound_addr();
+                        Ok((listener, bound))
                     }
-                    Ok((l, bound))
-                };
+                });
                 let ((local_rx, local_tx), remote) = SERVERS
                     .run_listening_server(
                         &self.executor,
-                        bind,
+                        super::reverse_tunnel::ReverseListenerKey::Socket(owner.clone(), bind),
                         self.config.remote_server_idle_timeout,
                         listening_server,
-                        self.fleet_registry.clone(),
+                        fleet.cloned(),
+                        (quota.cloned(), revocation.clone()),
                     )
                     .await?;
 
@@ -277,17 +494,21 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                 let remote_port = find_mapped_port(remote.port, restriction);
                 let local_srv = (remote.host, remote_port);
                 let bind = try_to_sock_addr(local_srv.clone())?;
-                let listening_server = async {
-                    let l = UdpDownstreamListener::new(bind, local_srv.clone(), timeout).await?;
-                    Ok((l, bind))
-                };
+                let listening_server = bind_reverse(bind, tenant, |candidate| {
+                    let destination = (local_srv.0.clone(), candidate.port());
+                    async move {
+                        let listener = UdpDownstreamListener::new(candidate, destination, timeout).await?;
+                        Ok((listener, candidate))
+                    }
+                });
                 let ((local_rx, local_tx), remote) = SERVERS
                     .run_listening_server(
                         &self.executor,
-                        bind,
+                        super::reverse_tunnel::ReverseListenerKey::Socket(owner.clone(), bind),
                         self.config.remote_server_idle_timeout,
                         listening_server,
-                        self.fleet_registry.clone(),
+                        fleet.cloned(),
+                        (quota.cloned(), revocation.clone()),
                     )
                     .await?;
                 Ok((remote, Box::pin(local_rx), Box::pin(local_tx)))
@@ -299,17 +520,21 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                 let remote_port = find_mapped_port(remote.port, restriction);
                 let local_srv = (remote.host, remote_port);
                 let bind = try_to_sock_addr(local_srv.clone())?;
-                let listening_server = async {
-                    let l = Socks5DownstreamListener::new(bind, timeout, credentials).await?;
-                    Ok((l, bind))
-                };
+                let listening_server = bind_reverse(bind, tenant, |candidate| {
+                    let credentials = credentials.clone();
+                    async move {
+                        let listener = Socks5DownstreamListener::new(candidate, timeout, credentials).await?;
+                        Ok((listener, candidate))
+                    }
+                });
                 let ((local_rx, mut local_tx), remote) = SERVERS
                     .run_listening_server(
                         &self.executor,
-                        bind,
+                        super::reverse_tunnel::ReverseListenerKey::Socket(owner.clone(), bind),
                         self.config.remote_server_idle_timeout,
                         listening_server,
-                        self.fleet_registry.clone(),
+                        fleet.cloned(),
+                        (quota.cloned(), revocation.clone()),
                     )
                     .await?;
 
@@ -330,17 +555,21 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                 let remote_port = find_mapped_port(remote.port, restriction);
                 let local_srv = (remote.host, remote_port);
                 let bind = try_to_sock_addr(local_srv.clone())?;
-                let listening_server = async {
-                    let l = HttpProxyDownstreamListener::new(bind, timeout, credentials, false).await?;
-                    Ok((l, bind))
-                };
+                let listening_server = bind_reverse(bind, tenant, |candidate| {
+                    let credentials = credentials.clone();
+                    async move {
+                        let listener = HttpProxyDownstreamListener::new(candidate, timeout, credentials, false).await?;
+                        Ok((listener, candidate))
+                    }
+                });
                 let ((local_rx, local_tx), remote) = SERVERS
                     .run_listening_server(
                         &self.executor,
-                        bind,
+                        super::reverse_tunnel::ReverseListenerKey::Socket(owner.clone(), bind),
                         self.config.remote_server_idle_timeout,
                         listening_server,
-                        self.fleet_registry.clone(),
+                        fleet.cloned(),
+                        (quota.cloned(), revocation.clone()),
                     )
                     .await?;
 
@@ -368,10 +597,11 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                 let ((local_rx, local_tx), remote) = SERVERS
                     .run_listening_server(
                         &self.executor,
-                        bind,
+                        super::reverse_tunnel::ReverseListenerKey::Unix(owner.clone(), path.clone()),
                         self.config.remote_server_idle_timeout,
                         listening_server,
-                        self.fleet_registry.clone(),
+                        fleet.cloned(),
+                        (quota.cloned(), revocation.clone()),
                     )
                     .await?;
 
@@ -394,13 +624,76 @@ impl<E: crate::TokioExecutorRef> Server<E> {
         }
     }
 
-    pub async fn serve(self, restrictions: RestrictionsRules) -> anyhow::Result<()> {
+    pub async fn serve(mut self, restrictions: RestrictionsRules) -> anyhow::Result<()> {
+        if let Some(path) = &self.config.tenant_config {
+            anyhow::ensure!(
+                self.config
+                    .tls
+                    .as_ref()
+                    .is_some_and(|tls| tls.tls_client_ca_certificates.is_some())
+                    && self.config.restriction_config.is_some(),
+                "tenant isolation requires verified mTLS and --restrict-config"
+            );
+            self.tenants = match &self.managed {
+                Some(state) => state.snapshot().tenants.clone(),
+                None => Some(TenantPolicy::from_path(path, &restrictions)?),
+            };
+        }
+        if let Some(path) = &self.config.fleet_inventory {
+            anyhow::ensure!(
+                self.config
+                    .tls
+                    .as_ref()
+                    .is_some_and(|tls| tls.tls_client_ca_certificates.is_some()),
+                "fleet inventory requires TLS and --tls-client-ca-certs (verified mTLS identity)"
+            );
+            self.fleet_registry
+                .as_ref()
+                .expect("inventory registry")
+                .attach_inventory(path.clone(), self.config.fleet_inventory_max_devices)
+                .await?;
+        }
+        if let Some(config) = &self.config.device_quotas {
+            config.validate()?;
+            anyhow::ensure!(
+                self.config
+                    .tls
+                    .as_ref()
+                    .is_some_and(|tls| tls.tls_client_ca_certificates.is_some()),
+                "device quotas require TLS and --tls-client-ca-certs (verified mTLS identity)"
+            );
+        }
+        let _revocation_reload = if let Some(path) = &self.config.device_revocation_config {
+            anyhow::ensure!(
+                self.config
+                    .tls
+                    .as_ref()
+                    .is_some_and(|tls| tls.tls_client_ca_certificates.is_some()),
+                "device revocation requires TLS and --tls-client-ca-certs (verified mTLS identity)"
+            );
+            let manager = RevocationManager::from_path(path)?;
+            self.revocations = Some(manager.clone());
+            Some(scopeguard::guard(self.executor.spawn(manager.reload(path.clone())), |task| {
+                task.abort()
+            }))
+        } else {
+            if self.managed.is_some()
+                && self
+                    .config
+                    .tls
+                    .as_ref()
+                    .is_some_and(|tls| tls.tls_client_ca_certificates.is_some())
+            {
+                self.revocations = Some(RevocationManager::empty());
+            }
+            None
+        };
         info!("Starting tunward server listening on {}", self.config.bind);
 
         // setup upgrade request handler
         let mk_websocket_upgrade_fn = |server: Server<_>,
                                        restrictions: Arc<ArcSwap<RestrictionsRules>>,
-                                       restrict_path: Option<String>,
+                                       restrict_path: ConnectionContext,
                                        client_addr: SocketAddr| {
             move |req: Request<Incoming>| {
                 ws_server_upgrade(
@@ -417,7 +710,7 @@ impl<E: crate::TokioExecutorRef> Server<E> {
 
         let mk_http_upgrade_fn = |server: Server<_>,
                                   restrictions: Arc<ArcSwap<RestrictionsRules>>,
-                                  restrict_path: Option<String>,
+                                  restrict_path: ConnectionContext,
                                   client_addr: SocketAddr| {
             move |req: Request<Incoming>| {
                 http_server_upgrade(
@@ -434,7 +727,7 @@ impl<E: crate::TokioExecutorRef> Server<E> {
 
         let mk_auto_upgrade_fn = |server: Server<_>,
                                   restrictions: Arc<ArcSwap<RestrictionsRules>>,
-                                  restrict_path: Option<String>,
+                                  restrict_path: ConnectionContext,
                                   client_addr: SocketAddr| {
             move |req: Request<Incoming>| {
                 let server = server.clone();
@@ -474,7 +767,11 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                     tls_config,
                     Some(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
                 )?),
-                tls_reloader: TlsReloader::new_for_server(self.config.clone())?,
+                tls_reloader: if self.managed.is_some() {
+                    None
+                } else {
+                    Some(TlsReloader::new_for_server(self.config.clone())?)
+                },
                 tls_config,
             };
             Some(tls_context)
@@ -483,10 +780,25 @@ impl<E: crate::TokioExecutorRef> Server<E> {
         };
 
         // Bind server and run forever to serve incoming connections.
-        let restrictions = RestrictionsRulesReloader::new(restrictions, self.config.restriction_config.clone())?;
+        let restrictions = RestrictionsRulesReloader::new(
+            restrictions,
+            if self.managed.is_some() {
+                None
+            } else {
+                self.config.restriction_config.clone()
+            },
+        )?;
         let listener = TcpListener::bind(&self.config.bind)
             .await
             .with_context(|| format!("Failed to bind to socket on {}", self.config.bind))?;
+
+        let _reload_task = if let (Some(state), Some(reload)) = (&self.managed, &self.reload) {
+            let requests = reload.take_receiver().await?;
+            let task = self.executor.spawn(state.clone().run(requests));
+            Some(scopeguard::guard(task, |task| task.abort()))
+        } else {
+            None
+        };
 
         // WebTransport needs its own UDP socket, so it runs as a sibling of the TCP accept loop
         // below. One server process then answers websocket, http2 and webtransport clients.
@@ -537,7 +849,10 @@ impl<E: crate::TokioExecutorRef> Server<E> {
             match tls_context.as_mut() {
                 Some(tls) => {
                     // Reload TLS certificate if needed
-                    let tls_acceptor = tls.tls_acceptor().clone();
+                    let tls_acceptor = match &server.managed {
+                        Some(state) => state.snapshot().tcp_tls.clone().expect("TLS mode is fixed at startup"),
+                        None => tls.tls_acceptor().clone(),
+                    };
                     let fut = async move {
                         info!("Doing TLS handshake");
                         let tls_stream = match tls_acceptor.accept(stream).await {
@@ -549,44 +864,76 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                         };
 
                         let tls_ctx = tls_stream.inner().get_ref().1;
-                        // extract client certificate common name if any
-                        let restrict_path = tls_ctx
-                            .peer_certificates()
-                            .and_then(tls::find_leaf_certificate)
-                            .and_then(|c| tls::cn_from_certificate(&c));
-                        match tls_ctx.alpn_protocol() {
-                            // http2
-                            Some(b"h2") => {
-                                let mut conn_builder = http2::Builder::new(TokioExecutor::new());
-                                conn_builder.timer(TokioTimer::new());
-                                if let Some(ping) = server.config.websocket_ping_frequency {
-                                    conn_builder.keep_alive_interval(ping);
+                        let identity_required = server
+                            .config
+                            .tls
+                            .as_ref()
+                            .is_some_and(|tls| tls.tls_client_ca_certificates.is_some());
+                        let restrict_path =
+                            match tls::client_path_from_certificate(tls_ctx.peer_certificates(), identity_required) {
+                                Ok(identity) => identity,
+                                Err(err) => {
+                                    warn!("Rejecting mTLS connection without a supported client identity: {err}");
+                                    return;
                                 }
-
-                                let http_upgrade_fn =
-                                    mk_http_upgrade_fn(server, restrictions, restrict_path, peer_addr);
-                                let con_fut = conn_builder.serve_connection(tls_stream, service_fn(http_upgrade_fn));
-                                if let Err(e) = con_fut.await {
-                                    error!("Error while upgrading cnx to http: {:?}", e);
-                                }
-                            }
-                            // websocket
-                            _ => {
-                                let websocket_upgrade_fn =
-                                    mk_websocket_upgrade_fn(server, restrictions, restrict_path, peer_addr);
-                                let conn_fut = http1::Builder::new()
-                                    .timer(TokioTimer::new())
-                                    // https://github.com/fahmikemal/tunward/issues/358
-                                    // disabled, to avoid conflict with --connection-min-idle flag, that open idle connections
-                                    .header_read_timeout(None)
-                                    .serve_connection(tls_stream, service_fn(websocket_upgrade_fn))
-                                    .with_upgrades();
-
-                                if let Err(e) = conn_fut.await {
-                                    error!("Error while upgrading cnx: {:?}", e);
-                                }
+                            };
+                        let is_http2 = tls_ctx.alpn_protocol() == Some(b"h2");
+                        let restrict_path = match server
+                            .connection_context(
+                                restrict_path,
+                                tls_ctx.peer_certificates(),
+                                peer_addr,
+                                if is_http2 { "https" } else { "wss" },
+                            )
+                            .await
+                        {
+                            Ok(context) => context,
+                            Err(err) => {
+                                warn!("Rejecting authenticated session due to access policy: {err}");
+                                return;
                             }
                         };
+                        let revocation = restrict_path.revocation.clone();
+                        let serve_connection = async move {
+                            match is_http2 {
+                                // http2
+                                true => {
+                                    let mut conn_builder = http2::Builder::new(TokioExecutor::new());
+                                    conn_builder.timer(TokioTimer::new());
+                                    if let Some(ping) = server.config.websocket_ping_frequency {
+                                        conn_builder.keep_alive_interval(ping);
+                                    }
+
+                                    let http_upgrade_fn =
+                                        mk_http_upgrade_fn(server, restrictions, restrict_path, peer_addr);
+                                    let con_fut =
+                                        conn_builder.serve_connection(tls_stream, service_fn(http_upgrade_fn));
+                                    if let Err(e) = con_fut.await {
+                                        error!("Error while upgrading cnx to http: {:?}", e);
+                                    }
+                                }
+                                // websocket
+                                false => {
+                                    let websocket_upgrade_fn =
+                                        mk_websocket_upgrade_fn(server, restrictions, restrict_path, peer_addr);
+                                    let conn_fut = http1::Builder::new()
+                                        .timer(TokioTimer::new())
+                                        // https://github.com/fahmikemal/tunward/issues/358
+                                        // disabled, to avoid conflict with --connection-min-idle flag, that open idle connections
+                                        .header_read_timeout(None)
+                                        .serve_connection(tls_stream, service_fn(websocket_upgrade_fn))
+                                        .with_upgrades();
+
+                                    if let Err(e) = conn_fut.await {
+                                        error!("Error while upgrading cnx: {:?}", e);
+                                    }
+                                }
+                            };
+                            Ok(())
+                        };
+                        if let Err(err) = revocation.run(serve_connection).await {
+                            info!("Closing authenticated connection: {err}");
+                        }
                     }
                     .instrument(span);
 
@@ -595,6 +942,13 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                 // HTTP without TLS
                 None => {
                     let fut = async move {
+                        let context = match server.connection_context(None, None, peer_addr, "tcp").await {
+                            Ok(context) => context,
+                            Err(err) => {
+                                warn!("Cannot register connection: {err}");
+                                return;
+                            }
+                        };
                         let stream = hyper_util::rt::TokioIo::new(stream);
                         let mut conn_fut = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
                         conn_fut.http1().timer(TokioTimer::new());
@@ -603,7 +957,7 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                             conn_fut.http2().keep_alive_interval(ping);
                         }
 
-                        let websocket_upgrade_fn = mk_auto_upgrade_fn(server, restrictions, None, peer_addr);
+                        let websocket_upgrade_fn = mk_auto_upgrade_fn(server, restrictions, context, peer_addr);
                         let upgradable =
                             conn_fut.serve_connection_with_upgrades(stream, service_fn(websocket_upgrade_fn));
 
@@ -642,6 +996,7 @@ impl Debug for ServerConfig {
             .field("tls", &self.tls.is_some())
             .field("remote_server_idle_timeout", &self.remote_server_idle_timeout)
             .field("enable_webtransport", &self.enable_webtransport)
+            .field("device_quotas", &self.device_quotas)
             .field(
                 "mTLS",
                 &self
@@ -654,15 +1009,50 @@ impl Debug for ServerConfig {
     }
 }
 
+async fn bind_reverse<T, F, Fut>(
+    bind: SocketAddr,
+    tenant: Option<&TenantAccess>,
+    mut create: F,
+) -> anyhow::Result<(T, SocketAddr)>
+where
+    F: FnMut(SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<(T, SocketAddr)>>,
+{
+    let candidates = tenant
+        .map(|tenant| tenant.bind_candidates(bind))
+        .unwrap_or_else(|| vec![bind]);
+    let mut last_error = anyhow!("no tenant reverse ports available");
+    for candidate in candidates {
+        match create(candidate).await {
+            Ok(listener) => return Ok(listener),
+            Err(error) => {
+                if !error.chain().any(|source| {
+                    source
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
+                }) {
+                    return Err(error);
+                }
+                last_error = error;
+            }
+        }
+    }
+    Err(last_error)
+}
+
 struct TlsContext<'a> {
     tls_acceptor: Arc<TlsAcceptor>,
-    tls_reloader: TlsReloader,
+    tls_reloader: Option<TlsReloader>,
     tls_config: &'a TlsServerConfig,
 }
 impl TlsContext<'_> {
     #[inline]
     pub fn tls_acceptor(&mut self) -> &Arc<TlsAcceptor> {
-        if self.tls_reloader.should_reload_certificate() {
+        if self
+            .tls_reloader
+            .as_ref()
+            .is_some_and(TlsReloader::should_reload_certificate)
+        {
             match tls::tls_acceptor(self.tls_config, Some(vec![b"h2".to_vec(), b"http/1.1".to_vec()])) {
                 Ok(acceptor) => self.tls_acceptor = Arc::new(acceptor),
                 Err(err) => error!("Cannot reload TLS certificate {:?}", err),

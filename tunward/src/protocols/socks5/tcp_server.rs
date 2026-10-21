@@ -12,7 +12,7 @@ use futures_util::{Stream, StreamExt, stream};
 use socket2::SockRef;
 use std::future::Future;
 use std::io::{Error, ErrorKind, IoSlice};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::Poll;
 use std::time::Duration;
@@ -26,8 +26,7 @@ use tracing::{info, warn};
 use url::Host;
 
 /// Max time a client has to send its SOCKS5 greeting and command once connected.
-/// The accept loop handles connections one at a time, so an idle client must not
-/// hold it: a real client sends its handshake immediately.
+/// Negotiations run concurrently with a bounded number of pending clients.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[allow(clippy::type_complexity)]
@@ -155,142 +154,115 @@ pub async fn run_server(
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("Cannot create socks5 server {bind:?}"))?;
-
     info!(
-        "Starting SOCKS5 server listening cnx on {} with credentials {:?}",
-        listener.local_addr().unwrap_or(bind),
-        credentials
+        "Starting SOCKS5 server on {} (authentication: {})",
+        listener.local_addr()?,
+        credentials.is_some()
     );
-
-    let udp_server = super::udp_server::run_server(bind, timeout).await?;
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
     let stream = stream::unfold(
-        (listener, Box::pin(udp_server), JoinSet::new(), credentials),
-        move |(listener, mut udp_server, mut tasks, credentials)| async move {
+        (listener, JoinSet::new(), tx, rx, credentials),
+        move |(listener, mut tasks, tx, mut rx, credentials)| async move {
             loop {
-                let socket = select! {
-                    biased;
-
-                    cnx = listener.accept() => match cnx {
-                        Err(err) => {
-                            return Some((Err(anyhow::Error::new(err)), (listener, udp_server, tasks, credentials)));
+                select! {
+                    item = rx.recv() => return item.map(|item| (item, (listener, tasks, tx, rx, credentials))),
+                    _ = tasks.join_next(), if !tasks.is_empty() => {},
+                    accepted = listener.accept(), if tasks.len() < 256 => {
+                        match accepted {
+                            Ok((socket, _)) => {
+                                let tx = tx.clone();
+                                let credentials = credentials.clone();
+                                tasks.spawn(async move {
+                                    if let Err(err) = accept_client(socket, timeout, credentials, tx).await {
+                                        warn!("SOCKS5 connection rejected: {err}");
+                                    }
+                                });
+                            },
+                            Err(err) => return Some((Err(err.into()), (listener, tasks, tx, rx, credentials))),
                         }
-                        Ok((socket, _addr)) => socket,
                     },
-
-                    // new incoming udp stream
-                    udp_conn = udp_server.next() => {
-                        return match udp_conn {
-                            Some(Ok(stream)) => {
-                                let dest = stream.destination();
-                                let writer = stream.writer();
-                                Some((Ok((Socks5Stream::Udp((stream, writer)), dest)), (listener, udp_server, tasks, credentials)))
-                            }
-                            Some(Err(err)) => {
-                                Some((Err(anyhow::Error::new(err)), (listener, udp_server, tasks, credentials)))
-                            }
-                            None => {
-                                None
-                            }
-                        };
-                    }
-                };
-
-                // Authenticate the connection, bounding the handshake read so a
-                // silent client cannot hold the accept loop (see HANDSHAKE_TIMEOUT).
-                let proto = if let Some((ref username, ref password)) = credentials {
-                    let username = username.clone();
-                    let password = password.clone();
-                    match tokio::time::timeout(
-                        HANDSHAKE_TIMEOUT,
-                        Socks5ServerProtocol::accept_password_auth(socket, move |user, pass| {
-                            user == username && pass == password
-                        }),
-                    )
-                    .await
-                    {
-                        Ok(Ok((proto, _))) => proto,
-                        Ok(Err(err)) => {
-                            warn!("Rejecting socks5 cnx (auth failed): {}", err);
-                            continue;
-                        }
-                        Err(_) => {
-                            warn!("Rejecting socks5 cnx: handshake timed out after {:?}", HANDSHAKE_TIMEOUT);
-                            continue;
-                        }
-                    }
-                } else {
-                    match tokio::time::timeout(HANDSHAKE_TIMEOUT, Socks5ServerProtocol::accept_no_auth(socket)).await {
-                        Ok(Ok(proto)) => proto,
-                        Ok(Err(err)) => {
-                            warn!("Rejecting socks5 cnx (auth failed): {}", err);
-                            continue;
-                        }
-                        Err(_) => {
-                            warn!("Rejecting socks5 cnx: handshake timed out after {:?}", HANDSHAKE_TIMEOUT);
-                            continue;
-                        }
-                    }
-                };
-
-                // Read the SOCKS5 command, bounded by the same handshake timeout.
-                let (proto, cmd, target_addr) =
-                    match tokio::time::timeout(HANDSHAKE_TIMEOUT, proto.read_command()).await {
-                        Ok(Ok(result)) => result,
-                        Ok(Err(err)) => {
-                            warn!("Rejecting socks5 cnx: {}", err);
-                            continue;
-                        }
-                        Err(_) => {
-                            warn!("Rejecting socks5 cnx: command read timed out after {:?}", HANDSHAKE_TIMEOUT);
-                            continue;
-                        }
-                    };
-
-                let (host, port) = match &target_addr {
-                    TargetAddr::Ip(SocketAddr::V4(ip)) => (Host::Ipv4(*ip.ip()), ip.port()),
-                    TargetAddr::Ip(SocketAddr::V6(ip)) => (Host::Ipv6(*ip.ip()), ip.port()),
-                    TargetAddr::Domain(host, port) => (Host::Domain(host.clone()), *port),
-                };
-
-                // Special case for UDP Associate where we return the bind addr of the udp server
-                if matches!(cmd, Socks5Command::UDPAssociate) {
-                    let mut cnx = match proto.reply_success(bind).await {
-                        Ok(cnx) => cnx,
-                        Err(err) => {
-                            warn!("Cannot reply to socks5 udp client: {}", err);
-                            continue;
-                        }
-                    };
-                    tasks.spawn(async move {
-                        let mut buf = [0u8; 8];
-                        loop {
-                            match cnx.read(&mut buf).await {
-                                Ok(0) => return,
-                                Err(_) => return,
-                                _ => {}
-                            }
-                        }
-                    });
-                    continue;
-                };
-
-                // Defer the SOCKS5 reply: it is sent by `Socks5WriteHalf::on_tunnel_ready` only once
-                // the tunnel to the remote endpoint (and onward to the target) is confirmed up, or
-                // an error reply is sent if it failed.
-                let reply_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
-                return Some((
-                    Ok((Socks5Stream::Tcp { proto, reply_addr }, (host, port))),
-                    (listener, udp_server, tasks, credentials),
-                ));
+                }
             }
         },
     );
-
-    let listener = Socks5Listener {
+    Ok(Socks5Listener {
         socks_server: Box::pin(stream),
-    };
+    })
+}
 
-    Ok(listener)
+type AcceptedSocks = anyhow::Result<(Socks5Stream, (Host, u16))>;
+
+async fn accept_client(
+    socket: TcpStream,
+    timeout: Option<Duration>,
+    credentials: Option<(String, String)>,
+    tx: tokio::sync::mpsc::Sender<AcceptedSocks>,
+) -> anyhow::Result<()> {
+    let peer = socket.peer_addr()?;
+    let local_ip = socket.local_addr()?.ip();
+    let negotiation = async {
+        let proto = if let Some((username, password)) = credentials {
+            Socks5ServerProtocol::accept_password_auth(socket, move |user, pass| user == username && pass == password)
+                .await?
+                .0
+        } else {
+            Socks5ServerProtocol::accept_no_auth(socket).await?
+        };
+        proto.read_command().await
+    };
+    let (proto, cmd, target) = tokio::time::timeout(HANDSHAKE_TIMEOUT, negotiation).await??;
+    if cmd == Socks5Command::UDPAssociate {
+        let expected_port = match &target {
+            TargetAddr::Ip(addr) => addr.port(),
+            TargetAddr::Domain(_, port) => *port,
+        };
+        let (relay_addr, udp) = super::udp_server::run_server(
+            SocketAddr::new(local_ip, 0),
+            timeout,
+            SocketAddr::new(peer.ip(), expected_port),
+        )
+        .await?;
+        let mut control = proto.reply_success(relay_addr).await?;
+        tokio::pin!(udp);
+        let relay = async {
+            while let Some(stream) = udp.next().await {
+                let stream = stream?;
+                let dest = stream.destination();
+                let writer = stream.writer();
+                tx.send(Ok((Socks5Stream::Udp((stream, writer)), dest)))
+                    .await
+                    .map_err(|_| Error::from(ErrorKind::BrokenPipe))?;
+            }
+            anyhow::Ok(())
+        };
+        let closed = async {
+            let mut buf = [0; 8];
+            loop {
+                if control.read(&mut buf).await? == 0 {
+                    return anyhow::Ok(());
+                }
+            }
+        };
+        select! { result = relay => result, result = closed => result }
+    } else if cmd == Socks5Command::TCPConnect {
+        let dest = match target {
+            TargetAddr::Ip(addr) => (Host::parse(&addr.ip().to_string())?, addr.port()),
+            TargetAddr::Domain(host, port) => (Host::Domain(host), port),
+        };
+        tx.send(Ok((
+            Socks5Stream::Tcp {
+                proto,
+                reply_addr: SocketAddr::new(local_ip, 0),
+            },
+            dest,
+        )))
+        .await
+        .map_err(|_| Error::from(ErrorKind::BrokenPipe))?;
+        Ok(())
+    } else {
+        let _ = proto.reply_error(&ReplyError::CommandNotSupported).await;
+        Ok(())
+    }
 }
 
 impl Unpin for Socks5Stream {}

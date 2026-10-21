@@ -1,0 +1,16 @@
+# Starting values for qualification, not a production sizing recommendation.
+# Requires verified mTLS. Keys below are certificate CNs, never client-id headers.
+version: 1
+max_tracked_devices: 10000
+default:
+  max_sessions: 16
+  max_tunnels: 64
+  requests_per_second: 20
+  request_burst: 40
+  upload_bytes_per_second: 1048576
+  download_bytes_per_second: 1048576
+  bandwidth_burst_bytes: 65536
+devices:
+  device-001:
+    max_tunnels: 128
+    download_bytes_per_second: 2097152

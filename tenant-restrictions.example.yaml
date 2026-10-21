@@ -1,0 +1,29 @@
+restrictions:
+  - name: alpha-forward
+    match: [Any]
+    allow:
+      - !Tunnel
+        protocol: [Tcp, Udp]
+        port: ["3000"]
+        cidr: [127.0.0.1/32]
+  - name: alpha-reverse
+    match: [Any]
+    allow:
+      - !ReverseTunnel
+        protocol: [Tcp, Udp]
+        port: ["0", "20000..20031"]
+        cidr: [127.0.0.1/32]
+  - name: beta-forward
+    match: [Any]
+    allow:
+      - !Tunnel
+        protocol: [Tcp, Udp]
+        port: ["4000"]
+        cidr: [127.0.0.1/32]
+  - name: beta-reverse
+    match: [Any]
+    allow:
+      - !ReverseTunnel
+        protocol: [Tcp, Udp]
+        port: ["0", "21000..21031"]
+        cidr: [127.0.0.1/32]

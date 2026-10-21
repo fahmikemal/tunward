@@ -1,0 +1,62 @@
+[Unit]
+Description=Tunward authenticated tunnel server
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=tunward
+Group=tunward
+UMask=0077
+StateDirectory=tunward
+StateDirectoryMode=0700
+RuntimeDirectory=tunward
+RuntimeDirectoryMode=0700
+ExecStartPre=/opt/tunward/current/tunward server --test-config \
+  --reload-socket %t/tunward/reload.sock \
+  --tls-certificate /etc/tunward/tls/server.pem \
+  --tls-private-key /etc/tunward/tls/server.key \
+  --tls-client-ca-certs /etc/tunward/tls/client-ca.pem \
+  --restrict-config /etc/tunward/restrictions.yaml \
+  --tenant-config /etc/tunward/tenants.yaml \
+  --device-quota-config /etc/tunward/quotas.yaml \
+  --device-revocation-config /etc/tunward/revocations.yaml \
+  --fleet-inventory /var/lib/tunward/devices.sqlite3 \
+  --management-api 127.0.0.1:8081 \
+  wts://0.0.0.0:8443
+ExecStart=/opt/tunward/current/tunward server \
+  --reload-socket %t/tunward/reload.sock \
+  --tls-certificate /etc/tunward/tls/server.pem \
+  --tls-private-key /etc/tunward/tls/server.key \
+  --tls-client-ca-certs /etc/tunward/tls/client-ca.pem \
+  --restrict-config /etc/tunward/restrictions.yaml \
+  --tenant-config /etc/tunward/tenants.yaml \
+  --device-quota-config /etc/tunward/quotas.yaml \
+  --device-revocation-config /etc/tunward/revocations.yaml \
+  --fleet-inventory /var/lib/tunward/devices.sqlite3 \
+  --management-api 127.0.0.1:8081 \
+  wts://0.0.0.0:8443
+ExecReload=/opt/tunward/current/tunward reload --socket %t/tunward/reload.sock
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+LimitNOFILE=65536
+TasksMax=4096
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

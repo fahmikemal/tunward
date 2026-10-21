@@ -50,6 +50,31 @@ pub enum DnsResolver {
 }
 
 impl DnsResolver {
+    pub(crate) fn validate_urls(resolvers: &[Url]) -> anyhow::Result<()> {
+        if resolvers.iter().any(|resolver| resolver.scheme() == "system") {
+            return Ok(());
+        }
+        for resolver in resolvers {
+            anyhow::ensure!(
+                matches!(resolver.scheme(), "dns" | "dns+https" | "dns+tls"),
+                "invalid protocol for dns resolver"
+            );
+            let host = resolver.host().context("Invalid dns resolver host")?;
+            if let Host::Domain(host) = host {
+                host.parse::<IpAddr>().context("DNS resolver must use an IP address")?;
+            }
+            if resolver.scheme() != "dns" {
+                anyhow::ensure!(
+                    resolver
+                        .query_pairs()
+                        .any(|(key, value)| key == "sni" && !value.is_empty()),
+                    "DNS over TLS/HTTPS requires a nonempty sni query parameter"
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub async fn lookup_host(&self, domain: &str, port: u16) -> anyhow::Result<Vec<SocketAddr>> {
         let addrs = match self {
             Self::System => tokio::net::lookup_host(format!("{domain}:{port}")).await?.collect(),
@@ -121,6 +146,7 @@ impl DnsResolver {
         so_mark: SoMark,
         prefer_ipv6: bool,
     ) -> anyhow::Result<Self> {
+        Self::validate_urls(resolvers)?;
         fn mk_resolver(
             cfg: ResolverConfig,
             mut opts: ResolverOpts,

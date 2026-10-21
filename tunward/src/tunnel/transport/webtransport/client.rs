@@ -51,6 +51,8 @@ pub(crate) fn mk_connect_request(client_cfg: &ClientConfig) -> anyhow::Result<Co
         request.headers.append(AUTHORIZATION, auth.clone());
     }
 
+    super::super::insert_client_label(&mut request.headers, client_cfg.client_id.as_deref());
+
     if let Some(headers_file_path) = &client_cfg.http_headers_file {
         let (host_header, headers_file) = headers_from_file(headers_file_path);
         for (k, v) in headers_file {
@@ -63,7 +65,11 @@ pub(crate) fn mk_connect_request(client_cfg: &ClientConfig) -> anyhow::Result<Co
         }
     }
 
-    debug!("with webtransport connect request {request:?}");
+    request.headers.insert(
+        super::super::VERSION_HEADER,
+        HeaderValue::from_static(super::super::PROTOCOL_VERSION),
+    );
+    debug!("opening WebTransport session");
     Ok(request)
 }
 
@@ -103,21 +109,25 @@ pub async fn connect(
         .await
         .with_context(|| format!("failed to send the tunnel jwt to {:?}", client_cfg.remote_addr))?;
 
-    // For dynamic reverse tunnels the server tells us the destination it resolved, via the
-    // preamble. Surfacing it as a Cookie header keeps `run_reverse_tunnel` unchanged.
-    let response = if dest_addr.protocol.is_dynamic_reverse_tunnel() {
-        let jwt = read_jwt_preamble(&mut recv)
-            .await
-            .with_context(|| "cannot read the tunnel jwt sent by the server")?;
-        let mut response = Response::new(());
-        response.headers_mut().insert(
-            COOKIE,
-            HeaderValue::from_str(&jwt).with_context(|| "server sent an invalid tunnel jwt")?,
-        );
-        response.into_parts().0
+    let acknowledgement = read_jwt_preamble(&mut recv);
+    let jwt = if dest_addr.protocol.is_reverse_tunnel() {
+        acknowledgement.await?
     } else {
-        Response::new(()).into_parts().0
+        match tokio::time::timeout(client_cfg.timeout_connect, acknowledgement).await {
+            Ok(result) => result?,
+            Err(err) => {
+                session.close(504, b"tunnel acknowledgement timed out");
+                return Err(err).with_context(|| "timed out waiting for the v2 server acknowledgement");
+            }
+        }
     };
+    let remote = crate::tunnel::transport::jwt_token_to_tunnel(&jwt)?;
+    RemoteAddr::try_from(remote.claims)?;
+    let mut response = Response::new(());
+    if dest_addr.protocol.is_dynamic_reverse_tunnel() {
+        response.headers_mut().insert(COOKIE, HeaderValue::from_str(&jwt)?);
+    }
+    let response = response.into_parts().0;
 
     Ok((
         WebTransportRead::new(recv, session.clone()),

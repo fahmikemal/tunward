@@ -1,5 +1,7 @@
 use anyhow::Context;
+use futures_util::task::AtomicWaker;
 use futures_util::{Stream, stream};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::RwLock;
 use pin_project::{pin_project, pinned_drop};
@@ -28,10 +30,12 @@ type PeerMapKey = (SocketAddr, TargetAddr);
 
 struct IoInner {
     sender: mpsc::Sender<Bytes>,
+    active: AtomicBool,
+    reader_waker: AtomicWaker,
 }
 struct Socks5UdpServer {
     listener: Arc<UdpSocket>,
-    peers: HashMap<PeerMapKey, Pin<Arc<IoInner>>, ahash::RandomState>,
+    peers: HashMap<PeerMapKey, Arc<IoInner>, ahash::RandomState>,
     keys_to_delete: Arc<RwLock<Vec<PeerMapKey>>>,
     cnx_timeout: Option<Duration>,
 }
@@ -98,6 +102,7 @@ impl Socks5UdpServer {
 }
 
 pub struct Socks5UdpStreamWriter {
+    io: Weak<IoInner>,
     send_socket: Arc<UdpSocket>,
     peer: SocketAddr,
     udp_header: Vec<u8>,
@@ -114,7 +119,7 @@ pub struct Socks5UdpStream {
     #[pin]
     pub watchdog_deadline: Option<Interval>,
     data_read_before_deadline: bool,
-    io: Pin<Arc<IoInner>>,
+    io: Arc<IoInner>,
     keys_to_delete: Weak<RwLock<Vec<PeerMapKey>>>,
 }
 
@@ -134,9 +139,13 @@ impl Socks5UdpStream {
         destination: TargetAddr,
         watchdog_deadline: Option<Duration>,
         keys_to_delete: Weak<RwLock<Vec<PeerMapKey>>>,
-    ) -> (Self, Pin<Arc<IoInner>>) {
-        let (tx, rx) = mpsc::channel(1024);
-        let io = Arc::pin(IoInner { sender: tx });
+    ) -> (Self, Arc<IoInner>) {
+        let (tx, rx) = mpsc::channel(32);
+        let io = Arc::new(IoInner {
+            sender: tx,
+            active: AtomicBool::new(true),
+            reader_waker: AtomicWaker::new(),
+        });
         let udp_header = match &destination {
             TargetAddr::Ip(ip) => new_udp_header(*ip).unwrap(),
             TargetAddr::Domain(h, p) => new_udp_header((h.as_str(), *p)).unwrap(),
@@ -166,6 +175,7 @@ impl Socks5UdpStream {
 
     pub fn writer(&self) -> Socks5UdpStreamWriter {
         Socks5UdpStreamWriter {
+            io: Arc::downgrade(&self.io),
             send_socket: self.send_socket.clone(),
             peer: self.peer,
             udp_header: self.udp_header.clone(),
@@ -180,6 +190,10 @@ impl AsyncRead for Socks5UdpStream {
         obuf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let mut project = self.project();
+        project.io.reader_waker.register(cx.waker());
+        if !project.io.active.load(Ordering::Acquire) {
+            return Poll::Ready(Err(ErrorKind::ConnectionAborted.into()));
+        }
         // Look that the timeout for client has not elapsed
         if let Some(mut deadline) = project.watchdog_deadline.as_pin_mut()
             && deadline.poll_tick(cx).is_ready()
@@ -214,6 +228,9 @@ impl AsyncRead for Socks5UdpStream {
 
 impl AsyncWrite for Socks5UdpStreamWriter {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> Poll<Result<usize, Error>> {
+        if !self.io.upgrade().is_some_and(|io| io.active.load(Ordering::Acquire)) {
+            return Poll::Ready(Err(ErrorKind::ConnectionAborted.into()));
+        }
         let header_len = self.udp_header.len();
         self.udp_header.extend_from_slice(buf);
         let ret = self.send_socket.poll_send_to(cx, self.udp_header.as_slice(), self.peer);
@@ -233,68 +250,94 @@ impl AsyncWrite for Socks5UdpStreamWriter {
 pub async fn run_server(
     bind: SocketAddr,
     timeout: Option<Duration>,
-) -> Result<impl Stream<Item = io::Result<Socks5UdpStream>>, anyhow::Error> {
+    expected_peer: SocketAddr,
+) -> Result<(SocketAddr, impl Stream<Item = io::Result<Socks5UdpStream>>), anyhow::Error> {
     let listener = UdpSocket::bind(bind)
         .await
         .with_context(|| format!("Cannot create UDP server {bind:?}"))?;
 
+    let relay_addr = listener.local_addr()?;
     let udp_server = Socks5UdpServer::new(listener, timeout);
     static MAX_PACKET_LENGTH: usize = 64 * 1024;
     let buffer = BytesMut::with_capacity(MAX_PACKET_LENGTH * 10);
-    let stream = stream::unfold((udp_server, buffer), |(mut server, mut buf)| async move {
-        loop {
-            server.clean_dead_keys();
-            buf.reserve(MAX_PACKET_LENGTH);
+    let stream = stream::unfold(
+        (udp_server, buffer, expected_peer),
+        |(mut server, mut buf, mut expected_peer)| async move {
+            loop {
+                server.clean_dead_keys();
+                buf.reserve(MAX_PACKET_LENGTH);
 
-            let peer_addr = match server.listener.recv_buf_from(&mut buf).await {
-                Ok((_read_len, peer_addr)) => peer_addr,
-                Err(err) => {
-                    error!("Cannot read from UDP server. Closing server: {}", err);
-                    return None;
-                }
-            };
-
-            let (destination_addr, data) = {
-                let payload = buf.split().freeze();
-                let (frag, destination_addr, data) = match fast_socks5::parse_udp_request(payload.chunk()).await {
-                    Ok((frag, addr, data)) => (frag, addr, data),
+                let peer_addr = match server.listener.recv_buf_from(&mut buf).await {
+                    Ok((_read_len, peer_addr)) => peer_addr,
                     Err(err) => {
-                        warn!("Skipping invalid UDP socks5 request: {err} ");
-                        debug!("Invalid UDP socks5 request: {:?}", payload.chunk());
-                        continue;
+                        error!("Cannot read from UDP server. Closing server: {}", err);
+                        return None;
                     }
                 };
-                // We don't support udp fragmentation
-                if frag != 0 {
-                    warn!("dropping UDP socks5 fragmented");
+
+                if peer_addr.ip() != expected_peer.ip()
+                    || (expected_peer.port() != 0 && peer_addr.port() != expected_peer.port())
+                {
+                    buf.clear();
                     continue;
                 }
-                (destination_addr, payload.slice_ref(data))
-            };
+                let (destination_addr, data) = {
+                    let payload = buf.split().freeze();
+                    let (frag, destination_addr, data) = match fast_socks5::parse_udp_request(payload.chunk()).await {
+                        Ok((frag, addr, data)) => (frag, addr, data),
+                        Err(err) => {
+                            warn!("Skipping invalid UDP socks5 request: {err} ");
+                            debug!("Invalid UDP socks5 request: {:?}", payload.chunk());
+                            continue;
+                        }
+                    };
+                    // We don't support udp fragmentation
+                    if frag != 0 {
+                        warn!("dropping UDP socks5 fragmented");
+                        continue;
+                    }
+                    (destination_addr, payload.slice_ref(data))
+                };
 
-            let addr = (peer_addr, destination_addr);
-            match server.peers.get(&addr) {
-                Some(io) => {
-                    if io.sender.send(data).await.is_err() {
-                        server.peers.remove(&addr);
+                if expected_peer.port() == 0 {
+                    expected_peer.set_port(peer_addr.port());
+                }
+                let addr = (peer_addr, destination_addr);
+                match server.peers.get(&addr) {
+                    Some(io) => {
+                        if let Err(mpsc::error::TrySendError::Closed(_)) = io.sender.try_send(data) {
+                            server.peers.remove(&addr);
+                        }
+                    }
+                    None => {
+                        if server.peers.len() >= 256 {
+                            continue;
+                        }
+                        info!("New UDP connection for {}", addr.1);
+                        let (udp_client, io) = Socks5UdpStream::new(
+                            server.listener.clone(),
+                            addr.0,
+                            addr.1.clone(),
+                            server.cnx_timeout,
+                            Arc::downgrade(&server.keys_to_delete),
+                        );
+                        let _ = io.sender.send(data).await;
+                        server.peers.insert(addr, io);
+                        return Some((Ok(udp_client), (server, buf, expected_peer)));
                     }
                 }
-                None => {
-                    info!("New UDP connection for {}", addr.1);
-                    let (udp_client, io) = Socks5UdpStream::new(
-                        server.listener.clone(),
-                        addr.0,
-                        addr.1.clone(),
-                        server.cnx_timeout,
-                        Arc::downgrade(&server.keys_to_delete),
-                    );
-                    let _ = io.sender.send(data).await;
-                    server.peers.insert(addr, io);
-                    return Some((Ok(udp_client), (server, buf)));
-                }
             }
-        }
-    });
+        },
+    );
 
-    Ok(stream)
+    Ok((relay_addr, stream))
+}
+
+impl Drop for Socks5UdpServer {
+    fn drop(&mut self) {
+        for io in self.peers.values() {
+            io.active.store(false, Ordering::Release);
+            io.reader_waker.wake();
+        }
+    }
 }

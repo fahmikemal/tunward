@@ -3,7 +3,8 @@ default_ca = CA_default
 
 [ CA_default ]
 # Directory and file locations.
-dir               = /home/fahmikemal/progs/tunward/certs/mTLS
+# Run OpenSSL commands from certs/mTLS.
+dir               = .
 certs             = $dir/certs
 crl_dir           = $dir/crl
 new_certs_dir     = $dir/newcerts
@@ -29,6 +30,7 @@ cert_opt          = ca_default
 default_days      = 375
 preserve          = no
 policy            = policy_loose
+copy_extensions   = none
 
 [ policy_loose ]
 countryName             = optional
@@ -76,23 +78,25 @@ keyUsage = critical, digitalSignature, cRLSign, keyCertSign
 
 [ client_cert ]
 # Configuration for client certificates.
-basicConstraints = CA:FALSE
-nsCertType = client, email
-nsComment = "OpenSSL Generated Client Certificate"
+basicConstraints = critical, CA:FALSE
 subjectKeyIdentifier = hash
 authorityKeyIdentifier = keyid,issuer
-keyUsage = critical, nonRepudiation, digitalSignature, keyEncipherment
-extendedKeyUsage = clientAuth, emailProtection
+keyUsage = critical, digitalSignature
+extendedKeyUsage = clientAuth
 
 [ server_cert ]
 # Configuration for server certificates.
-basicConstraints = CA:FALSE
-nsCertType = server
-nsComment = "OpenSSL Generated Server Certificate"
+basicConstraints = critical, CA:FALSE
 subjectKeyIdentifier = hash
 authorityKeyIdentifier = keyid,issuer:always
 keyUsage = critical, digitalSignature, keyEncipherment
 extendedKeyUsage = serverAuth
+subjectAltName = @server_names
+
+[ server_names ]
+DNS.1 = localhost
+IP.1 = 127.0.0.1
+IP.2 = ::1
 
 [ crl_ext ]
 # Configuration for CRLs.

@@ -67,18 +67,34 @@ impl TransportRead for Http2TransportRead {
             }
         }
     }
+
+    async fn finish(&mut self) -> io::Result<()> {
+        // Sending a record only enqueues a body frame. Wait for the peer's END_STREAM
+        // before Drop aborts the client connection poller and discards queued final data.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(frame) = self.inner.next().await {
+                let frame = frame.map_err(io::Error::other)?;
+                if frame.data_ref().is_some_and(|data| !data.is_empty()) {
+                    return Err(io::Error::new(ErrorKind::InvalidData, "data after tunnel FIN"));
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| io::Error::new(ErrorKind::TimedOut, "HTTP/2 tunnel did not finish its body"))?
+    }
 }
 
 pub struct Http2TransportWrite {
-    inner: mpsc::Sender<Bytes>,
+    inner: Option<mpsc::Sender<Bytes>>,
     buf: BytesMut,
 }
 
 impl Http2TransportWrite {
     pub fn new(inner: mpsc::Sender<Bytes>) -> Self {
         Self {
-            inner,
-            buf: BytesMut::with_capacity(MAX_PACKET_LENGTH * 20), // ~ 1Mb
+            inner: Some(inner),
+            buf: BytesMut::with_capacity(MAX_PACKET_LENGTH + 5),
         }
     }
 }
@@ -90,7 +106,11 @@ impl TransportWrite for Http2TransportWrite {
 
     async fn write(&mut self) -> Result<(), io::Error> {
         let data = self.buf.split().freeze();
-        let ret = match self.inner.send(data).await {
+        let inner = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| io::Error::from(ErrorKind::BrokenPipe))?;
+        let ret = match inner.send(data).await {
             Ok(_) => Ok(()),
             Err(err) => Err(io::Error::new(ErrorKind::ConnectionAborted, err)),
         };
@@ -108,6 +128,7 @@ impl TransportWrite for Http2TransportWrite {
     }
 
     async fn close(&mut self) -> Result<(), io::Error> {
+        self.inner.take();
         Ok(())
     }
 
@@ -186,6 +207,8 @@ pub async fn connect(
         headers.append(AUTHORIZATION, auth.clone());
     }
 
+    super::insert_client_label(headers, client.config.client_id.as_deref());
+
     if let Some(headers_file) = headers_file {
         for (k, v) in headers_file {
             let _ = headers.remove(&k);
@@ -193,7 +216,7 @@ pub async fn connect(
         }
     }
 
-    let (tx, rx) = mpsc::channel::<Bytes>(1024);
+    let (tx, rx) = mpsc::channel::<Bytes>(8);
     let body = StreamBody::new(ReceiverStream::new(rx).map(|s| -> anyhow::Result<Frame<Bytes>> { Ok(Frame::data(s)) }));
     let req = req.body(body).with_context(|| {
         format!(
@@ -201,7 +224,7 @@ pub async fn connect(
             client.config.remote_addr
         )
     })?;
-    debug!("with HTTP upgrade request {req:?}");
+    debug!("opening HTTP/2 tunnel");
     let transport = pooled_cnx
         .take()
         .and_then(Either::left)
@@ -234,6 +257,7 @@ pub async fn connect(
         ));
     }
 
+    super::check_version(response.headers())?;
     let (parts, body) = response.into_parts();
     Ok((
         Http2TransportRead::new(BodyStream::new(body), Some(cnx_poller)),

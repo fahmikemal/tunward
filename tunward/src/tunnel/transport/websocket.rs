@@ -117,7 +117,7 @@ impl TransportWrite for WebsocketTransportWrite {
             return Err(io::Error::new(ErrorKind::BrokenPipe, err));
         }
 
-        Ok(())
+        self.inner.flush().await.map_err(io::Error::other)
     }
 
     async fn close(&mut self) -> Result<(), io::Error> {
@@ -125,7 +125,7 @@ impl TransportWrite for WebsocketTransportWrite {
             return Err(io::Error::new(ErrorKind::BrokenPipe, err));
         }
 
-        Ok(())
+        self.inner.flush().await.map_err(io::Error::other)
     }
 
     fn pending_operations_notify(&mut self) -> Arc<Notify> {
@@ -155,7 +155,7 @@ impl TransportWrite for WebsocketTransportWrite {
             }
         }
 
-        Ok(())
+        self.inner.flush().await.map_err(io::Error::other)
     }
 }
 
@@ -198,7 +198,7 @@ impl TransportRead for WebsocketTransportRead {
                 Err(err) => return Err(io::Error::new(ErrorKind::ConnectionAborted, err)),
             };
 
-            trace!("receive ws frame {:?} {:?}", msg.opcode, msg.payload);
+            trace!("received WebSocket {:?} frame ({} bytes)", msg.opcode, msg.payload.len());
             self.in_flight_ping.store(0, Relaxed);
             match msg.opcode {
                 OpCode::Continuation | OpCode::Text | OpCode::Binary => {
@@ -212,7 +212,7 @@ impl TransportRead for WebsocketTransportRead {
                         .pending_operations
                         .send(Frame::close(CloseCode::Normal.into(), &[]))
                         .await;
-                    self.notify_pending_ops.notify_waiters();
+                    self.notify_pending_ops.notify_one();
                     return Err(io::Error::new(ErrorKind::NotConnected, "websocket close"));
                 }
                 OpCode::Ping => {
@@ -223,7 +223,7 @@ impl TransportRead for WebsocketTransportRead {
                         Payload::Owned(msg.payload.to_owned()),
                     )) {
                         Ok(()) => {
-                            self.notify_pending_ops.notify_waiters();
+                            self.notify_pending_ops.notify_one();
                         }
                         Err(TrySendError::Full(_)) => {
                             // Queue full due to TX write congestion; drop pong to avoid blocking RX
@@ -236,7 +236,7 @@ impl TransportRead for WebsocketTransportRead {
                 OpCode::Pong => {
                     match self.pending_operations.try_send(Frame::pong(Payload::Borrowed(&[]))) {
                         Ok(()) => {
-                            self.notify_pending_ops.notify_waiters();
+                            self.notify_pending_ops.notify_one();
                         }
                         Err(TrySendError::Full(_)) => {
                             // Queue full; in_flight_ping is already reset by RX
@@ -272,7 +272,7 @@ pub async fn connect(
         .header(SEC_WEBSOCKET_VERSION, "13")
         .header(
             SEC_WEBSOCKET_PROTOCOL,
-            format!("v1, {}{}", JWT_HEADER_PREFIX, tunnel_to_jwt_token(request_id, dest_addr)),
+            format!("v2, {}{}", JWT_HEADER_PREFIX, tunnel_to_jwt_token(request_id, dest_addr)),
         )
         .version(hyper::Version::HTTP_11);
 
@@ -296,13 +296,7 @@ pub async fn connect(
         headers.append(AUTHORIZATION, auth.clone());
     }
 
-    if let Some(val) = client_cfg
-        .client_id
-        .as_deref()
-        .and_then(|id| hyper::header::HeaderValue::from_str(id).ok())
-    {
-        headers.insert(hyper::header::HeaderName::from_static("x-client-id"), val);
-    }
+    super::insert_client_label(headers, client_cfg.client_id.as_deref());
 
     if let Some(headers_file_path) = &client_cfg.http_headers_file {
         let (host, headers_file) = headers_from_file(headers_file_path);
@@ -322,7 +316,7 @@ pub async fn connect(
             client_cfg.remote_addr
         )
     })?;
-    debug!("with HTTP upgrade request {req:?}");
+    debug!("opening WebSocket tunnel");
     let transport = pooled_cnx
         .take()
         .and_then(Either::left)
@@ -332,6 +326,7 @@ pub async fn connect(
         .await
         .with_context(|| format!("failed to do websocket handshake with the server {:?}", client_cfg.remote_addr))?;
 
+    super::check_version(response.headers())?;
     let (ws_rx, ws_tx) = mk_websocket_tunnel(ws, Role::Client, client_cfg.websocket_mask_frame)?;
     Ok((ws_rx, ws_tx, response.into_parts().0))
 }

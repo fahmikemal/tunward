@@ -1,5 +1,6 @@
 use crate::executor::{DefaultTokioExecutor, TokioExecutorRef};
 use crate::tunnel;
+use crate::tunnel::RemoteAddr;
 use crate::tunnel::client::ClientConfig;
 use crate::tunnel::client::connection_pool::L4StreamManager;
 use crate::tunnel::downstream_listeners::{DownstreamListener, DownstreamRead, DownstreamWrite};
@@ -7,16 +8,14 @@ use crate::tunnel::tls_reloader::TlsReloader;
 use crate::tunnel::transport::io::{TransportReader, TransportWriter};
 use crate::tunnel::transport::{TransportScheme, jwt_token_to_tunnel};
 use crate::tunnel::upstream_connectors::UpstreamConnector;
-use crate::tunnel::{LocalProtocol, RemoteAddr};
 use anyhow::Context;
 use futures_util::pin_mut;
 use hyper::header::COOKIE;
 use log::debug;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::oneshot;
 use tokio_stream::StreamExt;
-use tracing::{Instrument, Level, Span, error, event, span};
+use tracing::{Instrument, Level, error, event, span};
 use url::Host;
 use uuid::Uuid;
 
@@ -37,13 +36,25 @@ impl<E: TokioExecutorRef> Client<E> {
         reverse_tunnel_connection_retry_max_backoff: Duration,
         executor: E,
     ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !connection_retry_max_backoff.is_zero(),
+            "connection-retry-max-backoff must be greater than zero"
+        );
+        anyhow::ensure!(connection_min_idle <= 1000, "connection-min-idle must not exceed 1000");
         let config = Arc::new(config);
 
         let cnx = L4StreamManager::new(config.clone());
         let tls_reloader = TlsReloader::new_for_client(config.clone()).with_context(|| "Cannot create tls reloader")?;
+        // QUIC sessions multiplex streams. A TCP-sized pool retains many independently stale
+        // sessions after a server restart, costing one acknowledgement deadline per checkout.
+        let multiplexed = config.remote_addr.scheme().is_webtransport();
         let cnx_pool = bb8::Pool::builder()
-            .max_size(1000)
-            .min_idle(Some(connection_min_idle))
+            .max_size(if multiplexed { 1 } else { 1000 })
+            .min_idle(Some(if multiplexed {
+                connection_min_idle.min(1)
+            } else {
+                connection_min_idle
+            }))
             .max_lifetime(Some(Duration::from_secs(30)))
             .connection_timeout(connection_retry_max_backoff)
             .retry_connection(true)
@@ -86,19 +97,11 @@ impl<E: TokioExecutorRef> Client<E> {
             TransportScheme::Wts => tunnel::transport::webtransport::connect(request_id, self, remote_cfg)
                 .await
                 .map(|(r, w, response)| {
-                    if matches!(remote_cfg.protocol, LocalProtocol::Udp { .. } | LocalProtocol::TProxyUdp { .. }) {
-                        (
-                            TransportReader::WebTransportUdp(Box::new(r.into_udp_stream())),
-                            TransportWriter::WebTransportUdp(Box::new(w.into_udp_stream())),
-                            response,
-                        )
-                    } else {
-                        (
-                            TransportReader::WebTransport(Box::new(r)),
-                            TransportWriter::WebTransport(Box::new(w)),
-                            response,
-                        )
-                    }
+                    (
+                        TransportReader::WebTransport(Box::new(r)),
+                        TransportWriter::WebTransport(Box::new(w)),
+                        response,
+                    )
                 }),
         };
 
@@ -121,19 +124,7 @@ impl<E: TokioExecutorRef> Client<E> {
         };
 
         debug!("Server response: {response:?}");
-        let (close_tx, close_rx) = oneshot::channel::<()>();
-
-        // Forward local tx to websocket tx
-        let ping_frequency = self.config.websocket_ping_frequency;
-        self.executor.spawn(
-            super::super::transport::io::propagate_local_to_remote(local_rx, ws_tx, close_tx, ping_frequency)
-                .instrument(Span::current()),
-        );
-
-        // Forward websocket rx to local rx
-        let _ = super::super::transport::io::propagate_remote_to_local(local_tx, ws_rx, close_rx).await;
-
-        Ok(())
+        tunnel::transport::io::forward(local_rx, local_tx, ws_rx, ws_tx, self.config.websocket_ping_frequency).await
     }
 
     pub async fn run_tunnel(self, tunnel_listener: impl DownstreamListener) -> anyhow::Result<()> {
@@ -256,7 +247,6 @@ impl<E: TokioExecutorRef> Client<E> {
                 tracing::info!("Reverse tunnel active on assigned remote port: {port_hdr}");
             }
             let task = {
-                let executor = self.executor.clone();
                 let connector = connector.clone();
                 async move {
                     let remote = response
@@ -278,21 +268,15 @@ impl<E: TokioExecutorRef> Client<E> {
                         }
                     };
 
-                    let (close_tx, close_rx) = oneshot::channel::<()>();
-                    executor.spawn({
-                        let ping_frequency = client.config.websocket_ping_frequency;
-                        super::super::transport::io::propagate_local_to_remote(
-                            local_rx,
-                            ws_tx,
-                            close_tx,
-                            ping_frequency,
-                        )
-                        .instrument(span.clone())
-                    });
-
-                    let _ = super::super::transport::io::propagate_remote_to_local(local_tx, ws_rx, close_rx)
-                        .instrument(span.clone())
-                        .await;
+                    let _ = super::super::transport::io::forward(
+                        local_rx,
+                        local_tx,
+                        ws_rx,
+                        ws_tx,
+                        client.config.websocket_ping_frequency,
+                    )
+                    .instrument(span.clone())
+                    .await;
                 }
             };
 
