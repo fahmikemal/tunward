@@ -40,6 +40,18 @@ pub(crate) fn load_server_files(args: &ServerCreationRequest) -> anyhow::Result<
         args.http_proxy_password.clone(),
     )?;
     let tls_enabled = matches!(args.remote_addr.scheme(), "wss" | "wts");
+    let mtls_configured = tls_enabled && args.tls_client_ca_certs.is_some();
+    for (enabled, requirement) in [
+        (args.device_quota_config.is_some(), "device quotas require TLS"),
+        (args.device_revocation_config.is_some(), "device revocation requires TLS"),
+        (args.tenant_config.is_some(), "tenant isolation requires TLS"),
+        (args.fleet_inventory.is_some(), "fleet inventory requires TLS"),
+    ] {
+        ensure!(
+            !enabled || mtls_configured,
+            "{requirement} and --tls-client-ca-certs (verified mTLS identity)"
+        );
+    }
     ensure!(
         tls_enabled || !args.enable_webtransport,
         "--enable-webtransport requires TLS: use wss:// or wts://"
@@ -115,20 +127,6 @@ pub(crate) fn load_server_files(args: &ServerCreationRequest) -> anyhow::Result<
             &destinations,
         )?
     };
-    let verified_mtls = tls
-        .as_ref()
-        .is_some_and(|config| config.tls_client_ca_certificates.is_some());
-    for (enabled, option) in [
-        (args.device_quota_config.is_some(), "device quotas"),
-        (args.device_revocation_config.is_some(), "device revocation"),
-        (args.tenant_config.is_some(), "tenant isolation"),
-        (args.fleet_inventory.is_some(), "fleet inventory"),
-    ] {
-        ensure!(
-            !enabled || verified_mtls,
-            "{option} requires TLS and --tls-client-ca-certs (verified mTLS identity)"
-        );
-    }
     let device_quotas = args
         .device_quota_config
         .as_deref()

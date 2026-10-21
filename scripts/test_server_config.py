@@ -137,6 +137,21 @@ class ServerConfigTests(unittest.TestCase):
         invalid_usage = self.invoke("-t", "--unknown-option", "ws://127.0.0.1:8443", valid=False)
         self.assertEqual(invalid_usage.returncode, 2)
 
+    def test_mtls_prerequisite_diagnostics(self):
+        cases = [("device-quota-config", ROOT / "device-quotas.example.yaml", "device quotas require TLS"),
+                 ("device-revocation-config", ROOT / "device-revocations.example.yaml", "device revocation requires TLS"),
+                 ("tenant-config", ROOT / "tenant-policy.example.yaml", "tenant isolation requires TLS"),
+                 ("fleet-inventory", self.root / "never-created.sqlite3", "fleet inventory requires TLS")]
+        for option, path, message in cases:
+            for flag in ([], ["-t"]):
+                with self.subTest(option=option, validation=bool(flag)):
+                    result = self.invoke(*flag, "--tls-client-ca-certs", self.certs / "ca.pem",
+                                         "--restrict-config", ROOT / "tenant-restrictions.example.yaml",
+                                         f"--{option}", path, "ws://127.0.0.1:0", valid=False)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn(message, result.stderr)
+        self.assertFalse((self.root / "never-created.sqlite3").exists())
+
     def test_systemd_prestart_uses_startup_arguments(self):
         lines = (ROOT / "deploy" / "tunward.service").read_text().replace("\\\n", "").splitlines()
         commands = {line.split("=", 1)[0]: line.split("=", 1)[1].split()
