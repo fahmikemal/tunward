@@ -366,6 +366,9 @@ MDM devices, and completed long-duration evidence remain deployment gates.
 The native runner uses an explicit OpenSSL configuration to keep host-default
 extensions out of its test CA and CSRs, checks certificate chains and purposes
 before starting tunnels, and records the OpenSSL version and setup failures.
+CI writes native evidence outside the Cargo target cache, to a temporary path
+unique to each workflow run and attempt; cached results and test keys are not
+reused as a new run's output.
 The [qualification guide](docs/STAGING_QUALIFICATION.md)
 describes reproducible gates and the unresolved historical WSS WAN timeout.
 

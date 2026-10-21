@@ -465,6 +465,12 @@ is still required for each OS; the fixture fix does not qualify every feature.
 See the [OpenSSL request options](https://docs.openssl.org/master/man1/openssl-req/)
 for configuration and extension-section selection.
 
+Native CI evidence is written under the runner temporary directory with a
+run/attempt-specific name, outside the cached Cargo target tree. This avoids
+`FileExistsError` after a build-cache restore and prevents new native fixture
+keys/results from being saved in that cache. Local runners still refuse an
+existing `--output` directory: choose a fresh path to preserve earlier evidence.
+
 ## Physical-device working-hours acceptance
 
 When devices are available, select representative OS/versions, network providers,

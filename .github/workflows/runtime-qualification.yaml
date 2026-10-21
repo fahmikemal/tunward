@@ -29,13 +29,13 @@ jobs:
       - name: Verify portable certificate generation and setup evidence
         run: python -m unittest discover -s scripts -p test_qualify_runtime.py
       - name: Exercise native transport runtime
-        run: python scripts/qualify_runtime.py --output target/qualification/native-runtime
+        run: python scripts/qualify_runtime.py --output "${{ runner.temp }}/tunward-native-${{ github.run_id }}-${{ github.run_attempt }}"
       - name: Preserve native evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: native-runtime-${{ matrix.os }}
           path: |
-            target/qualification/native-runtime/results.json
-            target/qualification/native-runtime/metadata.json
-            target/qualification/native-runtime/*.log
+            ${{ runner.temp }}/tunward-native-${{ github.run_id }}-${{ github.run_attempt }}/results.json
+            ${{ runner.temp }}/tunward-native-${{ github.run_id }}-${{ github.run_attempt }}/metadata.json
+            ${{ runner.temp }}/tunward-native-${{ github.run_id }}-${{ github.run_attempt }}/*.log
