@@ -1,352 +1,272 @@
-use anyhow::Context;
+use anyhow::{Context, anyhow};
+use base64::Engine;
 use bytes::Bytes;
-use log::{debug, error};
-use std::future::Future;
+use futures_util::{Stream, stream};
+use http_body_util::{BodyExt, Empty, combinators::BoxBody};
+use hyper::body::Incoming;
+use hyper::header::{CONNECTION, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION};
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode, Uri};
+use hyper_util::rt::{TokioIo, TokioTimer};
+use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-
-use crate::protocols::tcp;
-use crate::somark::SoMark;
-use base64::Engine;
-use futures_util::{Stream, future, stream};
-use http_body_util::Empty;
-use hyper::body::Incoming;
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper::{Request, Response};
-use hyper_util::rt::TokioTimer;
-use parking_lot::Mutex;
-use socket2::SockRef;
+use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::select;
+use tokio::io::{AsyncWrite, DuplexStream, ReadHalf, WriteHalf};
+use tokio::net::TcpListener;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
-use tracing::log::info;
-use url::{Host, Url};
+use tracing::{info, warn};
+use url::Host;
 
-#[allow(clippy::type_complexity)]
+pub type HttpProxyRead = ReadHalf<DuplexStream>;
+pub struct HttpProxyWrite {
+    inner: WriteHalf<DuplexStream>,
+    ready: Option<oneshot::Sender<bool>>,
+}
+
+impl crate::tunnel::downstream_listeners::DownstreamWrite for HttpProxyWrite {
+    async fn on_tunnel_ready(&mut self, result: Result<(), &anyhow::Error>) -> io::Result<()> {
+        if let Some(tx) = self.ready.take() {
+            let _ = tx.send(result.is_ok());
+        }
+        Ok(())
+    }
+}
+
+impl AsyncWrite for HttpProxyWrite {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+type Connection = ((HttpProxyRead, HttpProxyWrite), (Host, u16));
+type Accepted = anyhow::Result<Connection>;
+type ProxyBody = BoxBody<Bytes, hyper::Error>;
+
 pub struct HttpProxyListener {
-    listener: Pin<Box<dyn Stream<Item = anyhow::Result<(TcpStream, (Host, u16))>> + Send>>,
+    listener: Pin<Box<dyn Stream<Item = Accepted> + Send>>,
 }
-
 impl Stream for HttpProxyListener {
-    type Item = anyhow::Result<(TcpStream, (Host, u16))>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
-        unsafe { self.map_unchecked_mut(|x| &mut x.listener) }.poll_next(cx)
+    type Item = Accepted;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        self.get_mut().listener.as_mut().poll_next(cx)
     }
 }
 
-fn handle_http_connect_request(
-    credentials: &Option<String>,
-    dest: &Mutex<Option<(Host, u16)>>,
-    req: Request<Incoming>,
-) -> impl Future<Output = Result<Response<Empty<Bytes>>, &'static str>> {
-    let ok_response = |forward_to: (Host, u16)| -> Result<Response<Empty<Bytes>>, _> {
-        *dest.lock() = Some(forward_to);
-        Ok(Response::builder().status(200).body(Empty::new()).unwrap())
+fn response(status: StatusCode) -> Response<ProxyBody> {
+    let mut response = Response::new(Empty::<Bytes>::new().map_err(|never| match never {}).boxed());
+    *response.status_mut() = status;
+    if status == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+        response.headers_mut().insert(
+            PROXY_AUTHENTICATE,
+            hyper::header::HeaderValue::from_static("Basic realm=\"tunward\""),
+        );
+    }
+    response
+}
+
+fn strip_hop_headers(headers: &mut hyper::HeaderMap) {
+    let named: Vec<_> = headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .filter_map(|name| hyper::header::HeaderName::from_bytes(name.trim().as_bytes()).ok())
+        .collect();
+    for name in named {
+        headers.remove(name);
+    }
+    for name in [
+        "connection",
+        "proxy-connection",
+        "proxy-authorization",
+        "proxy-authenticate",
+        "keep-alive",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ] {
+        headers.remove(name);
+    }
+}
+
+async fn handle_request(
+    mut req: Request<Incoming>,
+    auth: Option<String>,
+    tx: mpsc::Sender<Accepted>,
+    tasks: Arc<tokio::sync::Semaphore>,
+) -> Result<Response<ProxyBody>, anyhow::Error> {
+    let permit = match tasks.try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return Ok(response(StatusCode::SERVICE_UNAVAILABLE)),
     };
-    fn err_response() -> Result<Response<Empty<Bytes>>, &'static str> {
-        info!("Un-authorized connection to http proxy");
-        Ok(Response::builder().status(401).body(Empty::new()).unwrap())
+    if let Some(expected) = auth {
+        let supplied = req.headers().get(PROXY_AUTHORIZATION).and_then(|v| v.to_str().ok());
+        if supplied != Some(expected.as_str()) {
+            return Ok(response(StatusCode::PROXY_AUTHENTICATION_REQUIRED));
+        }
     }
-    // RFC 7235 §3.2: a proxy asks for credentials with a 407 carrying a challenge,
-    // so clients that wait for it before sending Proxy-Authorization can authenticate
-    fn proxy_auth_required_response() -> Result<Response<Empty<Bytes>>, &'static str> {
-        info!("Un-authorized connection to http proxy");
-        Ok(Response::builder()
-            .status(hyper::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
-            .header(hyper::header::PROXY_AUTHENTICATE, "Basic realm=\"tunward\"")
-            .body(Empty::new())
-            .unwrap())
+    let is_connect = req.method() == Method::CONNECT;
+    if !is_connect && req.uri().scheme_str() != Some("http") {
+        return Ok(response(StatusCode::BAD_REQUEST));
     }
-
-    if req.method() != hyper::Method::CONNECT {
-        return future::ready(err_response());
+    let Some(host) = req
+        .uri()
+        .host()
+        .and_then(|h| Host::parse(h.trim_matches(['[', ']'])).ok())
+    else {
+        return Ok(response(StatusCode::BAD_REQUEST));
+    };
+    let port = req.uri().port_u16().unwrap_or(if is_connect { 443 } else { 80 });
+    if port == 0 {
+        return Ok(response(StatusCode::BAD_REQUEST));
     }
-
-    debug!("HTTP Proxy CONNECT request to {}", req.uri());
-    let forward_to = Host::parse(req.uri().host().unwrap_or_default())
+    let authority = req
+        .uri()
+        .authority()
+        .ok_or_else(|| anyhow!("missing proxy authority"))?
+        .clone();
+    let (upstream, bridge) = tokio::io::duplex(64 * 1024);
+    let (reader, writer) = tokio::io::split(bridge);
+    let (ready_tx, ready_rx) = oneshot::channel();
+    tx.send(Ok((
+        (
+            reader,
+            HttpProxyWrite {
+                inner: writer,
+                ready: Some(ready_tx),
+            },
+        ),
+        (host, port),
+    )))
+    .await
+    .map_err(|_| anyhow!("proxy listener closed"))?;
+    if !tokio::time::timeout(Duration::from_secs(30), ready_rx)
+        .await
         .ok()
-        .map(|h| (h, req.uri().port_u16().unwrap_or(443)));
-
-    let Some(forward_to) = forward_to else {
-        return future::ready(err_response());
-    };
-
-    let header = req
-        .headers()
-        .get(hyper::header::PROXY_AUTHORIZATION)
-        .and_then(|h| h.to_str().ok());
-
-    if !verify_credentials(credentials, &header) {
-        return future::ready(proxy_auth_required_response());
-    }
-
-    future::ready(ok_response(forward_to))
-}
-
-fn verify_credentials(credentials: &Option<String>, header_value: &Option<&str>) -> bool {
-    const PROXY_AUTHORIZATION_PREFIX: &str = "Basic ";
-
-    // no creds set, that's ok
-    let Some(token) = credentials else {
-        return true;
-    };
-
-    // creds set, and no auth provided, that's forbidden
-    let Some(header_value) = header_value else {
-        return false;
-    };
-
-    let auth = header_value.trim();
-    auth.starts_with(PROXY_AUTHORIZATION_PREFIX) && &auth[PROXY_AUTHORIZATION_PREFIX.len()..] == token
-}
-
-async fn handle_new_connection(
-    proxy_cfg: Arc<(Option<String>, http1::Builder)>,
-    mut stream: TcpStream,
-) -> Option<(TcpStream, (Host, u16))> {
-    // We need to know if the http request if a CONNECT method or a regular one.
-    // HTTP CONNECT requires doing a handshake with client (which is easier)
-    // While for regular method, we need to replay the request as if it was done by the client.
-    // Non HTTP CONNECT method only works for non TLS connection/request.
-
-    // to drop the request_buf early when not needed anymore
+        .and_then(Result::ok)
+        .unwrap_or(false)
     {
-        // Get a pick at data to analyze http request
-        const CONNECT_METHOD: &[u8] = b"CONNECT ";
-        let mut request_buf = [0; 512];
-
-        // it is possible that the data is not yet available to us.
-        // ideally, we should delay and retry the call until we have read enough bytes, or deadline elapsed.
-        // But in practice and for the case of tunward, it is an edge case not worth handling.
-        // So we parse what we have and reject the request if not enough bytes already.
-        let buf_size = stream.peek(&mut request_buf).await.ok()?;
-
-        if request_buf[..CONNECT_METHOD.len()] != *CONNECT_METHOD {
-            // If no creds/auth is expected don't bother with headers
-            let mut headers = {
-                let headers_len = if proxy_cfg.0.is_some() { 32 } else { 0 };
-                vec![httparse::EMPTY_HEADER; headers_len]
-            };
-            let mut http_parser = httparse::Request::new(&mut headers);
-            let _ = http_parser.parse(&request_buf[..buf_size]);
-
-            // if it is not an HTTP CONNECT request handle it directly
-            return handle_regular_http_request(&http_parser, &proxy_cfg.0).map(|x| (stream, x));
-        }
+        return Ok(response(StatusCode::BAD_GATEWAY));
     }
-
-    // Handle HTTP CONNECT request
-    let (auth_header, http1) = proxy_cfg.as_ref();
-    let forward_to = Mutex::new(None);
-    let conn_fut = http1.serve_connection(
-        hyper_util::rt::TokioIo::new(&mut stream),
-        service_fn(|req| handle_http_connect_request(auth_header, &forward_to, req)),
-    );
-
-    match conn_fut.await {
-        Ok(_) => forward_to.into_inner().map(|forward_to| (stream, forward_to)),
-        Err(err) => {
-            info!("Error while serving connection: {err}");
-            None
-        }
+    if is_connect {
+        let upgrade = hyper::upgrade::on(&mut req);
+        tokio::spawn(async move {
+            let _permit = permit;
+            if let Ok(upgraded) = upgrade.await {
+                let mut downstream = TokioIo::new(upgraded);
+                let mut upstream = upstream;
+                let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
+            }
+        });
+        return Ok(response(StatusCode::OK));
     }
+    strip_hop_headers(req.headers_mut());
+    req.headers_mut()
+        .insert(HOST, hyper::header::HeaderValue::from_str(authority.as_str())?);
+    req.headers_mut()
+        .insert(CONNECTION, hyper::header::HeaderValue::from_static("close"));
+    *req.uri_mut() = Uri::builder()
+        .path_and_query(req.uri().path_and_query().map_or("/", |p| p.as_str()))
+        .build()?;
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(upstream)).await?;
+    tokio::spawn(async move {
+        let _permit = permit;
+        let _ = connection.await;
+    });
+    let mut result = sender.send_request(req).await?;
+    strip_hop_headers(result.headers_mut());
+    Ok(result.map(BodyExt::boxed))
 }
 
 pub async fn run_server(
     bind: SocketAddr,
     timeout: Option<Duration>,
     credentials: Option<(String, String)>,
-) -> Result<HttpProxyListener, anyhow::Error> {
+) -> anyhow::Result<HttpProxyListener> {
     let listener = TcpListener::bind(bind)
         .await
-        .with_context(|| format!("Cannot create TCP server {bind:?}"))?;
-
+        .with_context(|| format!("Cannot create HTTP proxy {bind}"))?;
     info!(
-        "Starting http proxy server listening cnx on {} with credential {:?}",
-        listener.local_addr().unwrap_or(bind),
-        credentials.as_ref().map(|x| (&x.0, "xxx"))
+        "Starting HTTP proxy on {} (authentication: {})",
+        listener.local_addr()?,
+        credentials.is_some()
     );
-
-    let http1 = {
-        let mut builder = http1::Builder::new();
-        builder
-            .timer(TokioTimer::new())
-            .header_read_timeout(timeout)
-            .keep_alive(false);
-        builder
-    };
-    let auth_header =
-        credentials.map(|(user, pass)| base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}")));
-    let tasks = JoinSet::<Option<(TcpStream, (Host, u16))>>::new();
-
-    let proxy_cfg = Arc::new((auth_header, http1));
-    let listener = stream::unfold((listener, tasks, proxy_cfg), |(listener, mut tasks, proxy_cfg)| async {
-        loop {
-            let (stream, forward_to) = select! {
-                biased;
-
-                cnx = tasks.join_next(), if !tasks.is_empty() => {
-                    match cnx {
-                        Some(Ok(Some((stream, f)))) => (stream, Some(f)),
-                        None | Some(Ok(None)) => continue,
-                        Some(Err(err)) => {
-                            error!("Error while joinning tasks {err:?}");
-                            continue
-                        },
-                    }
-                },
-
-                stream = listener.accept() => {
-                    match stream {
-                        Ok((stream, _)) => (stream, None),
-                        Err(err) => {
-                            error!("Error while accepting connection {err:?}");
-                            continue;
+    let auth = credentials.map(|(user, pass)| {
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"))
+        )
+    });
+    let (tx, rx) = mpsc::channel(64);
+    let permits = Arc::new(tokio::sync::Semaphore::new(256));
+    let stream = stream::unfold(
+        (listener, JoinSet::new(), tx, rx, auth, permits),
+        move |(listener, mut tasks, tx, mut rx, auth, permits)| async move {
+            loop {
+                tokio::select! {
+                    item = rx.recv() => return item.map(|item| (item, (listener, tasks, tx, rx, auth, permits))),
+                    _ = tasks.join_next(), if !tasks.is_empty() => {},
+                    accepted = listener.accept(), if tasks.len() < 256 => {
+                        match accepted {
+                            Ok((socket, _)) => {
+                                let auth = auth.clone(); let tx = tx.clone(); let permits = permits.clone();
+                                tasks.spawn(async move {
+                                    let mut builder = hyper::server::conn::http1::Builder::new();
+                                    builder.timer(TokioTimer::new()).header_read_timeout(Some(timeout.unwrap_or(Duration::from_secs(10)).min(Duration::from_secs(10))))
+                                        .max_buf_size(32 * 1024).half_close(true);
+                                    let service = service_fn(move |req| handle_request(req, auth.clone(), tx.clone(), permits.clone()));
+                                    if let Err(err) = builder.serve_connection(TokioIo::new(socket), service).with_upgrades().await {
+                                        warn!("HTTP proxy connection ended: {err}");
+                                    }
+                                });
+                            },
+                            Err(err) => return Some((Err(err.into()), (listener, tasks, tx, rx, auth, permits))),
                         }
-                    }
+                    },
                 }
-            };
-
-            // We have a new connection to forward
-            if let Some(forward_to) = forward_to {
-                let _ = tcp::configure_socket(SockRef::from(&stream), SoMark::new(None));
-                return Some((Ok((stream, forward_to)), (listener, tasks, proxy_cfg)));
             }
-
-            // New incoming connection, parse and route the http request
-            //let task = tokio::time::timeout(Duration::from_secs(10), handle_new_connection(proxy_cfg.clone(), stream));
-            let task = handle_new_connection(proxy_cfg.clone(), stream);
-            tasks.spawn(task);
-        }
-    });
-
+        },
+    );
     Ok(HttpProxyListener {
-        listener: Box::pin(listener),
+        listener: Box::pin(stream),
     })
-}
-
-fn handle_regular_http_request(http_parser: &httparse::Request, auth_header: &Option<String>) -> Option<(Host, u16)> {
-    const DEFAULT_HTTP_PORT: u16 = 80;
-
-    let header = http_parser.headers.iter().find_map(|h| {
-        if h.name == hyper::header::PROXY_AUTHORIZATION {
-            Some(String::from_utf8_lossy(h.value))
-        } else {
-            None
-        }
-    });
-
-    if !verify_credentials(auth_header, &header.as_deref()) {
-        return None;
-    }
-
-    let url = Url::parse(http_parser.path.unwrap_or("")).ok()?;
-    let host = url.host()?.to_owned();
-    let port = url.port_or_known_default().unwrap_or(DEFAULT_HTTP_PORT);
-
-    Some((host, port))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rstest::{fixture, rstest};
-    use std::net::{Ipv4Addr, SocketAddrV4};
-    use tokio::io::AsyncReadExt;
-    use tokio::io::AsyncWriteExt;
 
-    #[fixture]
-    async fn connected_client() -> (TcpStream, TcpStream) {
-        let server = TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
-            .await
-            .unwrap();
-        let client = TcpStream::connect(server.local_addr().unwrap()).await.unwrap();
-        let (stream, _) = server.accept().await.unwrap();
-        (client, stream)
+    #[test]
+    fn consumes_proxy_credentials_and_connection_named_headers() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(PROXY_AUTHORIZATION, "Basic synthetic".parse().unwrap());
+        headers.insert(CONNECTION, "keep-alive, x-private".parse().unwrap());
+        headers.insert("x-private", "private".parse().unwrap());
+        headers.insert("content-length", "100".parse().unwrap());
+        headers.insert("authorization", "Bearer origin".parse().unwrap());
+        strip_hop_headers(&mut headers);
+        assert!(!headers.contains_key(PROXY_AUTHORIZATION));
+        assert!(!headers.contains_key(CONNECTION));
+        assert!(!headers.contains_key("x-private"));
+        assert_eq!(headers["content-length"], "100");
+        assert_eq!(headers["authorization"], "Bearer origin");
     }
 
-    #[rstest]
-    // No host available, it should fail
-    #[case("GET / HTTP/1.1\r\n\r\n", None, None)]
-    // Partial request should fail
-    #[case("GET ", None, None)]
-    // Url is too long, it should fail. Limit is 512 bytes for the whole request
-    #[case(String::from_iter(["GET google.com/".to_string(), "a".repeat(512), "  HTTP/1.1\r\n\r\n".to_string()]), None, None)]
-    #[case("GET http://google.com/ HTTP/1.1\r\n\r\n", None, Some((Host::Domain("google.com".to_string()), 80)))]
-    #[case("GET http://google.com/ HTTP/1.1\r\nProxy-Authorization: Basic toto\r\n\r\n", Some("toto"), Some((Host::Domain("google.com".to_string()), 80)))]
-    #[case(
-        "GET http://google.com/ HTTP/1.1\r\nProxy-Authorization: Basic toto\r\n\r\n",
-        Some("tata"),
-        None
-    )]
-    #[timeout(Duration::from_secs(10))]
-    #[tokio::test]
-    #[awt]
-    async fn test_handle_new_connection(
-        #[future] connected_client: (TcpStream, TcpStream),
-        #[case] input: impl AsRef<[u8]>,
-        #[case] auth: Option<&str>,
-        #[case] expected_result: Option<(Host, u16)>,
-    ) {
-        let (mut client, stream) = connected_client;
-        let auth_header = auth.map(|x| x.to_string());
-        let proxy_cfg = Arc::new((auth_header, http1::Builder::new()));
-
-        client.write_all(input.as_ref()).await.unwrap();
-
-        let ret = handle_new_connection(proxy_cfg.clone(), stream).await;
-        assert_eq!(ret.map(|(_, x)| x), expected_result);
-    }
-
-    #[rstest]
-    // No host available, it should fail
-    #[case("CONNECT / HTTP/1.0\r\n\r\n", None, None)]
-    #[case("CONNECT google.com:80 HTTP/1.1\r\n\r\n", None, Some((Host::Domain("google.com".to_string()), 80)))]
-    #[case("CONNECT google.com HTTP/1.1\r\n\r\n", None, Some((Host::Domain("google.com".to_string()), 443)))]
-    #[case("CONNECT google.com HTTP/1.1\r\nProxy-Authorization: Basic toto\r\n\r\n", Some("toto"), Some((Host::Domain("google.com".to_string()), 443)))]
-    #[case(
-        "CONNECT google.com HTTP/1.0\r\nProxy-Authorization: Basic toto\r\n\r\n",
-        Some("tata"),
-        None
-    )]
-    // Credentials expected but none sent, the client must be challenged
-    #[case("CONNECT google.com HTTP/1.0\r\n\r\n", Some("toto"), None)]
-    #[timeout(Duration::from_secs(10))]
-    #[tokio::test]
-    #[awt]
-    async fn test_handle_new_connect_connection(
-        #[future] connected_client: (TcpStream, TcpStream),
-        #[case] input: impl AsRef<[u8]>,
-        #[case] auth: Option<&str>,
-        #[case] expected_result: Option<(Host, u16)>,
-    ) {
-        let (mut client, stream) = connected_client;
-        let auth_header = auth.map(|x| x.to_string());
-        let proxy_cfg = Arc::new((auth_header, http1::Builder::new()));
-
-        client.write_all(input.as_ref()).await.unwrap();
-
-        let ret = handle_new_connection(proxy_cfg.clone(), stream).await;
-        assert_eq!(ret.map(|(_, x)| x), expected_result);
-
-        let mut buf = Vec::with_capacity(1024);
-        client.read_to_end(&mut buf).await.unwrap();
-        let response = String::from_utf8_lossy(&buf);
-        if expected_result.is_some() {
-            assert_eq!(response[..17], *"HTTP/1.1 200 OK\r\n");
-        } else if auth.is_some() {
-            assert_eq!(response[..44], *"HTTP/1.0 407 Proxy Authentication Required\r\n");
-            assert!(
-                response
-                    .to_ascii_lowercase()
-                    .contains("\r\nproxy-authenticate: basic realm=\"tunward\"\r\n")
-            );
-        } else {
-            assert_eq!(response[..27], *"HTTP/1.0 401 Unauthorized\r\n");
-        }
+    #[test]
+    fn authentication_challenge_is_a_proxy_challenge() {
+        let response = response(StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+        assert_eq!(response.status(), StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+        assert_eq!(response.headers()[PROXY_AUTHENTICATE], "Basic realm=\"tunward\"");
     }
 }

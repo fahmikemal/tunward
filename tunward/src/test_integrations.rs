@@ -89,6 +89,11 @@ fn server_no_tls(dns_resolver: DnsResolver) -> Server {
         remote_server_idle_timeout: Duration::from_secs(30),
         enable_webtransport: false,
         management_api: None,
+        device_quotas: None,
+        device_revocation_config: None,
+        fleet_inventory: None,
+        tenant_config: None,
+        fleet_inventory_max_devices: std::num::NonZeroU32::new(10000).unwrap(),
     };
     Server::new(server_config, DefaultTokioExecutor::default())
 }
@@ -116,6 +121,11 @@ fn server_webtransport(dns_resolver: DnsResolver) -> Server {
         remote_server_idle_timeout: Duration::from_secs(30),
         enable_webtransport: true,
         management_api: None,
+        device_quotas: None,
+        device_revocation_config: None,
+        fleet_inventory: None,
+        tenant_config: None,
+        fleet_inventory_max_devices: std::num::NonZeroU32::new(10000).unwrap(),
     };
     Server::new(server_config, DefaultTokioExecutor::default())
 }
@@ -765,6 +775,11 @@ async fn test_fleet_management_and_ephemeral_reverse_tunnel(
         remote_server_idle_timeout: Duration::from_secs(30),
         enable_webtransport: false,
         management_api: Some(mgmt_addr),
+        device_quotas: None,
+        device_revocation_config: None,
+        fleet_inventory: None,
+        tenant_config: None,
+        fleet_inventory_max_devices: std::num::NonZeroU32::new(10000).unwrap(),
     };
     let server = Server::new(server_config, DefaultTokioExecutor::default());
     let server_port = server.config.bind.port();

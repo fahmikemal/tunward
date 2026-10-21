@@ -1,72 +1,164 @@
-# Contributing to Tunward
+# Contributing
 
-Thank you for your interest in contributing to Tunward. This document outlines development setup, quality checks, and contribution workflows.
+Use this guide with the source version you are changing. The workspace is
+`0.1.0-beta`, and tunnel protocol v2 is incompatible with older peers.
+Keep documentation, client/server behavior, and migration instructions together.
 
-## Prerequisites
+## Environment
 
-- **Rust toolchain:** Rust 1.97 or later (Rust 2024 edition).
-- **Test runner:** [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest --locked`).
-- **TOML formatter:** [taplo-cli](https://taplo.tamasfe.dev) (`cargo install taplo-cli --locked`).
-- **Docker:** Optional, needed only for integration tests that spin up proxy fixtures (e.g. mitmproxy).
+CI pins Rust 1.97 and uses edition 2024. No separate minimum supported Rust
+version is declared in the manifests. Install the native toolchain/build
+dependencies required by your target and TLS provider; the Linux container build
+installs CMake and libclang.
 
-## Task Runners
+The workspace contains the `tunward` library and `tunward-cli` binary crate:
 
-The repository includes configuration for both `just` and `mise`. You can use either tool:
+~~~sh
+cargo build --release --locked -p tunward-cli
+./target/release/tunward --version
+./target/release/tunward client --help
+./target/release/tunward server --help
+~~~
 
-### With `just`
-```bash
-just fmt          # Formats Rust code (cargo fmt) and TOML files (taplo fmt)
-just test         # Runs test suite with cargo nextest
-just linter_fix   # Runs cargo clippy --fix
-```
+Python 3 and OpenSSL are required for certificate generation and qualification
+scripts. Container-backed Rust integration fixtures require a Docker-compatible
+API, access to the chosen engine, and available fixture images.
 
-### With `mise`
-```bash
-mise run test         # Runs test suite
-mise run linter-fix   # Runs cargo clippy --fix, followed by cargo fmt
-```
+## Docker and Podman integration tests
 
-## Local Validation Checklist
+With Docker, use its running daemon and socket. You do not need a second Docker
+daemon when your environment already supplies a working compatible Podman API.
 
-Our CI enforces formatting, static analysis, security audits, and tests on every push and pull request. Run these commands locally before submitting a PR:
+On Linux with rootless Podman and a systemd user session:
 
-```bash
-# 1. Format check
+~~~sh
+systemctl --user enable --now podman.socket
+export DOCKER_HOST="unix://$XDG_RUNTIME_DIR/podman/podman.sock"
+cargo test --workspace --locked
+~~~
+
+Check `XDG_RUNTIME_DIR` and the socket path for the user actually running the
+tests. An absent `docker.sock` does not establish a test failure when
+`DOCKER_HOST` correctly points to Podman. A CLI `--version` check alone does
+not prove API access or container-fixture behavior.
+
+See [Testcontainers configuration](https://github.com/testcontainers/testcontainers-rs/blob/main/docs/features/configuration.md).
+The Python loopback qualification runner does not need Docker; the explicit
+container qualification profile does.
+
+## Checks
+
+Install the tools used by CI when needed:
+
+~~~sh
+cargo install cargo-nextest --locked
+cargo install taplo-cli --locked
+~~~
+
+Run:
+
+~~~sh
 cargo fmt --all -- --check
 taplo fmt --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo nextest run --workspace --locked
+cargo nextest run --workspace --locked --no-default-features --features ring
+~~~
 
-# 2. Static analysis and lints
-cargo clippy --all --all-features --locked -- -D warnings
+`cargo test --workspace --locked` is an alternative to nextest. Test providers
+separately: default `aws-lc-rs`, then `ring` with default features disabled.
+Do not use all-feature runtime tests as a substitute; they enable both TLS
+providers. All-feature Clippy compiles code and is a separate check.
 
-# 3. Test suites (tested separately per crypto provider)
-cargo nextest run --locked
-cargo nextest run --locked --no-default-features --features ring
-```
+For protocol, authentication, lifecycle, or resource changes, build the release
+binary and run the relevant executable qualification sections:
 
-### Crypto Provider Testing Note
+~~~sh
+cargo build --release --locked -p tunward-cli
+python3 scripts/qualify.py --sections protocols,fleet,security,extended,isolation,lifecycle,rotation
+python3 scripts/qualify_identity.py --output target/qualification/identity-review
+python3 scripts/qualify_pool_timeout.py --output target/qualification/pool-review
+python3 scripts/qualify_quotas.py --output target/qualification/quota-review
+python3 scripts/qualify_revocation.py --output target/qualification/revocation-review
+python3 scripts/qualify_fleet.py --output target/qualification/fleet-review
+python3 scripts/qualify_tenants.py --output target/qualification/tenant-review
+python3 scripts/qualify_pki.py --output target/qualification/pki-review
+python3 scripts/qualify_runtime.py --output target/qualification/runtime-review
+python3 scripts/check_publication.py
+~~~
 
-The test suite runs once for each crypto provider:
-- `aws-lc-rs` (default): Used on x86_64 and aarch64 Linux, macOS, and Windows.
-- `ring`: Used on armv7, armv6, FreeBSD, and 32-bit Windows targets.
+Output directories must be new. Preserve failures, `metadata.json`,
+`results.json`, logs, and binary hashes. A `not_run` row is not coverage.
+Use the [qualification guide](docs/STAGING_QUALIFICATION.md) for bounded capacity,
+container, WAN, and endurance profiles. Historical results do not qualify a new
+binary automatically.
 
-Do not run tests with `--all-features`. Passing `--all-features` activates both `aws-lc-rs` and `ring` simultaneously, which causes runtime panics because the underlying token libraries treat them as mutually exclusive.
+## Task runners and legacy scripts
 
-## Secret Scanning
+`mise.toml` defines `test`, `linter-fix`, dependency maintenance, benchmark,
+and release tasks. For example:
 
-Tunward uses Gitleaks in CI to prevent credential leaks. If your changes add configuration or test fixtures, verify locally that they pass without triggering false positives:
+~~~sh
+mise run test
+~~~
 
-```bash
-gitleaks detect --source=. --config=.gitleaks.toml
-```
+Read maintenance/release tasks before using them: some update dependencies or
+commit, tag, and push. This checkout does not contain a `justfile`; the direct
+commands above are the reference.
 
-Any intentional mock certificates or non-sensitive test keys must be added to `.gitleaks.toml`.
+`scripts/bench.sh` is a separate iperf3/perf helper, not the qualification
+runner. It needs its external tools and may generate substantial traffic.
+Its `--dhat` mode refers to a `dhat-heap` feature that is not currently in the
+manifests; do not present that mode as supported. Its comments also reference a
+missing benchmarking guide. Prefer the maintained qualification profiles for
+reproducible bounded checks until those legacy paths are repaired.
 
-## Git and Release Workflow
+## Documentation and secrets
 
-- **Branching:** Base all feature branches and bugfixes on `main`.
-- **Commit Messages:** Follow [Conventional Commits](https://www.conventionalcommits.org/) (for example: `feat(transport): add ...`, `fix(server): resolve ...`, `chore(deps): update ...`).
-- **Releases:** Releases are automated via GitHub Actions and trigger only when version tags (`v*`) are pushed. Regular branch pushes only run CI checks and scans.
+Update the [README](README.md), [mTLS guide](docs/using_mtls.md), and
+[protocol guide](docs/PROTOCOL_V2.md) when changing options, identities, framing,
+defaults, or compatibility. Check examples against the actual parser/CLI and
+link to existing repository files.
 
-## Reporting Issues
+Generate development certificates with:
 
-Please file bug reports and feature requests using our [issue templates](.github/ISSUE_TEMPLATE). Include complete reproduction steps, client/server flags, operating system, and relevant logs.
+~~~sh
+python3 scripts/generate_mtls.py
+~~~
+
+Only the template, ignore file, and README under `certs/mTLS` belong in Git.
+Never commit deployment CA, server, or device private keys. Gitleaks runs in CI,
+but `.gitleaks.toml` has path allowlists, including development TLS material
+and build output; a passing scan is not proof that a file is safe to publish.
+Do not broaden an allowlist to hide a real credential. Old published keys must
+be replaced even after current-tree removal.
+
+Redact proxy credentials, Authorization headers, secret path prefixes, TLS key
+logs, and device/customer identifiers before sharing evidence. Keep test output
+and private keys out of release artifacts.
+
+## CI and releases
+
+[CI](.github/workflows/ci.yaml) runs for pushes to `main`/`draft`, pull
+requests targeting `main`, and manual dispatch. Its jobs include Gitleaks,
+Semgrep, formatting, Clippy, a RustSec audit, provider-specific Rust tests, and
+local qualification.
+
+The [release workflow](.github/workflows/release.yaml) runs on `v*` tags or
+manual dispatch. Checks gate its configured build matrix before release
+publishing. The matrix is a build configuration, not proof of hardware/runtime
+qualification on every OS. Publishing binaries or images is a separate
+maintainer operation; do not infer that the newest source is already released.
+
+## Pull requests and reports
+
+Keep changes focused and describe the concrete before/after behavior. Include
+the relevant test command, result, binary/commit identifiers, and any untested
+platform or transport. Protocol changes need a migration/rollback plan for both
+peers. Avoid claims of enterprise readiness based only on a health counter or a
+short local benchmark.
+
+Use the [bug](.github/ISSUE_TEMPLATE/bug_report.md),
+[feature](.github/ISSUE_TEMPLATE/feature_request.md), or
+[help](.github/ISSUE_TEMPLATE/need-help.md) template. Report vulnerabilities
+privately through [SECURITY.md](SECURITY.md).

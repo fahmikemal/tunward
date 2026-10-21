@@ -3,13 +3,18 @@ mod embedded_certificate;
 pub mod executor;
 pub mod management;
 mod protocols;
+pub mod quotas;
 mod restrictions;
+mod revocation;
 mod somark;
+mod tenants;
 #[cfg(test)]
 mod test_integrations;
 pub mod tunnel;
 
-pub use management::{ClientRecord, FleetRegistry, HealthStats, SessionRecord};
+pub use management::{
+    ClientRecord, ConnectionRecord, DevicePage, DeviceRecord, FleetRegistry, HealthStats, SessionRecord,
+};
 
 use crate::config::{ClientCreationRequest, DEFAULT_CLIENT_UPGRADE_PATH_PREFIX, ServerCreationRequest};
 use crate::executor::{TokioExecutor, TokioExecutorRef};
@@ -505,6 +510,11 @@ pub async fn run_server(args: ServerCreationRequest, executor: impl TokioExecuto
 }
 
 async fn run_server_impl(args: ServerCreationRequest, executor: impl TokioExecutorRef) -> anyhow::Result<()> {
+    let device_quotas = args
+        .device_quota_config
+        .as_deref()
+        .map(crate::quotas::DeviceQuotaConfig::from_path)
+        .transpose()?;
     // wts:// binds TLS on TCP exactly like wss://, and additionally serves webtransport over UDP.
     let is_webtransport = args.remote_addr.scheme() == "wts";
     let tls_config = if args.remote_addr.scheme() == "wss" || is_webtransport {
@@ -587,6 +597,11 @@ async fn run_server_impl(args: ServerCreationRequest, executor: impl TokioExecut
         // The TCP listener still runs, serving websocket and http2 as usual.
         enable_webtransport: args.enable_webtransport || is_webtransport,
         management_api: args.management_api,
+        device_quotas,
+        device_revocation_config: args.device_revocation_config,
+        fleet_inventory: args.fleet_inventory,
+        fleet_inventory_max_devices: args.fleet_inventory_max_devices,
+        tenant_config: args.tenant_config,
     };
     let server = Server::new(server_config, executor);
 

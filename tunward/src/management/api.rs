@@ -12,6 +12,10 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 
 pub async fn run_management_server(bind_addr: SocketAddr, registry: FleetRegistry) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        bind_addr.ip().is_loopback(),
+        "management API must bind to loopback; expose it through an authenticated TLS proxy"
+    );
     let listener = TcpListener::bind(bind_addr).await?;
     info!("Tunward Management REST API listening on http://{bind_addr}");
 
@@ -50,8 +54,13 @@ async fn handle_request<B: hyper::body::Body>(req: Request<B>, registry: FleetRe
     match (method, path) {
         (&Method::GET, "/healthz") => {
             let health = registry.health();
+            let status = if health.status == "healthy" {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
             let json = serde_json::to_vec(&health).unwrap_or_default();
-            json_response(StatusCode::OK, json)
+            json_response(status, json)
         }
         (&Method::GET, "/api/v1/clients") => {
             let clients = registry.list_clients();
@@ -72,14 +81,78 @@ async fn handle_request<B: hyper::body::Body>(req: Request<B>, registry: FleetRe
             let json = serde_json::to_vec(&sessions).unwrap_or_default();
             json_response(StatusCode::OK, json)
         }
+        (&Method::GET, "/api/v1/connections") => json_response(
+            StatusCode::OK,
+            serde_json::to_vec(&registry.list_connections()).unwrap_or_default(),
+        ),
+        (&Method::GET, "/api/v1/devices") => {
+            let (limit, after) = match inventory_query(req.uri().query()) {
+                Ok(query) => query,
+                Err(_) => {
+                    return json_response(
+                        StatusCode::BAD_REQUEST,
+                        b"{\"error\":\"Invalid inventory pagination\"}".to_vec(),
+                    );
+                }
+            };
+            match registry.list_devices(limit, after).await {
+                Ok(page) => json_response(StatusCode::OK, serde_json::to_vec(&page).unwrap_or_default()),
+                Err(err) => {
+                    error!("Cannot read device inventory: {err:#}");
+                    json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        b"{\"error\":\"Inventory unavailable\"}".to_vec(),
+                    )
+                }
+            }
+        }
+        (&Method::GET, path) if path.starts_with("/api/v1/devices/") => {
+            let identity = match urlencoding::decode(&path["/api/v1/devices/".len()..]) {
+                Ok(identity) if !identity.is_empty() => identity.into_owned(),
+                _ => {
+                    return json_response(StatusCode::BAD_REQUEST, b"{\"error\":\"Invalid device identity\"}".to_vec());
+                }
+            };
+            match registry.get_device(identity).await {
+                Ok(Some(device)) => json_response(StatusCode::OK, serde_json::to_vec(&device).unwrap_or_default()),
+                Ok(None) => json_response(StatusCode::NOT_FOUND, b"{\"error\":\"Device not found\"}".to_vec()),
+                Err(err) => {
+                    error!("Cannot read device inventory: {err:#}");
+                    json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        b"{\"error\":\"Inventory unavailable\"}".to_vec(),
+                    )
+                }
+            }
+        }
         _ => json_response(StatusCode::NOT_FOUND, b"{\"error\":\"Route not found\"}".to_vec()),
     }
+}
+
+fn inventory_query(query: Option<&str>) -> anyhow::Result<(usize, String)> {
+    let mut limit = None;
+    let mut after = None;
+    for pair in query.unwrap_or("").split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').ok_or_else(|| anyhow::anyhow!("invalid query"))?;
+        let value = urlencoding::decode(value)?;
+        match key {
+            "limit" if limit.is_none() => {
+                let value = value.parse::<usize>()?;
+                anyhow::ensure!((1..=1000).contains(&value), "invalid page limit");
+                limit = Some(value);
+            }
+            "after" if after.is_none() => after = Some(value.into_owned()),
+            _ => anyhow::bail!("unknown or duplicate pagination argument"),
+        }
+    }
+    Ok((limit.unwrap_or(100), after.unwrap_or_default()))
 }
 
 fn json_response(status: StatusCode, body: Vec<u8>) -> Response<Full<Bytes>> {
     Response::builder()
         .status(status)
         .header(hyper::header::CONTENT_TYPE, "application/json")
+        .header(hyper::header::CACHE_CONTROL, "no-store")
         .body(Full::new(Bytes::from(body)))
         .unwrap()
 }

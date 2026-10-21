@@ -28,6 +28,9 @@ const MAX_JWT_PREAMBLE_LEN: usize = 8 * 1024;
 /// behaviour for a user who asked for no periodic traffic.
 pub(crate) fn mk_transport_config(keep_alive_interval: Option<Duration>) -> anyhow::Result<quinn::TransportConfig> {
     let mut transport = quinn::TransportConfig::default();
+    // One session carries both active tunnels and pending reverse requests. The default
+    // 100-stream credit deadlocks a workload that holds 128 tunnels open before sending.
+    transport.max_concurrent_bidi_streams(1024u32.into());
 
     // TODO: Check performance impact
     transport.send_fairness(false);

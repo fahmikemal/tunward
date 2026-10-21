@@ -15,6 +15,9 @@ env:
   BIN_NAME: "tunward"
 
 jobs:
+  native-runtime:
+    uses: ./.github/workflows/runtime-qualification.yaml
+
   # Runs alongside the build matrix, so a formatting or test failure is reported without
   # waiting on the cross-compilation of every platform.
   check:
@@ -38,6 +41,9 @@ jobs:
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Reject private keys in reachable publication history
+        run: python3 scripts/check_publication.py --history
+
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 
@@ -47,9 +53,7 @@ jobs:
       - name: Lint
         run: cargo clippy --all --all-features --locked -- -D warnings
 
-      # Not --all-features: it turns on both `aws-lc-rs` and `ring`, which forward the two
-      # mutually exclusive crypto providers of jsonwebtoken, and the tests then panic at runtime.
-      # Each provider gets its own run instead, as they are compiled in, never side by side.
+      # Validate each shipped TLS provider separately.
       - name: Test with aws-lc-rs
         run: cargo nextest run --locked
 
@@ -59,7 +63,7 @@ jobs:
 
   build:
     name: Build - ${{ matrix.platform.name }}
-    needs: [ check ]
+    needs: [ check, native-runtime ]
     # By default, runs on Ubuntu, otherwise, override with the desired os
     runs-on: ${{ matrix.platform.os || 'ubuntu-24.04' }}
     strategy:
@@ -200,7 +204,7 @@ jobs:
         with:
           command: build
           use-cross: ${{ (!contains(matrix.platform.target, 'x86_64') && !contains(matrix.platform.target, 'windows')) || contains(matrix.platform.target, 'freebsd') }}
-          args: ${{ matrix.platform.build-args }} --bin tunward --target ${{ matrix.platform.target }}
+          args: ${{ matrix.platform.build-args }} --locked --bin tunward --target ${{ matrix.platform.target }}
 
       - name: Store artifact
         uses: actions/upload-artifact@v4

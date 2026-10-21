@@ -25,3 +25,25 @@ pub fn cn_from_certificate(tls_certificate_x509: &X509Certificate) -> Option<Str
         .next()
         .map(|cn| cn.to_string())
 }
+
+/// The mTLS restriction scheme binds each verified client certificate to one path prefix.
+/// A trusted chain without that identity must not fall back to unrestricted path selection.
+pub fn client_path_from_certificate(
+    certificates: Option<&[CertificateDer<'static>]>,
+    required: bool,
+) -> anyhow::Result<Option<String>> {
+    if !required {
+        return Ok(None);
+    }
+    let leaf = certificates
+        .and_then(find_leaf_certificate)
+        .ok_or_else(|| anyhow::anyhow!("mTLS client certificate has no usable leaf identity"))?;
+    anyhow::ensure!(
+        leaf.subject().iter_common_name().count() == 1,
+        "mTLS client certificate must contain exactly one Common Name"
+    );
+    let identity = cn_from_certificate(&leaf)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("mTLS client certificate has no usable Common Name"))?;
+    Ok(Some(identity))
+}

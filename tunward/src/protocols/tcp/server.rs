@@ -160,7 +160,7 @@ pub async fn connect_with_http_proxy(
     };
 
     let connect_request = format!("CONNECT {host}:{port} HTTP/1.0\r\nHost: {host}:{port}\r\n{authorization}\r\n");
-    debug!("Sending request:\n{}", connect_request);
+    debug!("Sending HTTP CONNECT to {host}:{port}");
     socket.write_all(connect_request.as_bytes()).await?;
 
     let mut buf = BytesMut::with_capacity(1024);
@@ -203,7 +203,7 @@ pub async fn connect_with_http_proxy(
         ));
     }
 
-    debug!("Got response from proxy:\n{}", String::from_utf8_lossy(&buf));
+    debug!("Received HTTP proxy response ({} bytes)", buf.len());
     info!("Http proxy accepted connection to remote host {}:{}", host, port);
     Ok(socket)
 }
@@ -282,7 +282,13 @@ mod tests {
             ("tunward_test_proxy_connection", host)
         };
 
-        let mitm_proxy: ContainerAsync<MitmProxy> = MitmProxy.with_network(network_name).start().await.unwrap();
+        let mitm_proxy = if network_name == "host" {
+            // Podman exposes host networking as a mode, not a named network.
+            MitmProxy.with_host_config_modifier(|config| config.network_mode = Some("host".to_string()))
+        } else {
+            MitmProxy.with_network(network_name)
+        };
+        let mitm_proxy: ContainerAsync<MitmProxy> = mitm_proxy.start().await.unwrap();
 
         let proxy_port = match network_name {
             "host" => 8080,

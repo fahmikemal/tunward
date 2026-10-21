@@ -7,9 +7,11 @@ use anyhow::{Context, anyhow};
 use bb8::ManageConnection;
 use bytes::Bytes;
 use either::Either;
+use futures_util::{StreamExt, pin_mut};
 use std::net::SocketAddr;
 use std::ops::Deref;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{instrument, warn};
 use url::Host;
 use web_transport_quinn::Session;
@@ -32,7 +34,7 @@ impl Deref for L4StreamManager {
 }
 
 impl L4StreamManager {
-    /// Establish a webtransport session with the server, trying each resolved address in turn.
+    /// Establish a webtransport session with the server, racing resolved addresses with a bounded stagger.
     ///
     /// This does the whole expensive part up front — QUIC handshake, TLS 1.3, HTTP/3 SETTINGS and
     /// the session-level CONNECT — so a pooled session is ready to carry tunnels immediately. The
@@ -64,45 +66,45 @@ impl L4StreamManager {
         let sni = self.quic_server_name();
         let timeout = self.timeout_connect;
 
-        let mut last_err = None;
-        for addr in &addrs {
-            // Bound the handshake like the TCP transports do, so a server that never answers on
-            // UDP fails with a clear error instead of hanging until the QUIC idle timeout. This is
-            // the common symptom of a firewall or port mapping that only forwards TCP.
-            let handshake = async {
-                let cnx = webtransport
-                    .endpoint_for(*addr)
-                    .connect_with(webtransport.config.clone(), *addr, &sni)
-                    .with_context(|| format!("cannot start a QUIC connection to {addr}"))?
-                    .await
-                    .with_context(|| format!("cannot establish a QUIC connection to {addr}"))?;
-
-                Session::connect(cnx, request.clone())
-                    .await
-                    .with_context(|| format!("webtransport handshake with {addr} failed"))
-            };
-
-            match tokio::time::timeout(timeout, handshake).await {
-                Ok(Ok(session)) => return Ok(session),
-                Ok(Err(err)) => {
-                    warn!("{err:?}");
-                    last_err = Some(err);
+        // A stalled first address must not consume the pool deadline before another family
+        // is attempted. Keep at most four handshakes in flight, staggered by 250 ms.
+        let attempts = futures_util::stream::iter(addrs)
+            .enumerate()
+            .map(|(index, addr)| {
+                let request = request.clone();
+                let sni = &sni;
+                async move {
+                    tokio::time::sleep(Duration::from_millis(index as u64 * 250)).await;
+                    let cnx = webtransport
+                        .endpoint_for(addr)
+                        .connect_with(webtransport.config.clone(), addr, sni)
+                        .with_context(|| format!("cannot start a QUIC connection to {addr}"))?
+                        .await
+                        .with_context(|| format!("cannot establish a QUIC connection to {addr}"))?;
+                    Session::connect(cnx, request)
+                        .await
+                        .with_context(|| format!("webtransport handshake with {addr} failed"))
                 }
-                Err(_) => {
-                    warn!("timed out after {timeout:?} doing the webtransport handshake with {addr}");
-                    last_err = Some(anyhow!(
-                        "timed out after {timeout:?} doing the webtransport handshake with {addr}. Is UDP reachable on that port?"
-                    ));
+            })
+            .buffer_unordered(4);
+        pin_mut!(attempts);
+        let handshake = async {
+            let mut last_err = None;
+            while let Some(result) = attempts.next().await {
+                match result {
+                    Ok(session) => return Ok(session),
+                    Err(err) => {
+                        warn!("{err:?}");
+                        last_err = Some(err);
+                    }
                 }
             }
-        }
-
-        Err(last_err
-            .unwrap_or_else(|| anyhow!("no address to connect to"))
-            .context(format!(
-                "failed to open a webtransport session with the server {:?}",
-                self.remote_addr
-            )))
+            Err(last_err.unwrap_or_else(|| anyhow!("no address to connect to")))
+        };
+        tokio::time::timeout(timeout, handshake)
+            .await
+            .with_context(|| format!("webtransport connection timed out after {timeout:?}; check UDP reachability"))?
+            .with_context(|| format!("failed to open a webtransport session with the server {:?}", self.remote_addr))
     }
 }
 

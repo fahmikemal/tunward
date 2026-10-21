@@ -1,3 +1,4 @@
+use super::server::{ConnectionContext, EstablishedTunnel};
 use crate::executor::TokioExecutorRef;
 use crate::restrictions::types::RestrictionsRules;
 use crate::tunnel::server::Server;
@@ -12,45 +13,40 @@ use hyper::header::{HeaderName, HeaderValue, SEC_WEBSOCKET_PROTOCOL};
 use hyper::{Request, Response};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::oneshot;
 use tracing::{Instrument, Span, error, warn};
 
 pub(super) async fn ws_server_upgrade(
     server: Server<impl TokioExecutorRef>,
     restrictions: Arc<RestrictionsRules>,
-    restrict_path_prefix: Option<String>,
+    restrict_path_prefix: ConnectionContext,
     client_addr: SocketAddr,
     mut req: Request<Incoming>,
 ) -> HttpResponse {
+    let revocation = restrict_path_prefix.revocation.clone();
+    let quota = match restrict_path_prefix.admit_tunnel() {
+        Ok(permit) => permit,
+        Err(err) => return *super::utils::quota_rejection(err),
+    };
     if !fastwebsockets::upgrade::is_upgrade_request(&req) {
         warn!("Rejecting connection with bad upgrade request: {}", req.uri());
         return bad_request();
     }
 
-    let client_id = req
-        .headers()
-        .get("x-client-id")
-        .or_else(|| req.headers().get("x-device-id"))
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string());
-
-    let client_guard = if let (Some(id), Some(reg)) = (&client_id, &server.fleet_registry) {
-        reg.register_client(id.clone(), client_addr);
-        Some(scopeguard::guard((id.clone(), reg.clone()), |(id, reg)| {
-            reg.unregister_client(&id);
-        }))
-    } else {
-        None
-    };
-
     let mask_frame = server.config.websocket_mask_frame;
-    let (remote_addr, local_rx, local_tx, need_cookie) = match server
-        .handle_tunnel_request(restrictions, restrict_path_prefix, client_addr, &req)
+    let EstablishedTunnel {
+        remote_addr,
+        local_rx,
+        local_tx,
+        need_cookie,
+        quota,
+        fleet,
+    } = match server
+        .handle_tunnel_request(restrictions, restrict_path_prefix, client_addr, &req, quota)
         .await
     {
         Ok(ret) => ret,
         Err(err) => {
-            return err;
+            return *err;
         }
     };
 
@@ -62,62 +58,36 @@ pub(super) async fn ws_server_upgrade(
         }
     };
 
-    if let Some(guard) = client_guard {
-        scopeguard::ScopeGuard::into_inner(guard);
-    }
-
-    let executor = server.executor.clone();
-    let client_id_cleanup = client_id;
-    let fleet_reg = server.fleet_registry.clone();
-    let session_id = uuid::Uuid::now_v7().to_string();
-
-    if let Some(reg) = &server.fleet_registry {
-        reg.register_session(
-            session_id.clone(),
-            client_id_cleanup.clone().unwrap_or_else(|| "anonymous".to_string()),
-            remote_addr.port,
-            client_addr,
-            remote_addr.port,
-        );
-    }
-
     server.executor.spawn(
         async move {
-            scopeguard::defer!({
-                if let Some(reg) = &fleet_reg {
-                    reg.unregister_session(&session_id);
-                    if let Some(id) = &client_id_cleanup {
-                        reg.unregister_client(id);
-                    }
-                }
-            });
-
-            let (ws_rx, ws_tx) = match fut.await {
-                Ok(ws) => match mk_websocket_tunnel(ws, Role::Server, mask_frame) {
-                    Ok(ws) => ws,
-                    Err(err) => {
-                        error!("Error during http upgrade request: {:?}", err);
-                        return Err(err);
-                    }
-                },
-                Err(err) => {
-                    error!("Error during http upgrade request: {:?}", err);
-                    return Err(anyhow::Error::from(err));
-                }
-            };
-            let (close_tx, close_rx) = oneshot::channel::<()>();
-
-            executor
-                .spawn(transport::io::propagate_remote_to_local(local_tx, ws_rx, close_rx).instrument(Span::current()));
-
-            let _ = transport::io::propagate_local_to_remote(
-                local_rx,
-                ws_tx,
-                close_tx,
-                server.config.websocket_ping_frequency,
-            )
-            .await;
-            Ok(())
+            let _fleet = fleet;
+            revocation
+                .run(async move {
+                    let (ws_rx, ws_tx) = match fut.await {
+                        Ok(ws) => match mk_websocket_tunnel(ws, Role::Server, mask_frame) {
+                            Ok(ws) => ws,
+                            Err(err) => {
+                                error!("Error during http upgrade request: {:?}", err);
+                                return Err(err);
+                            }
+                        },
+                        Err(err) => {
+                            error!("Error during http upgrade request: {:?}", err);
+                            return Err(anyhow::Error::from(err));
+                        }
+                    };
+                    let _ = transport::io::forward_with_quota(
+                        local_rx,
+                        local_tx,
+                        ws_rx,
+                        ws_tx,
+                        server.config.websocket_ping_frequency,
+                        quota,
+                    )
+                    .await;
+                    Ok(())
+                })
+                .await
         }
         .instrument(Span::current()),
     );
@@ -135,7 +105,10 @@ pub(super) async fn ws_server_upgrade(
 
     response
         .headers_mut()
-        .insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static("v1"));
+        .insert(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static("v2"));
+    response
+        .headers_mut()
+        .insert(transport::VERSION_HEADER, HeaderValue::from_static(transport::PROTOCOL_VERSION));
 
     response
 }

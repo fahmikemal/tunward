@@ -1,0 +1,5 @@
+# Live local access policy. Publish a complete file using atomic replacement.
+# Empty lists permit every otherwise-authorized verified device/certificate.
+version: 1
+blocked_devices: []
+blocked_cert_sha256: []

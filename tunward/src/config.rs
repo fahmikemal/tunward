@@ -110,9 +110,10 @@ pub struct ClientCreationRequest {
     #[cfg_attr(feature = "clap", arg(long, verbatim_doc_comment))]
     pub tls_ech_enable: bool,
 
-    /// Enable TLS certificate verification.
-    /// Disabled by default. The client will happily connect to any server with self-signed certificate.
-    #[cfg_attr(feature = "clap", arg(long, verbatim_doc_comment))]
+    /// Verify the server certificate (enabled by default).
+    /// For isolated development with a self-signed certificate, explicitly set this to false.
+    #[cfg_attr(feature = "clap", arg(long, action = clap::ArgAction::Set, num_args = 0..=1,
+        default_value_t = true, default_missing_value = "true", require_equals = true, verbatim_doc_comment))]
     pub tls_verify_certificate: bool,
 
     /// If set, will use this http proxy to connect to the server
@@ -433,6 +434,55 @@ pub struct ServerCreationRequest {
         arg(long, value_name = "IP:PORT", verbatim_doc_comment, env = "TUNWARD_MANAGEMENT_API")
     )]
     pub management_api: Option<SocketAddr>,
+
+    /// Per-device quota YAML. Requires mTLS; keys are verified client certificate CNs, not client-id labels.
+    /// Loaded at startup. Limits apply across transports in this server instance.
+    #[cfg_attr(
+        feature = "clap",
+        arg(
+            long,
+            value_name = "FILE",
+            requires = "tls_client_ca_certs",
+            env = "TUNWARD_DEVICE_QUOTA_CONFIG"
+        )
+    )]
+    pub device_quota_config: Option<PathBuf>,
+
+    /// Live revocation YAML for verified mTLS device CNs or leaf-certificate SHA-256 fingerprints.
+    /// Reloaded every second; unreadable/invalid policy closes sessions and denies access until recovery.
+    #[cfg_attr(
+        feature = "clap",
+        arg(
+            long,
+            value_name = "FILE",
+            requires = "tls_client_ca_certs",
+            env = "TUNWARD_DEVICE_REVOCATION_CONFIG"
+        )
+    )]
+    pub device_revocation_config: Option<PathBuf>,
+
+    /// SQLite file for persistent observations of verified mTLS device identities.
+    #[cfg_attr(
+        feature = "clap",
+        arg(
+            long,
+            value_name = "FILE",
+            requires = "tls_client_ca_certs",
+            env = "TUNWARD_FLEET_INVENTORY"
+        )
+    )]
+    pub fleet_inventory: Option<PathBuf>,
+
+    /// Maximum distinct identities stored in the fleet inventory; existing identities can reconnect at capacity.
+    #[cfg_attr(
+        feature = "clap",
+        arg(long, default_value = "10000", env = "TUNWARD_FLEET_INVENTORY_MAX_DEVICES")
+    )]
+    pub fleet_inventory_max_devices: std::num::NonZeroU32,
+
+    /// Startup tenant membership, role permissions, and reverse resource reservations. Requires mTLS and named restriction rules.
+    #[cfg_attr(feature = "clap", arg(long, value_name = "FILE", requires_all = ["tls_client_ca_certs", "restrict_config"], env = "TUNWARD_TENANT_CONFIG"))]
+    pub tenant_config: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -449,7 +499,6 @@ mod parsers {
     use crate::tunnel::transport::TransportScheme;
     use base64::Engine;
     use hyper::http::{HeaderName, HeaderValue};
-    use std::cmp::max;
     use std::collections::BTreeMap;
     use std::io;
     use std::io::ErrorKind;
@@ -463,11 +512,14 @@ mod parsers {
     pub fn parse_duration_sec(arg: &str) -> Result<Duration, io::Error> {
         use std::io::Error;
 
-        let (arg, multiplier) = match &arg[max(0, arg.len() - 1)..] {
-            "s" => (&arg[..arg.len() - 1], 1),
-            "m" => (&arg[..arg.len() - 1], 60),
-            "h" => (&arg[..arg.len() - 1], 3600),
-            _ => (arg, 1),
+        let (arg, multiplier) = if let Some(arg) = arg.strip_suffix('s') {
+            (arg, 1)
+        } else if let Some(arg) = arg.strip_suffix('m') {
+            (arg, 60)
+        } else if let Some(arg) = arg.strip_suffix('h') {
+            (arg, 3600)
+        } else {
+            (arg, 1)
         };
 
         let Ok(secs) = arg.parse::<u64>() else {
@@ -477,7 +529,10 @@ mod parsers {
             ));
         };
 
-        Ok(Duration::from_secs(secs * multiplier))
+        let secs = secs
+            .checked_mul(multiplier)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "duration is too large"))?;
+        Ok(Duration::from_secs(secs))
     }
 
     pub fn parse_local_bind(arg: &str) -> Result<(SocketAddr, &str), io::Error> {
@@ -742,7 +797,8 @@ mod parsers {
             }
         };
 
-        Ok((HeaderName::from_str(key).unwrap(), value))
+        let name = HeaderName::from_str(key.trim()).map_err(|err| io::Error::new(ErrorKind::InvalidInput, err))?;
+        Ok((name, value))
     }
 
     pub fn parse_http_credentials(arg: &str) -> Result<HeaderValue, io::Error> {

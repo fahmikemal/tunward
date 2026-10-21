@@ -4,6 +4,7 @@ use crate::restrictions::types::{
     ReverseTunnelProtocol, TunnelProtocol,
 };
 use crate::tunnel::RemoteAddr;
+use crate::tunnel::transport::TunnelMetadata;
 use crate::tunnel::transport::{JWT_HEADER_PREFIX, JwtTunnelConfig, jwt_token_to_tunnel, tunnel_to_jwt_token};
 use anyhow::Context;
 use bytes::Bytes;
@@ -13,7 +14,6 @@ use http_body_util::combinators::BoxBody;
 use hyper::body::Body;
 use hyper::header::{AUTHORIZATION, COOKIE, HeaderValue, SEC_WEBSOCKET_PROTOCOL};
 use hyper::{Request, Response, StatusCode, http};
-use jsonwebtoken::TokenData;
 use std::net::IpAddr;
 use tracing::{error, info};
 use url::Host;
@@ -26,6 +26,24 @@ pub(super) fn bad_request() -> HttpResponse {
         .status(StatusCode::BAD_REQUEST)
         .body(Either::Left("Invalid request".to_string()))
         .unwrap()
+}
+
+pub(super) fn quota_rejection(error: crate::quotas::QuotaError) -> Box<HttpResponse> {
+    let mut response = http::Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header(hyper::header::CACHE_CONTROL, "no-store");
+    if let Some(delay) = error.retry_after {
+        let seconds = delay
+            .as_secs()
+            .saturating_add(u64::from(delay.subsec_nanos() != 0))
+            .max(1);
+        response = response.header(hyper::header::RETRY_AFTER, seconds.to_string());
+    }
+    Box::new(
+        response
+            .body(Either::Left(format!("Device quota exceeded: {}", error.kind)))
+            .unwrap(),
+    )
 }
 
 /// Checks if the requested (remote) port has been mapped in the configuration to another port.
@@ -91,7 +109,7 @@ pub(super) enum PathPrefixErr {
 }
 
 #[inline]
-pub(super) fn extract_tunnel_info<B>(req: &Request<B>) -> anyhow::Result<TokenData<JwtTunnelConfig>> {
+pub(super) fn extract_tunnel_info<B>(req: &Request<B>) -> anyhow::Result<TunnelMetadata<JwtTunnelConfig>> {
     let jwt = req
         .headers()
         .get(SEC_WEBSOCKET_PROTOCOL)
@@ -101,13 +119,7 @@ pub(super) fn extract_tunnel_info<B>(req: &Request<B>) -> anyhow::Result<TokenDa
         .or_else(|| req.headers().get(COOKIE).and_then(|header| header.to_str().ok()))
         .unwrap_or_default();
 
-    jwt_token_to_tunnel(jwt).with_context(|| {
-        let msg = format!(
-            "error while decoding jwt for tunnel info header {:?}",
-            req.headers().get(SEC_WEBSOCKET_PROTOCOL)
-        );
-        msg
-    })
+    jwt_token_to_tunnel(jwt).with_context(|| "invalid or unsupported tunnel metadata")
 }
 
 impl RestrictionConfig {
@@ -129,7 +141,11 @@ impl AllowReverseTunnelConfig {
             return false;
         }
 
-        // For ReverseUnix tunnels there is no port or cidr to check
+        if !self.protocol.is_empty() && !self.protocol.contains(&ReverseTunnelProtocol::from(&remote.protocol)) {
+            return false;
+        }
+
+        // Unix listeners have a filesystem identity, rather than a network port or CIDR.
         if let LocalProtocol::ReverseUnix { path } = &remote.protocol {
             return self
                 .unix_path
@@ -137,10 +153,6 @@ impl AllowReverseTunnelConfig {
         }
 
         if !self.port.is_empty() && !self.port.iter().any(|range| range.contains(&remote.port)) {
-            return false;
-        }
-
-        if !self.protocol.is_empty() && !self.protocol.contains(&ReverseTunnelProtocol::from(&remote.protocol)) {
             return false;
         }
 
@@ -200,9 +212,20 @@ pub(super) fn validate_tunnel<'a>(
     authorization: Option<&str>,
     restrictions: &'a RestrictionsRules,
 ) -> Option<&'a RestrictionConfig> {
+    validate_tunnel_with_scope(remote, path_prefix, authorization, restrictions, |_| true)
+}
+
+pub(super) fn validate_tunnel_with_scope<'a>(
+    remote: &RemoteAddr,
+    path_prefix: &str,
+    authorization: Option<&str>,
+    restrictions: &'a RestrictionsRules,
+    scope: impl Fn(&RestrictionConfig) -> bool,
+) -> Option<&'a RestrictionConfig> {
     restrictions
         .restrictions
         .iter()
+        .filter(|restriction| scope(restriction))
         .filter(|restriction| restriction.filter(path_prefix, authorization))
         .find(|restriction| restriction.allow.iter().any(|allow| allow.is_allowed(remote)))
 }
@@ -254,7 +277,7 @@ mod tests {
                     r#match: vec![MatchConfig::Any],
                     allow: vec![AllowConfig::Tunnel(AllowTunnelConfig {
                         protocol: vec![TunnelProtocol::Tcp],
-                        port: vec![80..=80],
+                        port: std::iter::once(80..=80).collect(),
                         cidr: vec![IpNet::from(Ipv4Net::new([127, 0, 0, 1].into(), 24).unwrap())],
                         host: Regex::new("example.com").unwrap(),
                     })],
@@ -265,7 +288,7 @@ mod tests {
                     r#match: vec![MatchConfig::Any],
                     allow: vec![AllowConfig::ReverseTunnel(AllowReverseTunnelConfig {
                         protocol: vec![ReverseTunnelProtocol::Tcp],
-                        port: vec![80..=80],
+                        port: std::iter::once(80..=80).collect(),
                         cidr: vec![IpNet::from(Ipv4Net::new([127, 0, 0, 1].into(), 24).unwrap())],
                         port_mapping: Default::default(),
                         unix_path: default_host(),
@@ -375,7 +398,7 @@ mod tests {
     fn test_reverse_tunnel_is_allowed() {
         let config = AllowReverseTunnelConfig {
             protocol: vec![ReverseTunnelProtocol::Tcp],
-            port: vec![80..=80],
+            port: std::iter::once(80..=80).collect(),
             cidr: vec![IpNet::from(Ipv4Net::new([127, 0, 0, 1].into(), 8).unwrap())],
             port_mapping: Default::default(),
             unix_path: default_host(),
@@ -403,7 +426,7 @@ mod tests {
     fn test_reverse_tunnel_is_not_allowed() {
         let config = AllowReverseTunnelConfig {
             protocol: vec![ReverseTunnelProtocol::Tcp],
-            port: vec![80..=80],
+            port: std::iter::once(80..=80).collect(),
             cidr: vec![IpNet::from(Ipv4Net::new([127, 0, 0, 1].into(), 24).unwrap())],
             port_mapping: Default::default(),
             unix_path: default_host(),
@@ -507,7 +530,7 @@ mod tests {
     fn test_tunnel_is_allowed() {
         let config = AllowTunnelConfig {
             protocol: vec![TunnelProtocol::Tcp],
-            port: vec![80..=80],
+            port: std::iter::once(80..=80).collect(),
             cidr: vec![IpNet::from(Ipv4Net::new([127, 0, 0, 1].into(), 8).unwrap())],
             host: Regex::new(".*").unwrap(),
         };
@@ -543,7 +566,7 @@ mod tests {
     fn test_tunnel_is_not_allowed() {
         let config = AllowTunnelConfig {
             protocol: vec![TunnelProtocol::Tcp],
-            port: vec![80..=80],
+            port: std::iter::once(80..=80).collect(),
             cidr: vec![IpNet::from(Ipv4Net::new([127, 0, 0, 1].into(), 24).unwrap())],
             host: Regex::new("example.com").unwrap(),
         };

@@ -15,6 +15,9 @@ env:
   RUST_VERSION: 1.97
 
 jobs:
+  native-runtime:
+    uses: ./.github/workflows/runtime-qualification.yaml
+
   secret-scan:
     name: Secret Scan (Gitleaks)
     runs-on: ubuntu-latest
@@ -73,7 +76,6 @@ jobs:
 
       - name: Security Vulnerability Scan (cargo-audit)
         uses: actions-rust-lang/audit@v1
-        continue-on-error: true
 
   test:
     name: Tests
@@ -100,3 +102,66 @@ jobs:
 
       - name: Test with ring
         run: cargo nextest run --locked --no-default-features --features ring
+
+  qualification:
+    name: Local protocol and security regressions
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "${{ env.RUST_VERSION }}"
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: cargo build --release --locked -p tunward-cli
+      - name: Qualify transports and security
+        timeout-minutes: 15
+        run: python3 scripts/qualify.py --sections protocols,fleet,security,extended,isolation,soak,lifecycle,rotation --devices 32 --idle 128 --hold 5
+      - name: Qualify certificate identity and device isolation
+        timeout-minutes: 5
+        run: python3 scripts/qualify_identity.py --output target/qualification/identity
+      - name: Verify delayed TLS pool deadline behavior
+        timeout-minutes: 2
+        run: python3 scripts/qualify_pool_timeout.py --output target/qualification/pool-delay
+      - name: Qualify authenticated device quotas
+        timeout-minutes: 5
+        run: python3 scripts/qualify_quotas.py --output target/qualification/quotas
+      - name: Qualify live certificate and device revocation
+        timeout-minutes: 5
+        run: python3 scripts/qualify_revocation.py --output target/qualification/revocation
+      - name: Qualify fleet transport parity and persistent inventory
+        timeout-minutes: 5
+        run: python3 scripts/qualify_fleet.py --output target/qualification/fleet
+      - name: Qualify tenant scope and reverse ownership
+        timeout-minutes: 5
+        run: python3 scripts/qualify_tenants.py --output target/qualification/tenants
+      - name: Check publication tree for PEM private keys
+        run: python3 scripts/check_publication.py
+      - name: Verify endurance evidence and supervisor shutdown
+        run: python3 -m unittest discover -s scripts -p 'test_*endurance.py'
+      - name: Qualify synthetic verified-device admission
+        run: python3 scripts/qualify_device_scale.py --devices 200 --output target/qualification/device-scale
+      - name: Qualify certificate renewal and rollback
+        timeout-minutes: 5
+        run: python3 scripts/qualify_pki.py --output target/qualification/pki
+      - name: Install controlled DNS test dependencies
+        run: python3 -m pip install -r scripts/requirements-qualification.txt
+      - name: Qualify DNS and ECH edge cases
+        timeout-minutes: 5
+        run: python3 scripts/qualify_dns.py --output target/qualification/dns
+      - name: Qualify isolated privileged IPv4 TProxy
+        timeout-minutes: 5
+        run: |
+          status=0
+          sudo python3 scripts/qualify_tproxy.py --output target/qualification/tproxy || status=$?
+          sudo chown -R "$(id -u):$(id -g)" target/qualification/tproxy
+          exit "$status"
+      - name: Preserve qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qualification-evidence
+          path: |
+            target/qualification/**/results.json
+            target/qualification/**/metadata.json
+            target/qualification/**/*.log

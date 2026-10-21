@@ -36,7 +36,8 @@ pub struct Tunward {
         global = true,
         value_name = "INT",
         verbatim_doc_comment,
-        env = "TOKIO_WORKER_THREADS"
+        env = "TOKIO_WORKER_THREADS",
+        value_parser = clap::value_parser!(u32).range(1..=1024)
     )]
     nb_worker_threads: Option<u32>,
 
@@ -107,26 +108,10 @@ fn main() -> anyhow::Result<()> {
         // Start system CA reloader
         SystemCaReloader::start(None);
 
-        let run = async {
-            match args.commands {
-                Commands::Client(args) => {
-                    run_client(*args, DefaultTokioExecutor::default())
-                        .await
-                        .unwrap_or_else(|err| {
-                            panic!("Cannot start tunward client: {err:?}");
-                        });
-                }
-                Commands::Server(args) => {
-                    run_server(*args, DefaultTokioExecutor::default())
-                        .await
-                        .unwrap_or_else(|err| {
-                            panic!("Cannot start tunward server: {err:?}");
-                        });
-                }
-            }
-        };
-
-        run.await;
+        match args.commands {
+            Commands::Client(args) => run_client(*args, DefaultTokioExecutor::default()).await?,
+            Commands::Server(args) => run_server(*args, DefaultTokioExecutor::default()).await?,
+        }
 
         Ok(())
     })

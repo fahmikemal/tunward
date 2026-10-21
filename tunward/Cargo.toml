@@ -32,7 +32,6 @@ ipnet = { version = "2.12.2", features = ["serde"] }
 hyper = { version = "1.11.1", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1.20", features = ["tokio", "server", "server-auto"] }
 http-body-util = { version = "0.1.5" }
-jsonwebtoken = { version = "11.1.0", default-features = false }
 log = "0.4.34"
 nix = { version = "0.31.3", features = ["socket", "net", "uio"] }
 parking_lot = "0.12.5"
@@ -70,6 +69,7 @@ rcgen = { version = "0.14.10", default-features = false, features = [] }
 time = { version = "0.3.55", default-features = false, features = ["std"] }
 hickory-resolver = { version = "0.26.3", default-features = false, features = ["system-config", "tokio"] }
 aws-lc-rs = { version = "*", optional = true }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 [target.'cfg(not(target_family = "unix"))'.dependencies]
 crossterm = { version = "0.29.0" }
@@ -79,6 +79,7 @@ tokio-util = { version = "0.7.19", features = ["io"] }
 tokio-fd = "0.3.0"
 
 [dev-dependencies]
+tokio = { version = "1.53.1", features = ["test-util", "rt-multi-thread", "macros"] }
 testcontainers = "0.28.0"
 test-case = "3.3.1"
 collection_macros = "0.2.0"
@@ -95,7 +96,6 @@ aws-lc-rs = [
   "rcgen/aws_lc_rs",
   "hickory-resolver/tls-aws-lc-rs",
   "hickory-resolver/https-aws-lc-rs",
-  "jsonwebtoken/aws_lc_rs",
   "web-transport-quinn/aws-lc-rs",
 ]
 aws-lc-rs-bindgen = ["dep:aws-lc-rs", "aws-lc-rs/bindgen"]
@@ -104,6 +104,5 @@ ring = [
   "rcgen/ring",
   "hickory-resolver/tls-ring",
   "hickory-resolver/https-ring",
-  "jsonwebtoken/rust_crypto",
   "web-transport-quinn/ring",
 ]

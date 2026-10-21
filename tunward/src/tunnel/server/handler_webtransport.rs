@@ -1,15 +1,14 @@
+use super::server::{ConnectionContext, EstablishedTunnel};
 use crate::executor::TokioExecutorRef;
 use crate::protocols::tls;
 use crate::restrictions::types::RestrictionsRules;
-use crate::tunnel::LocalProtocol;
 use crate::tunnel::server::Server;
 use crate::tunnel::server::utils::{extract_path_prefix, matches_any_restriction};
 use crate::tunnel::tls_reloader::TlsReloader;
 use crate::tunnel::transport;
 use crate::tunnel::transport::tunnel_to_jwt_token;
 use crate::tunnel::transport::webtransport::{
-    WebTransportRead, WebTransportUdpRead, WebTransportUdpWrite, WebTransportWrite, bind_udp_socket,
-    mk_transport_config, read_jwt_preamble, write_jwt_preamble,
+    WebTransportRead, WebTransportWrite, bind_udp_socket, mk_transport_config, read_jwt_preamble, write_jwt_preamble,
 };
 use anyhow::{Context, anyhow};
 use arc_swap::ArcSwap;
@@ -18,7 +17,6 @@ use hyper::{Request, StatusCode};
 use std::any::Any;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::oneshot;
 use tokio_rustls::rustls::pki_types::CertificateDer;
 use tracing::{Instrument, Level, Span, debug, error, info, span, warn};
 use uuid::Uuid;
@@ -45,18 +43,25 @@ pub(super) async fn run_webtransport_server(
         .with_context(|| "Cannot create the tls reloader for webtransport")?;
 
     info!("Starting tunward webtransport server listening on udp://{bind}");
+    let mut reload_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    reload_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
-        // Same contract as `TlsContext::tls_acceptor` on the TCP path: swap the certificate in
-        // between accepts, so a rotated certificate is picked up without a restart.
-        if tls_reloader.should_reload_certificate() {
-            match mk_quic_server_config(&server, tls_config) {
-                Ok(config) => endpoint.set_server_config(Some(config)),
-                Err(err) => error!("Cannot reload the webtransport TLS certificate {err:?}"),
+        let request = tokio::select! {
+            _ = reload_tick.tick() => {
+                // accept() waits for a successful TLS/H3 handshake. A new trust anchor must
+                // be installed even when every pending handshake rejects the old certificate.
+                if tls_reloader.should_reload_certificate() {
+                    match mk_quic_server_config(&server, tls_config) {
+                        Ok(config) => endpoint.set_server_config(Some(config)),
+                        Err(err) => error!("Cannot reload the webtransport TLS certificate {err:?}"),
+                    }
+                }
+                continue;
             }
-        }
-
-        let Some(request) = endpoint.accept().await else {
+            request = endpoint.accept() => request,
+        };
+        let Some(request) = request else {
             warn!("webtransport endpoint closed, stopping to accept connections");
             return Ok(());
         };
@@ -114,14 +119,31 @@ async fn handle_session(
     restrictions: Arc<ArcSwap<RestrictionsRules>>,
     request: web_transport_quinn::Request,
 ) -> anyhow::Result<()> {
+    if transport::check_version(&request.headers).is_err() {
+        let _ = request.reject(StatusCode::BAD_REQUEST).await;
+        return Ok(());
+    }
     // Unlike the TCP path, the client certificate is readable before we answer the CONNECT.
-    let restrict_path = request
+    let peer_certificates = request
         .conn()
         .peer_identity()
-        .and_then(|identity: Box<dyn Any>| identity.downcast::<Vec<CertificateDer<'static>>>().ok())
-        .and_then(|certs| {
-            tls::find_leaf_certificate(certs.as_slice()).and_then(|cert| tls::cn_from_certificate(&cert))
-        });
+        .and_then(|identity: Box<dyn Any>| identity.downcast::<Vec<CertificateDer<'static>>>().ok());
+    let identity_required = server
+        .config
+        .tls
+        .as_ref()
+        .is_some_and(|tls| tls.tls_client_ca_certificates.is_some());
+    let restrict_path = match tls::client_path_from_certificate(
+        peer_certificates.as_deref().map(|certs| certs.as_slice()),
+        identity_required,
+    ) {
+        Ok(identity) => identity,
+        Err(err) => {
+            warn!("Rejecting mTLS connection without a supported client identity: {err}");
+            let _ = request.reject(StatusCode::BAD_REQUEST).await;
+            return Ok(());
+        }
+    };
 
     // Rebuild an http request so the whole validation path is shared with the other transports.
     // Only the uri and headers are read, so the unit body is fine. The destination is *not* in
@@ -167,16 +189,51 @@ async fn handle_session(
         return Ok(());
     }
 
-    let session = request
-        .ok()
+    let restrict_path = match server
+        .connection_context(
+            restrict_path,
+            peer_certificates.as_deref().map(|certs| certs.as_slice()),
+            client_addr,
+            "wts",
+        )
         .await
-        .with_context(|| format!("Cannot accept the webtransport session from {client_addr}"))?;
+    {
+        Ok(context) => context,
+        Err(err) => {
+            warn!("Rejecting authenticated WebTransport session due to access policy: {err}");
+            let status = if err.downcast_ref::<crate::quotas::QuotaError>().is_some() {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::FORBIDDEN
+            };
+            let _ = request.reject(status).await;
+            return Ok(());
+        }
+    };
+
+    let revocation = restrict_path.revocation.clone();
+    let session = revocation
+        .run(async {
+            request
+                .ok()
+                .await
+                .with_context(|| format!("Cannot accept the webtransport session from {client_addr}"))
+        })
+        .await?;
 
     // One tunnel per stream. Accepting the session commits nothing upstream, so there is no need to
     // bound how long the client takes to open the first one; an idle session costs a QUIC
     // connection, which the keep-alive/idle timeout already reaps.
     loop {
-        let (send, recv) = match session.accept_bi().await {
+        let accepted = tokio::select! {
+            biased;
+            _ = revocation.cancelled() => {
+                session.close(StatusCode::FORBIDDEN.as_u16() as u32, b"device access revoked");
+                return Ok(());
+            }
+            stream = session.accept_bi() => stream,
+        };
+        let (send, recv) = match accepted {
             Ok(stream) => stream,
             Err(err) => {
                 debug!("webtransport session with {client_addr} ended: {err}");
@@ -190,20 +247,22 @@ async fn handle_session(
         let session_path = session_path.clone();
         let session_headers = session_headers.clone();
         let restrict_path = restrict_path.clone();
+        let revocation = revocation.clone();
         let span = span!(Level::INFO, "tunnel", peer = client_addr.to_string());
         server.executor.clone().spawn(
             async move {
-                if let Err(err) = wt_server_connect(
-                    server,
-                    restrictions,
-                    session,
-                    client_addr,
-                    restrict_path,
-                    &session_path,
-                    session_headers,
-                    (send, recv),
-                )
-                .await
+                if let Err(err) = revocation
+                    .run(wt_server_connect(
+                        server,
+                        restrictions,
+                        session,
+                        client_addr,
+                        restrict_path,
+                        &session_path,
+                        session_headers,
+                        (send, recv),
+                    ))
+                    .await
                 {
                     warn!("{err:?}");
                 }
@@ -220,11 +279,20 @@ async fn wt_server_connect(
     restrictions: Arc<RestrictionsRules>,
     session: web_transport_quinn::Session,
     client_addr: SocketAddr,
-    restrict_path: Option<String>,
+    restrict_path: ConnectionContext,
     session_path: &str,
     session_headers: hyper::HeaderMap,
     (mut send, mut recv): (web_transport_quinn::SendStream, web_transport_quinn::RecvStream),
 ) -> anyhow::Result<()> {
+    let revocation = restrict_path.revocation.clone();
+    let quota = match restrict_path.admit_tunnel() {
+        Ok(permit) => permit,
+        Err(err) => {
+            warn!("Rejecting WebTransport stream due to device quota: {err}");
+            let _ = send.reset(StatusCode::TOO_MANY_REQUESTS.as_u16() as u32);
+            return Ok(());
+        }
+    };
     // The client announces the destination for this stream before anything else, since the
     // session-level CONNECT is shared and cannot carry it.
     let jwt = tokio::time::timeout(server.config.timeout_connect, read_jwt_preamble(&mut recv))
@@ -246,11 +314,19 @@ async fn wt_server_connect(
         HeaderValue::from_str(&jwt).with_context(|| "client sent an invalid tunnel jwt")?,
     );
 
-    let tunnel = server
-        .handle_tunnel_request(restrictions, restrict_path, client_addr, &http_request)
-        .await;
+    let tunnel = tokio::select! {
+        tunnel = server.handle_tunnel_request(restrictions, restrict_path, client_addr, &http_request, quota) => tunnel,
+        _ = send.stopped() => return Ok(()),
+    };
 
-    let (remote_addr, local_rx, local_tx, need_preamble) = match tunnel {
+    let EstablishedTunnel {
+        remote_addr,
+        local_rx,
+        local_tx,
+        quota,
+        fleet,
+        ..
+    } = match tunnel {
         Ok(tunnel) => tunnel,
         Err(response) => {
             // The session stays up for the client's other tunnels, so only this stream is
@@ -263,49 +339,26 @@ async fn wt_server_connect(
         }
     };
 
-    // Dynamic reverse tunnels learn their destination from the server. The CONNECT response
-    // cannot carry it (`ConnectResponse` has no header map), so it goes out as a preamble on
-    // the stream instead. See `transport::webtransport::write_jwt_preamble`.
-    if need_preamble {
-        let jwt = tunnel_to_jwt_token(Uuid::from_u128(0), &remote_addr);
-        if let Err(err) = write_jwt_preamble(&mut send, &jwt).await {
-            let _ = send.reset(StatusCode::INTERNAL_SERVER_ERROR.as_u16() as u32);
-            return Err(err).with_context(|| format!("Cannot send the tunnel jwt to {client_addr}"));
+    // A stream is ready only after destination validation and the upstream/visitor accept.
+    // The same acknowledgement carries dynamic reverse destinations.
+    let jwt = tunnel_to_jwt_token(Uuid::from_u128(0), &remote_addr);
+    write_jwt_preamble(&mut send, &jwt).await?;
+    server.executor.spawn(
+        async move {
+            let _fleet = fleet;
+            revocation
+                .run(transport::io::forward_with_quota(
+                    local_rx,
+                    local_tx,
+                    WebTransportRead::new(recv, session.clone()),
+                    WebTransportWrite::new(send, session),
+                    None,
+                    quota,
+                ))
+                .await
         }
-    }
-
-    let (close_tx, close_rx) = oneshot::channel::<()>();
-    if matches!(
-        remote_addr.protocol,
-        LocalProtocol::Udp { .. } | LocalProtocol::TProxyUdp { .. }
-    ) {
-        server.executor.spawn(
-            transport::io::propagate_remote_to_local(
-                local_tx,
-                WebTransportUdpRead::new(recv, session.clone()),
-                close_rx,
-            )
-            .instrument(Span::current()),
-        );
-        server.executor.spawn(
-            transport::io::propagate_local_to_remote(
-                local_rx,
-                WebTransportUdpWrite::new(send, session),
-                close_tx,
-                None,
-            )
-            .instrument(Span::current()),
-        );
-    } else {
-        server.executor.spawn(
-            transport::io::propagate_remote_to_local(local_tx, WebTransportRead::new(recv, session.clone()), close_rx)
-                .instrument(Span::current()),
-        );
-        server.executor.spawn(
-            transport::io::propagate_local_to_remote(local_rx, WebTransportWrite::new(send, session), close_tx, None)
-                .instrument(Span::current()),
-        );
-    }
+        .instrument(Span::current()),
+    );
 
     Ok(())
 }

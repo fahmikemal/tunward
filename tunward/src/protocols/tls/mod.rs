@@ -8,5 +8,6 @@ pub use server::quic_client_config;
 pub use server::quic_server_config;
 pub use server::tls_acceptor;
 pub use server::tls_connector;
+pub use utils::client_path_from_certificate;
 pub use utils::cn_from_certificate;
 pub use utils::find_leaf_certificate;

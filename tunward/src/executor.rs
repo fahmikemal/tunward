@@ -72,11 +72,6 @@ impl JoinSetTokioExecutor {
     }
 }
 
-impl Drop for JoinSetTokioExecutor {
-    fn drop(&mut self) {
-        self.abort_all();
-    }
-}
 impl Default for JoinSetTokioExecutor {
     fn default() -> Self {
         Self::new(JoinSet::new())

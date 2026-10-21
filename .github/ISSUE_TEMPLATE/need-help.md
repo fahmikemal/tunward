@@ -1,46 +1,43 @@
 ---
 name: Need help
-about: You encounter an issue you can't solve
+about: Ask for help after checking the current guides
 title: ''
-labels: 'help wanted'
+labels: help wanted
 ---
 
+Read the [README](../../README.md),
+[mTLS guide](../../docs/using_mtls.md), and
+[qualification guide](../../docs/STAGING_QUALIFICATION.md) first. This source
+tree requires protocol-v2-compatible peers.
 
-(ノಠ益ಠ)ノ彡┻━┻  
+## Goal
 
-==> Read and try the examples first before requesting help <==
+Describe what you want to connect and which machine hosts the listener, tunnel
+server, and final destination. Include forward/reverse direction and URL scheme.
 
-https://github.com/fahmikemal/tunward?#examples
+## Commands and versions
 
-If you have trouble with wireguard  https://github.com/fahmikemal/tunward?#wireguard-and-tunward-
-```
-If tunward cannot connect to server while wireguard is on,
-be sure you have added a static route via your main gateway for the ip of tunward server.
-Else if you forward all the traffic without putting a static route,
-you will endup looping your traffic wireguard interface -> tunward client -> wireguard interface
-If you have trouble making it works on windows, please check this issue #252
-```
+Provide sanitized client/server commands, versions/commits, and OS/architecture.
+If containerized, identify Docker or Podman and the relevant port mappings.
+Remove credentials, secret path prefixes, private keys, and customer identifiers.
 
-(ノಠ益ಠ)ノ彡┻━┻
+## What happens
 
+Include the exact error and a short reviewed log excerpt. Explain whether the
+problem occurs during TLS, proxy negotiation, target connection, data transfer,
+or cleanup. State what already works without the tunnel.
 
+## Checks already performed
 
+- Both peers implement the same wire protocol.
+- The target is reachable from the correct side of the tunnel.
+- The server SAN matches the domain/IP used by the client and its CA is trusted.
+- For mTLS, client CN and path prefix agree and restrictions permit the request.
+- For WebTransport, UDP is reachable on the server port as well as TCP.
+- If tests use Podman, DOCKER_HOST points to that user's active Podman API socket.
+- With WireGuard/VPN routing, the tunward server remains reachable outside the
+  tunnel to avoid routing recursion.
 
-
-
-## Describe the goal
-A clear and concise description of `what` you try to achieve.
-Describe if you are behind a proxy, if you use some kind relay, what protocol/app you want to forward
-
-## Describe what does not work
-A clear and concise description of why you can't reach your goal.
-
-
-## Describe your tunward setup
-Paste your logs of tunward, started with `--log-lvl=DEBUG`, and with the `command line used`
- - client
- - server
-
-## Desktop (please complete the following information):
- - OS: [e.g. iOS]
- - Version [e.g. 22]
+A reachable management /healthz endpoint proves only that API response, not
+end-to-end tunnel or device health. Do not disable certificate verification as a
+production fix.

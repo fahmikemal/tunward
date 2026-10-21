@@ -1,12 +1,11 @@
 use crate::protocols::http_proxy;
-use crate::protocols::http_proxy::HttpProxyListener;
+use crate::protocols::http_proxy::{HttpProxyListener, HttpProxyRead, HttpProxyWrite};
 use crate::tunnel::{LocalProtocol, RemoteAddr};
 use anyhow::{Context, anyhow};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Poll, ready};
 use std::time::Duration;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio_stream::Stream;
 
 pub struct HttpProxyDownstreamListener {
@@ -33,17 +32,17 @@ impl HttpProxyDownstreamListener {
 }
 
 impl Stream for HttpProxyDownstreamListener {
-    type Item = anyhow::Result<((OwnedReadHalf, OwnedWriteHalf), RemoteAddr)>;
+    type Item = anyhow::Result<((HttpProxyRead, HttpProxyWrite), RemoteAddr)>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         let ret = ready!(Pin::new(&mut this.listener).poll_next(cx));
         let ret = match ret {
-            Some(Ok((stream, (host, port)))) => {
+            Some(Ok((halves, (host, port)))) => {
                 let protocol = LocalProtocol::Tcp {
                     proxy_protocol: this.proxy_protocol,
                 };
-                Some(anyhow::Ok((stream.into_split(), RemoteAddr { protocol, host, port })))
+                Some(anyhow::Ok((halves, RemoteAddr { protocol, host, port })))
             }
             Some(Err(err)) => Some(Err(err)),
             None => None,

@@ -1,0 +1,24 @@
+version: 1
+roles:
+  forwarder: [forward_tcp, forward_udp]
+  reverse_agent: [reverse_tcp, reverse_udp]
+tenants:
+  alpha:
+    restrictions: [alpha-forward, alpha-reverse]
+    reverse_bindings:
+      - address: 127.0.0.1
+        ports: ["20000..20031"]
+        allow_ephemeral: true
+  beta:
+    restrictions: [beta-forward, beta-reverse]
+    reverse_bindings:
+      - address: 127.0.0.1
+        ports: ["21000..21031"]
+        allow_ephemeral: true
+devices:
+  tunward_client_1:
+    tenant: alpha
+    roles: [forwarder, reverse_agent]
+  device-beta-001:
+    tenant: beta
+    roles: [forwarder, reverse_agent]
