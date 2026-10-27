@@ -483,6 +483,19 @@ pub struct ServerCreationRequest {
     /// Startup tenant membership, role permissions, and reverse resource reservations. Requires mTLS and named restriction rules.
     #[cfg_attr(feature = "clap", arg(long, value_name = "FILE", requires_all = ["tls_client_ca_certs", "restrict_config"], env = "TUNWARD_TENANT_CONFIG"))]
     pub tenant_config: Option<PathBuf>,
+
+    /// Explicit exception permitting unauthenticated, cleartext, or non-loopback listeners for local development.
+    /// Emits a high-visibility security warning at startup. Does not relax loopback restriction on --management-api.
+    #[cfg_attr(
+        feature = "clap",
+        arg(
+            long,
+            default_value = "false",
+            verbatim_doc_comment,
+            env = "TUNWARD_ALLOW_INSECURE_DEV"
+        )
+    )]
+    pub allow_insecure_dev: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]

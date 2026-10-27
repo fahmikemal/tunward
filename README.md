@@ -95,6 +95,15 @@ When an authenticated feature lacks TLS/mTLS, the error names that feature.
 Restriction YAML rejects unknown fields and descending port ranges. These same
 checks apply at server startup; correct previously ignored field typos before upgrading.
 
+In accordance with enterprise secure defaults, any public or non-loopback listener
+(such as `0.0.0.0`, `[::]`, LAN, WAN, or non-localhost hostnames) strictly requires TLS
+(`wss://` or `wts://`), client certificate verification (`--tls-client-ca-certs`), and
+an explicit restriction policy (`--restrict-config`). For isolated local testing across
+interfaces, operators may supply `--allow-insecure-dev` to bypass these prerequisites
+(note: `--allow-insecure-dev` emits prominent security warnings on startup and does not
+relax loopback enforcement on `--management-api`). Loopback listeners (`127.0.0.1`,
+`localhost`, `[::1]`) remain unrestricted for rapid local development.
+
 Run it as the service user, with the intended arguments, environment and file
 permissions. It does not bind ports, resolve addresses, contact peers, start
 watchers, create an inventory database, or write TLS key logs. It can run while
@@ -406,6 +415,7 @@ tunward server --help
 | `-r, --restrict-http-upgrade-path-prefix VALUE` | Server path allowlist; not a substitute for TLS and target rules |
 | `--restrict-to HOST:PORT` | Server forward-destination allowlist; repeat as needed |
 | `--restrict-config FILE` | Reloadable YAML restriction rules; replaces CLI-generated restriction rules |
+| `--allow-insecure-dev` | Explicit exception permitting cleartext or unauthenticated non-loopback listeners for local testing; emits security warnings |
 | `-c, --connection-min-idle N` | Idle pool setting, default 0; accepted range 0..1000; WebTransport clamps to one session |
 | `--connection-retry-max-backoff DURATION` | Pool acquisition deadline, default 5m, must be nonzero |
 | `--reverse-tunnel-connection-retry-max-backoff DURATION` | Reverse reconnect backoff ceiling, default 1s |

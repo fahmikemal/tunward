@@ -19,18 +19,19 @@ readiness. See [current usage and limits](README.md) and the
 
 ## Next milestone: secure defaults
 
-All five items are **planned**. The current beta still requires operators to
-enable the appropriate controls explicitly; the
-[deployment template](deploy/tunward.service) does so. Its minimum CLI invocation
-does not enforce the proposed public-listener policy.
+Priorities 1 and 2 are **implemented**; priorities 3, 4, and 5 are planned or in progress.
+The `v0.1.0-beta` baseline required operators to enable the appropriate controls explicitly; the
+[deployment template](deploy/tunward.service) does so. With Priorities 1 & 2 active, non-loopback
+listeners strictly mandate TLS, client certificate authentication (mTLS), and explicit restriction
+policies unless explicitly bypassed with `--allow-insecure-dev`.
 
-| Priority | Planned change | Acceptance criteria |
-| --- | --- | --- |
-| 1 | Require secure public listeners | A non-loopback listener requires TLS (`wss://`/`wts://`), `--tls-client-ca-certs`, and `--restrict-config`. Missing prerequisites reject startup with actionable errors identifying the missing settings. Cover wildcard IPv4/IPv6 and LAN/public addresses; hostname handling must not bypass the check. |
-| 2 | Make development exceptions explicit | Cleartext or unauthenticated listeners are limited to loopback unless the operator explicitly selects a development exception. A proposed `--allow-insecure-dev` flag must warn on every start. It must not implicitly allow all destinations or relax the management API's loopback requirement. The flag does not exist in the current beta. |
-| 3 | Deny tunnel access without an explicit policy | Missing policy must not synthesize `Allow All`. Unmatched requests are denied. An explicitly configured missing, unreadable, or invalid restriction file rejects startup; a failed managed reload retains the previous active generation. Document loopback/development behavior and migration from existing restriction options. |
-| 4 | Apply resource limits without an operator quota file | Provide finite initial session, tunnel, request-rate, and payload-bandwidth limits, plus global admission and pre-authentication connection/handshake limits. Operators can adjust them. Preserve verified-device accounting across transports and reload. Select and document numerical defaults from measured capacity; there is no universal quota suitable for every deployment. Tenant configuration remains optional. |
-| 5 | Prove the defaults with negative and positive tests | Reject minimum-argument non-loopback startup, every missing prerequisite, and invalid policy/trust files. Cover IPv4, IPv6, development exceptions, denied destinations, default quota enforcement, and valid complete configurations. Enforce the same policy through `server -t`, startup, and the library API. Existing CI does not yet prove these proposed defaults. |
+| Priority | Planned change | Status | Acceptance criteria |
+| --- | --- | --- | --- |
+| 1 | Require secure public listeners | **Implemented** | A non-loopback listener requires TLS (`wss://`/`wts://`), `--tls-client-ca-certs`, and `--restrict-config`. Missing prerequisites reject startup with actionable errors identifying the missing settings. Cover wildcard IPv4/IPv6 and LAN/public addresses; hostname handling must not bypass the check. |
+| 2 | Make development exceptions explicit | **Implemented** | Cleartext or unauthenticated listeners are limited to loopback unless the operator explicitly selects a development exception. The `--allow-insecure-dev` flag warns on every start and CLI test. It does not implicitly allow all destinations or relax the management API's loopback requirement. |
+| 3 | Deny tunnel access without an explicit policy | Planned | Missing policy must not synthesize `Allow All`. Unmatched requests are denied. An explicitly configured missing, unreadable, or invalid restriction file rejects startup; a failed managed reload retains the previous active generation. Document loopback/development behavior and migration from existing restriction options. |
+| 4 | Apply resource limits without an operator quota file | Planned | Provide finite initial session, tunnel, request-rate, and payload-bandwidth limits, plus global admission and pre-authentication connection/handshake limits. Operators can adjust them. Preserve verified-device accounting across transports and reload. Select and document numerical defaults from measured capacity; there is no universal quota suitable for every deployment. Tenant configuration remains optional. |
+| 5 | Prove the defaults with negative and positive tests | In progress | Reject minimum-argument non-loopback startup, every missing prerequisite, and invalid policy/trust files. Cover IPv4, IPv6, development exceptions, denied destinations, default quota enforcement, and valid complete configurations. Enforce the same policy through `server -t`, startup, and the library API. Existing CI does not yet prove these proposed defaults. |
 
 This milestone changes existing startup behavior. Ship it with README/CLI help,
 a migration guide, updated examples, and regression checks for existing

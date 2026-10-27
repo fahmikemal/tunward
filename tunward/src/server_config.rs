@@ -26,6 +26,29 @@ pub fn check_server_config(args: &ServerCreationRequest) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Check if the URL listen host is strictly loopback (IPv4 127.0.0.0/8, IPv6 ::1 or IPv4-mapped loopback, or localhost).
+/// Wildcard (0.0.0.0, ::), LAN, public IPs, and non-localhost domains are treated as non-loopback during offline verification
+/// to prevent hostname bypass without relying on live DNS resolution.
+pub fn is_loopback_host(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback() || ip.to_ipv4().is_some_and(|v4| v4.is_loopback()),
+        Some(url::Host::Domain(domain)) => {
+            if domain.eq_ignore_ascii_case("localhost") || domain.to_ascii_lowercase().ends_with(".localhost") {
+                true
+            } else if let Ok(ip) = domain.parse::<std::net::IpAddr>() {
+                match ip {
+                    std::net::IpAddr::V4(v4) => v4.is_loopback(),
+                    std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.to_ipv4().is_some_and(|v4| v4.is_loopback()),
+                }
+            } else {
+                false
+            }
+        }
+        None => false,
+    }
+}
+
 pub(crate) fn load_server_files(args: &ServerCreationRequest) -> anyhow::Result<ServerConfigFiles> {
     ensure!(
         matches!(args.remote_addr.scheme(), "ws" | "http" | "wss" | "wts"),
@@ -67,6 +90,25 @@ pub(crate) fn load_server_files(args: &ServerCreationRequest) -> anyhow::Result<
         args.tls_certificate.is_some() == args.tls_private_key.is_some(),
         "--tls-certificate and --tls-private-key must be supplied together"
     );
+
+    let is_loopback = is_loopback_host(&args.remote_addr);
+    if !is_loopback && !args.allow_insecure_dev {
+        ensure!(
+            tls_enabled,
+            "public/non-loopback listener ({}) requires TLS (wss:// or wts://); specify --allow-insecure-dev for local development exceptions",
+            args.remote_addr
+        );
+        ensure!(
+            args.tls_client_ca_certs.is_some(),
+            "public/non-loopback listener ({}) requires client authentication (--tls-client-ca-certs); specify --allow-insecure-dev for local development exceptions",
+            args.remote_addr
+        );
+        ensure!(
+            args.restrict_config.is_some(),
+            "public/non-loopback listener ({}) requires an explicit restriction policy file (--restrict-config); specify --allow-insecure-dev for local development exceptions",
+            args.remote_addr
+        );
+    }
     let tls = if tls_enabled {
         SystemCaReloader::init_crypto_provider();
         let (certificates, key) = match (&args.tls_certificate, &args.tls_private_key) {
@@ -150,4 +192,136 @@ pub(crate) fn load_server_files(args: &ServerCreationRequest) -> anyhow::Result<
         http_proxy,
         tenants,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn test_is_loopback_host() {
+        // IPv4 loopback
+        assert!(is_loopback_host(&Url::parse("ws://127.0.0.1:8080").unwrap()));
+        assert!(is_loopback_host(&Url::parse("ws://127.0.0.2:8080").unwrap()));
+        assert!(is_loopback_host(&Url::parse("ws://127.255.255.254:8080").unwrap()));
+
+        // IPv6 loopback
+        assert!(is_loopback_host(&Url::parse("ws://[::1]:8080").unwrap()));
+        assert!(is_loopback_host(&Url::parse("ws://[::ffff:127.0.0.1]:8080").unwrap()));
+
+        // Localhost domains
+        assert!(is_loopback_host(&Url::parse("ws://localhost:8080").unwrap()));
+        assert!(is_loopback_host(&Url::parse("ws://LOCALHOST:8080").unwrap()));
+        assert!(is_loopback_host(&Url::parse("ws://sub.localhost:8080").unwrap()));
+
+        // Non-loopback wildcards
+        assert!(!is_loopback_host(&Url::parse("ws://0.0.0.0:8080").unwrap()));
+        assert!(!is_loopback_host(&Url::parse("ws://[::]:8080").unwrap()));
+        assert!(!is_loopback_host(&Url::parse("ws://[::ffff:0.0.0.0]:8080").unwrap()));
+
+        // Non-loopback LAN and public IPs
+        assert!(!is_loopback_host(&Url::parse("ws://10.0.0.1:8080").unwrap()));
+        assert!(!is_loopback_host(&Url::parse("ws://192.168.1.1:8080").unwrap()));
+        assert!(!is_loopback_host(&Url::parse("ws://172.16.0.1:8080").unwrap()));
+        assert!(!is_loopback_host(&Url::parse("ws://8.8.8.8:8080").unwrap()));
+
+        // Non-loopback domains (hostname handling must not bypass check)
+        assert!(!is_loopback_host(&Url::parse("ws://example.com:8080").unwrap()));
+        assert!(!is_loopback_host(&Url::parse("ws://127.0.0.1.nip.io:8080").unwrap()));
+        assert!(!is_loopback_host(&Url::parse("ws://tunward.internal:8080").unwrap()));
+    }
+
+    fn sample_server_request(url: &str) -> ServerCreationRequest {
+        ServerCreationRequest {
+            remote_addr: Url::parse(url).unwrap(),
+            enable_webtransport: false,
+            socket_so_mark: None,
+            websocket_ping_frequency: Some(Duration::from_secs(30)),
+            websocket_mask_frame: false,
+            dns_resolver: vec![],
+            dns_resolver_prefer_ipv4: false,
+            restrict_to: None,
+            restrict_http_upgrade_path_prefix: None,
+            restrict_config: None,
+            tls_certificate: None,
+            tls_private_key: None,
+            tls_client_ca_certs: None,
+            http_proxy: None,
+            http_proxy_login: None,
+            http_proxy_password: None,
+            remote_to_local_server_idle_timeout: Duration::from_secs(180),
+            management_api: None,
+            device_quota_config: None,
+            device_revocation_config: None,
+            fleet_inventory: None,
+            fleet_inventory_max_devices: std::num::NonZeroU32::new(10000).unwrap(),
+            tenant_config: None,
+            allow_insecure_dev: false,
+        }
+    }
+
+    #[test]
+    fn test_public_listener_requires_tls() {
+        let req = sample_server_request("ws://0.0.0.0:8080");
+        let Err(err) = load_server_files(&req) else {
+            panic!("expected error for public listener without TLS");
+        };
+        assert!(err.to_string().contains("requires TLS (wss:// or wts://)"));
+        assert!(err.to_string().contains("--allow-insecure-dev"));
+    }
+
+    #[test]
+    fn test_public_listener_requires_client_ca() {
+        let req = sample_server_request("wss://0.0.0.0:8080");
+        let Err(err) = load_server_files(&req) else {
+            panic!("expected error for public listener without client CA");
+        };
+        assert!(
+            err.to_string()
+                .contains("requires client authentication (--tls-client-ca-certs)")
+        );
+    }
+
+    #[test]
+    fn test_public_listener_allows_insecure_dev() {
+        let mut req = sample_server_request("ws://0.0.0.0:8080");
+        req.allow_insecure_dev = true;
+        match load_server_files(&req) {
+            Ok(_) => {}
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_loopback_listener_allowed_without_insecure_dev() {
+        let req = sample_server_request("ws://127.0.0.1:8080");
+        match load_server_files(&req) {
+            Ok(_) => {}
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+
+        let req_localhost = sample_server_request("ws://localhost:8080");
+        match load_server_files(&req_localhost) {
+            Ok(_) => {}
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+
+        let req_ipv6 = sample_server_request("ws://[::1]:8080");
+        match load_server_files(&req_ipv6) {
+            Ok(_) => {}
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_management_api_still_rejects_non_loopback_even_with_allow_insecure_dev() {
+        let mut req = sample_server_request("ws://0.0.0.0:8080");
+        req.allow_insecure_dev = true;
+        req.management_api = Some("0.0.0.0:8081".parse().unwrap());
+        let Err(err) = load_server_files(&req) else {
+            panic!("expected error for non-loopback management API");
+        };
+        assert!(err.to_string().contains("management API must bind to loopback"));
+    }
 }

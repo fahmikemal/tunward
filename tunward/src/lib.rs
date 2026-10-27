@@ -536,6 +536,12 @@ async fn run_server_impl(
     reload: Option<reload::ServerReload>,
 ) -> anyhow::Result<()> {
     let files = server_config::load_server_files(&args)?;
+    if args.allow_insecure_dev {
+        tracing::warn!(
+            "INSECURE DEVELOPMENT EXCEPTION ACTIVE: Server is running with --allow-insecure-dev on listener {}. Cleartext or unauthenticated connections are permitted. DO NOT USE IN PRODUCTION.",
+            args.remote_addr
+        );
+    }
     let managed = reload
         .as_ref()
         .map(|_| {
