@@ -541,6 +541,16 @@ A guard-stopped run remains incomplete even if earlier cycles passed. Use a
 dedicated client host when uninterrupted qualification conflicts with protecting
 production workloads.
 
+## Acknowledgements
+
+Tunward is built upon the foundational work of [wstunnel](https://github.com/erebe/wstunnel)
+by Romain Gerard ([@erebe](https://github.com/erebe)), licensed under the BSD 3-Clause License.
+Tunward redesigns the wire framing as Protocol v2 and introduces carrier-grade
+enterprise controls including authenticated device quotas, live revocation, tenant
+isolation, and persistent fleet inventory.
+
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+Tunward is licensed under the Apache License, Version 2.0. It incorporates software
+originally developed by Romain Gerard (Erèbe) under the BSD 3-Clause License.
+See [LICENSE](LICENSE) and [NOTICE](NOTICE) for full details.
