@@ -199,7 +199,17 @@ cover concurrent parameterized writes, capacity/pagination, schema rejection,
 and cloned lease lifetimes. These checks do not qualify physical MDM inventory,
 cluster consistency, every filesystem/OS, or production endurance.
 
+## Architectural decoupling and future control plane
+
+In the `v0.1.0-beta` baseline, the fleet observation module (`src/management/`) is in-tree within the core `tunward` crate, and the SQLite C-library (`rusqlite`) is linked into the compiled binary. While the feature is runtime-optional (omitting `--fleet-inventory` leaves the database uninitialized and zero-cost during forwarding), the binary still carries SQLite dependencies.
+
+Planned evolutions (see [ROADMAP.md](../ROADMAP.md#architectural-limitations-and-future-scope-v02--v03)):
+1. **Cargo Feature Separation (`features = ["fleet"]`)**: Decouple `rusqlite` and the management REST API into an optional Cargo feature or separate crate (`tunward-fleet`). This allows compiling minimal, stripped-down data-plane binaries for embedded environments, OpenWrt routers, and microVMs.
+2. **Control Plane / Data Plane Decoupling**: Evolve the fleet subsystem into an external control-plane collector (communicating via gRPC, Unix socket events, or OpenTelemetry), enabling a central fleet management instance to aggregate observations from multiple edge Tunward forwarders.
+3. **Pluggable Storage Backends**: Provide adapters for centralized databases (PostgreSQL, Redis) to enable cross-replica device observation and clustered state coordination.
+
 ## Documentation contracts
+
 
 - [Rusqlite connection and parameterized queries](https://docs.rs/rusqlite/0.40.2/rusqlite/)
 - [SQLite WAL constraints and operation](https://www.sqlite.org/wal.html)
