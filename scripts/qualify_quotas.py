@@ -323,6 +323,32 @@ class QuotaChecks:
         assert "device quotas require TLS" in log
         return {"cleartext_rejected_before_listen": True}
 
+    async def default_resource_limits(self):
+        sp, mp = port(), port()
+        process = await self.suite.spawn("default-quota-server", "server", f"wts://127.0.0.1:{sp}",
+            "--tls-certificate", str(self.certs / "server.pem"), "--tls-private-key", str(self.certs / "server.key"),
+            "--tls-client-ca-certs", str(self.certs / "ca.pem"), "--restrict-config", str(self.policy),
+            "--management-api", f"127.0.0.1:{mp}")
+        clients = []
+        await self.suite.ready(sp, process)
+        try:
+            lp = port()
+            c = await self.suite.spawn("default-quota-client", "client", "-L", f"tcp://127.0.0.1:{lp}:127.0.0.1:{self.target_port}",
+                "-P", "device-a", "--tls-certificate", str(self.certs / "a.pem"), "--tls-private-key", str(self.certs / "a.key"),
+                "--tls-verify-certificate=false", f"wts://127.0.0.1:{sp}")
+            clients.append(c)
+            await self.suite.ready(lp, c)
+            r, w = await asyncio.open_connection("127.0.0.1", lp)
+            w.write(b"hello-default-quota\n")
+            await w.drain()
+            data = await r.read(64)
+            assert data == b"hello-default-quota\n"
+            await close(w)
+            return {"default_limits_applied_and_tunnel_succeeds": True}
+        finally:
+            await asyncio.gather(*(self.suite.stop(c) for c in clients))
+            await self.suite.stop(process)
+
     async def run(self):
         await self.prepare()
         try:
@@ -333,6 +359,7 @@ class QuotaChecks:
                 ("aggregate-download", lambda: self.bandwidth("download")),
                 ("udp-and-proxies", self.udp_and_proxies), ("reverse-cancellation", self.reverse),
                 ("reverse-resource-ownership", self.reverse_ownership),
+                ("default-resource-limits", self.default_resource_limits),
                 ("startup-requires-mtls", self.invalid_config),
             ):
                 await self.suite.check(f"quotas/{name}", case, 45)

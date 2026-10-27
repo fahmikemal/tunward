@@ -58,6 +58,10 @@ pub(crate) fn load_server_files(args: &ServerCreationRequest) -> anyhow::Result<
     if let Some(address) = args.management_api {
         ensure!(address.ip().is_loopback(), "management API must bind to loopback");
     }
+    ensure!(
+        !(args.no_device_quotas && args.device_quota_config.is_some()),
+        "--no-device-quotas conflicts with --device-quota-config"
+    );
     DnsResolver::validate_urls(&args.dns_resolver)?;
     let http_proxy = crate::mk_http_proxy(
         args.http_proxy.clone(),
@@ -171,11 +175,16 @@ pub(crate) fn load_server_files(args: &ServerCreationRequest) -> anyhow::Result<
             &destinations,
         )?
     };
-    let device_quotas = args
-        .device_quota_config
-        .as_deref()
-        .map(DeviceQuotaConfig::from_path)
-        .transpose()?;
+    let device_quotas = if let Some(path) = &args.device_quota_config {
+        Some(
+            DeviceQuotaConfig::from_path(path)
+                .with_context(|| format!("Cannot load device quota config {}", path.display()))?,
+        )
+    } else if mtls_configured && !args.allow_insecure_dev && !args.no_device_quotas {
+        Some(DeviceQuotaConfig::default_production_limits())
+    } else {
+        None
+    };
     if let Some(path) = &args.device_revocation_config {
         RevocationManager::from_path(path)?;
     }
@@ -258,6 +267,7 @@ mod tests {
             fleet_inventory_max_devices: std::num::NonZeroU32::new(10000).unwrap(),
             tenant_config: None,
             allow_insecure_dev: false,
+            no_device_quotas: false,
         }
     }
 
@@ -323,5 +333,60 @@ mod tests {
             panic!("expected error for non-loopback management API");
         };
         assert!(err.to_string().contains("management API must bind to loopback"));
+    }
+
+    fn write_test_ca_pem(name: &str) -> std::path::PathBuf {
+        use base64::Engine;
+        let path = std::env::temp_dir().join(format!("tunward-test-{}-{}.pem", std::process::id(), name));
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let cert = params.self_signed(&key_pair).unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(cert.der());
+        let pem = format!("-----BEGIN CERTIFICATE-----\n{b64}\n-----END CERTIFICATE-----\n");
+        std::fs::write(&path, pem).unwrap();
+        path
+    }
+
+    #[test]
+    fn test_mtls_listener_defaults_to_production_resource_limits() {
+        let ca_path = write_test_ca_pem("default-quotas");
+        let mut req = sample_server_request("wss://127.0.0.1:8080");
+        req.tls_client_ca_certs = Some(ca_path.clone());
+
+        let files = load_server_files(&req).expect("valid mtls configuration");
+        let _ = std::fs::remove_file(ca_path);
+        assert_eq!(
+            files.device_quotas,
+            Some(DeviceQuotaConfig::default_production_limits()),
+            "Default finite production limits should be applied when mTLS is enabled without explicit quota file"
+        );
+    }
+
+    #[test]
+    fn test_no_device_quotas_disables_default_limits() {
+        let ca_path = write_test_ca_pem("no-quotas");
+        let mut req = sample_server_request("wss://127.0.0.1:8080");
+        req.tls_client_ca_certs = Some(ca_path.clone());
+        req.no_device_quotas = true;
+
+        let files = load_server_files(&req).expect("valid configuration with --no-device-quotas");
+        let _ = std::fs::remove_file(ca_path);
+        assert_eq!(files.device_quotas, None);
+    }
+
+    #[test]
+    fn test_no_device_quotas_conflicts_with_device_quota_config() {
+        let mut req = sample_server_request("wss://127.0.0.1:8080");
+        req.no_device_quotas = true;
+        req.device_quota_config = Some(std::path::PathBuf::from("/any/path"));
+
+        let Err(err) = load_server_files(&req) else {
+            panic!("expected conflict error when both no_device_quotas and device_quota_config are set");
+        };
+        assert!(
+            err.to_string()
+                .contains("--no-device-quotas conflicts with --device-quota-config")
+        );
     }
 }

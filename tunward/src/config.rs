@@ -443,10 +443,23 @@ pub struct ServerCreationRequest {
             long,
             value_name = "FILE",
             requires = "tls_client_ca_certs",
+            conflicts_with = "no_device_quotas",
             env = "TUNWARD_DEVICE_QUOTA_CONFIG"
         )
     )]
     pub device_quota_config: Option<PathBuf>,
+
+    /// Explicitly disable default device quota limits.
+    #[cfg_attr(
+        feature = "clap",
+        arg(
+            long,
+            default_value = "false",
+            conflicts_with = "device_quota_config",
+            env = "TUNWARD_NO_DEVICE_QUOTAS"
+        )
+    )]
+    pub no_device_quotas: bool,
 
     /// Live revocation YAML for verified mTLS device CNs or leaf-certificate SHA-256 fingerprints.
     /// Reloaded every second; unreadable/invalid policy closes sessions and denies access until recovery.

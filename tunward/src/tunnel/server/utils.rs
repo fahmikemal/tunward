@@ -244,6 +244,7 @@ pub(super) fn matches_any_restriction(
     restrictions
         .restrictions
         .iter()
+        .filter(|restriction| !restriction.allow.is_empty())
         .any(|restriction| restriction.filter(path_prefix, authorization))
 }
 
@@ -651,5 +652,23 @@ mod tests {
         assert_eq!(extract_path_prefix("prefix/events"), Err(PathPrefixErr::BadPathPrefix));
         assert_eq!(extract_path_prefix("prefix/a/events"), Err(PathPrefixErr::BadPathPrefix));
         assert_eq!(extract_path_prefix("prefix/a/b/events"), Err(PathPrefixErr::BadPathPrefix));
+    }
+
+    #[test]
+    fn test_empty_restrictions_deny_tunnel_and_session() {
+        let empty_rules = RestrictionsRules {
+            restrictions: vec![RestrictionConfig {
+                name: "empty".into(),
+                r#match: vec![MatchConfig::Any],
+                allow: vec![],
+            }],
+        };
+        let remote = RemoteAddr {
+            protocol: LocalProtocol::Tcp { proxy_protocol: false },
+            host: Host::Ipv4([127, 0, 0, 1].into()),
+            port: 80,
+        };
+        assert!(validate_tunnel(&remote, "events", None, &empty_rules).is_none());
+        assert!(!matches_any_restriction("events", None, &empty_rules));
     }
 }

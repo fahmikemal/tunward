@@ -222,6 +222,15 @@ class ServerConfigTests(unittest.TestCase):
                     self.assertIn(message, result.stderr)
         self.assertFalse((self.root / "never-created.sqlite3").exists())
 
+    def test_no_device_quotas_options(self):
+        # --no-device-quotas is valid on loopback or with complete config
+        self.invoke("-t", "--no-device-quotas", "ws://127.0.0.1:8443")
+        # --no-device-quotas conflicts with --device-quota-config
+        res = self.invoke("-t", "--no-device-quotas", "--device-quota-config",
+                          ROOT / "device-quotas.example.yaml", "ws://127.0.0.1:8443", valid=False)
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("cannot be used with", res.stderr)
+
     def test_systemd_prestart_uses_startup_arguments(self):
         lines = (ROOT / "deploy" / "tunward.service").read_text().replace("\\\n", "").splitlines()
         commands = {line.split("=", 1)[0]: line.split("=", 1)[1].split()

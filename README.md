@@ -96,14 +96,10 @@ When an authenticated feature lacks TLS/mTLS, the error names that feature.
 Restriction YAML rejects unknown fields and descending port ranges. These same
 checks apply at server startup; correct previously ignored field typos before upgrading.
 
-In accordance with enterprise secure defaults, any public or non-loopback listener
-(such as `0.0.0.0`, `[::]`, LAN, WAN, or non-localhost hostnames) strictly requires TLS
-(`wss://` or `wts://`), client certificate verification (`--tls-client-ca-certs`), and
-an explicit restriction policy (`--restrict-config`). For isolated local testing across
-interfaces, operators may supply `--allow-insecure-dev` to bypass these prerequisites
-(note: `--allow-insecure-dev` emits prominent security warnings on startup and does not
-relax loopback enforcement on `--management-api`). Loopback listeners (`127.0.0.1`,
-`localhost`, `[::1]`) remain unrestricted for rapid local development.
+In accordance with enterprise secure defaults:
+- Any public or non-loopback listener (such as `0.0.0.0`, `[::]`, LAN, WAN, or non-localhost hostnames) strictly requires TLS (`wss://` or `wts://`), client certificate verification (`--tls-client-ca-certs`), and an explicit restriction policy (`--restrict-config`). For isolated local testing across interfaces, operators may supply `--allow-insecure-dev` to bypass these prerequisites (emits prominent security warnings on startup and does not relax loopback enforcement on `--management-api`).
+- **Deny-by-default access control**: In alignment with OWASP recommendations, Tunward denies all tunnel requests by default unless explicitly matched by `--restrict-to` or `--restrict-config`. Missing policies never synthesize an implicit `Allow All`.
+- **Default resource limits**: When mTLS is enabled, finite baseline limits (32 sessions, 256 tunnels, 100 rps / 200 burst, 10 MB/s bandwidth shaping) are enforced per verified device to protect against unrestricted resource consumption (OWASP API4:2023). Operators can supply custom limits via `--device-quota-config` or opt out via `--no-device-quotas`. Loopback listeners (`127.0.0.1`, `localhost`, `[::1]`) remain unrestricted for rapid local development.
 
 Run it as the service user, with the intended arguments, environment and file
 permissions. It does not bind ports, resolve addresses, contact peers, start
@@ -408,6 +404,7 @@ tunward server --help
 | `--tls-certificate`, `--tls-private-key` | Server identity or client mTLS identity, depending on subcommand |
 | `--tls-client-ca-certs FILE` | Server trust bundle for client certificate authentication |
 | `--device-quota-config FILE` | Startup-loaded per-device quotas; requires mTLS and uses verified CNs |
+| `--no-device-quotas` | Explicitly disable default finite device resource limits under mTLS |
 | `--device-revocation-config FILE` | Live mTLS CN/certificate denial; closes active sessions and reverse resources |
 | `--tenant-config FILE` | Startup-loaded device membership, tunnel roles, and reserved reverse scope; requires mTLS and named `--restrict-config` rules |
 | `--fleet-inventory FILE` | Persistent SQLite observations of verified mTLS devices |

@@ -1,19 +1,31 @@
 # Authenticated device quotas
 
-Device quotas are optional and disabled unless the server receives
-`--device-quota-config FILE`. They require verified mTLS. They cover authenticated
-transport sessions, admitted/pending tunnel work, tunnel-attempt rate, and
-aggregate upload/download application payload rates.
+Device quotas require verified mTLS. They cover authenticated transport sessions,
+admitted/pending tunnel work, tunnel-attempt rate, and aggregate upload/download
+application payload rates.
+
+To defend against unrestricted resource consumption (OWASP API4:2023), when mTLS
+authentication is active and no custom `--device-quota-config` is supplied, Tunward
+enforces **finite default baseline limits**:
+- `max_sessions`: 32 concurrent transport sessions per device
+- `max_tunnels`: 256 concurrent tunnels per device
+- `requests_per_second`: 100 rps (with a burst capacity of 200)
+- `upload_bytes_per_second`: 10,485,760 bytes/s (10 MB/s)
+- `download_bytes_per_second`: 10,485,760 bytes/s (10 MB/s)
+- `bandwidth_burst_bytes`: 1,048,576 bytes (1 MB burst)
+
+Operators can override these defaults by supplying `--device-quota-config FILE`, or
+explicitly opt out using `--no-device-quotas` (or `--allow-insecure-dev` during development).
 
 One CLI server shares the same accounting across WSS, HTTP/2, and WebTransport.
 Server clones share state. Separate Server instances, processes, and replicas do
 not coordinate quotas. Counters and token buckets reset on server restart;
 this is not durable billing or a distributed quota service.
 
-## Enable
+## Enable and customize
 
 Generate the local bundle using the [mTLS guide](using_mtls.md), then add the
-quota file to the README server recipe:
+custom quota file to the README server recipe:
 
 ~~~sh
 tunward server \

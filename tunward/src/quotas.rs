@@ -18,7 +18,7 @@ use tokio::time::{Instant, Sleep};
 const TOKEN_SCALE: u128 = 1_000_000_000;
 const RECORD_BYTES: u64 = 65536;
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceQuotaConfig {
     pub version: u32,
@@ -33,7 +33,7 @@ fn default_tracked_devices() -> NonZeroU32 {
     NonZeroU32::new(10000).unwrap()
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceQuotaLimits {
     pub max_sessions: Option<NonZeroU32>,
@@ -86,6 +86,27 @@ impl DeviceQuotaLimits {
 }
 
 impl DeviceQuotaConfig {
+    /// Finite baseline resource limits applied by default in production when mTLS is enabled
+    /// and no explicit operator `--device-quota-config` is supplied.
+    /// Provides finite initial session, tunnel, request-rate, and bandwidth limits to defend
+    /// against unrestricted resource consumption (OWASP API4:2023).
+    pub fn default_production_limits() -> Self {
+        Self {
+            version: 1,
+            max_tracked_devices: NonZeroU32::new(10000).unwrap(),
+            default: DeviceQuotaLimits {
+                max_sessions: NonZeroU32::new(32),
+                max_tunnels: NonZeroU32::new(256),
+                requests_per_second: NonZeroU32::new(100),
+                request_burst: NonZeroU32::new(200),
+                upload_bytes_per_second: NonZeroU64::new(10 * 1024 * 1024),
+                download_bytes_per_second: NonZeroU64::new(10 * 1024 * 1024),
+                bandwidth_burst_bytes: NonZeroU64::new(1024 * 1024),
+            },
+            devices: HashMap::new(),
+        }
+    }
+
     pub fn from_path(path: &Path) -> anyhow::Result<Self> {
         let file =
             std::fs::File::open(path).with_context(|| format!("Cannot open device quota config {}", path.display()))?;
@@ -776,5 +797,20 @@ mod tests {
         assert!(session.open_tunnel().is_err());
         drop(listener);
         assert!(session.open_tunnel().is_ok());
+    }
+
+    #[tokio::test]
+    async fn default_production_limits_validate_and_enforce() {
+        let default_config = DeviceQuotaConfig::default_production_limits();
+        assert!(default_config.validate().is_ok());
+        assert_eq!(default_config.default.max_sessions.unwrap().get(), 32);
+        assert_eq!(default_config.default.max_tunnels.unwrap().get(), 256);
+        assert_eq!(default_config.default.requests_per_second.unwrap().get(), 100);
+        assert_eq!(default_config.default.request_burst.unwrap().get(), 200);
+
+        let manager = QuotaManager::new(default_config);
+        let session = manager.open_session("test-device").unwrap();
+        let permit = session.open_tunnel().unwrap();
+        assert_eq!(&*permit.identity(), "test-device");
     }
 }
