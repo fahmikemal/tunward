@@ -43,6 +43,7 @@ with the qualification gates above still open.
 | [Tenant isolation and roles](docs/TENANT_ISOLATION.md) | Verified membership, named destination scope, and reverse resource ownership |
 | [Fleet and inventory](docs/FLEET_INVENTORY.md) | Consistent transport records and persistent verified-device observations |
 | [Deployment lifecycle](docs/DEPLOYMENT.md) | Certificate validation, renewal, canary rollout, and rollback |
+| [Monitoring and Prometheus](docs/MONITORING.md) | Built-in `/metrics` scraping, Grafana metrics reference, and alerting rules |
 | [Publication cleanup](docs/PUBLICATION.md) | Exposed-key history, safe mirror preparation, and hosting cutover |
 | [Qualification](docs/STAGING_QUALIFICATION.md) | Local, container, WAN, capacity, and endurance checks |
 | [Contributing](CONTRIBUTING.md) | Build requirements, Docker/Podman tests, and CI |
@@ -411,6 +412,7 @@ tunward server --help
 | `--tenant-config FILE` | Startup-loaded device membership, tunnel roles, and reserved reverse scope; requires mTLS and named `--restrict-config` rules |
 | `--fleet-inventory FILE` | Persistent SQLite observations of verified mTLS devices |
 | `--fleet-inventory-max-devices N` | Maximum stored device identities; default 10000 |
+| `--management-api IP:PORT` | Loopback REST management API exposing `/healthz`, Prometheus `/metrics`, and client/session registry |
 | `-P, --http-upgrade-path-prefix VALUE` | Client path prefix; mTLS uses the certificate CN by default |
 | `-r, --restrict-http-upgrade-path-prefix VALUE` | Server path allowlist; not a substitute for TLS and target rules |
 | `--restrict-to HOST:PORT` | Server forward-destination allowlist; repeat as needed |
