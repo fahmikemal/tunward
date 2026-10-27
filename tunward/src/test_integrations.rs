@@ -1,3 +1,4 @@
+use crate::config::ClientIdentityField;
 use crate::embedded_certificate;
 use crate::executor::DefaultTokioExecutor;
 use crate::protocols;
@@ -94,6 +95,7 @@ fn server_no_tls(dns_resolver: DnsResolver) -> Server {
         fleet_inventory: None,
         tenant_config: None,
         fleet_inventory_max_devices: std::num::NonZeroU32::new(10000).unwrap(),
+        tls_client_identity_field: ClientIdentityField::default(),
     };
     Server::new(server_config, DefaultTokioExecutor::default())
 }
@@ -126,6 +128,7 @@ fn server_webtransport(dns_resolver: DnsResolver) -> Server {
         fleet_inventory: None,
         tenant_config: None,
         fleet_inventory_max_devices: std::num::NonZeroU32::new(10000).unwrap(),
+        tls_client_identity_field: ClientIdentityField::default(),
     };
     Server::new(server_config, DefaultTokioExecutor::default())
 }
@@ -780,6 +783,7 @@ async fn test_fleet_management_and_ephemeral_reverse_tunnel(
         fleet_inventory: None,
         tenant_config: None,
         fleet_inventory_max_devices: std::num::NonZeroU32::new(10000).unwrap(),
+        tls_client_identity_field: ClientIdentityField::default(),
     };
     let server = Server::new(server_config, DefaultTokioExecutor::default());
     let server_port = server.config.bind.port();

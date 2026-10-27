@@ -206,6 +206,7 @@ pub(crate) fn load_server_files(args: &ServerCreationRequest) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ClientIdentityField;
     use std::time::Duration;
 
     #[test]
@@ -268,6 +269,7 @@ mod tests {
             tenant_config: None,
             allow_insecure_dev: false,
             no_device_quotas: false,
+            tls_client_identity_field: ClientIdentityField::Cn,
         }
     }
 

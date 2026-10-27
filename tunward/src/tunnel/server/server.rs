@@ -1,3 +1,4 @@
+use crate::config::ClientIdentityField;
 use crate::executor::DefaultTokioExecutor;
 use crate::management::registry::{ConnectionLease, TunnelLease};
 use crate::protocols;
@@ -82,6 +83,7 @@ pub struct ServerConfig {
     pub fleet_inventory: Option<PathBuf>,
     pub fleet_inventory_max_devices: std::num::NonZeroU32,
     pub tenant_config: Option<PathBuf>,
+    pub tls_client_identity_field: ClientIdentityField,
 }
 
 #[derive(Clone, Default)]
@@ -869,14 +871,17 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                             .tls
                             .as_ref()
                             .is_some_and(|tls| tls.tls_client_ca_certificates.is_some());
-                        let restrict_path =
-                            match tls::client_path_from_certificate(tls_ctx.peer_certificates(), identity_required) {
-                                Ok(identity) => identity,
-                                Err(err) => {
-                                    warn!("Rejecting mTLS connection without a supported client identity: {err}");
-                                    return;
-                                }
-                            };
+                        let restrict_path = match tls::client_path_from_certificate(
+                            tls_ctx.peer_certificates(),
+                            identity_required,
+                            server.config.tls_client_identity_field,
+                        ) {
+                            Ok(identity) => identity,
+                            Err(err) => {
+                                warn!("Rejecting mTLS connection without a supported client identity: {err}");
+                                return;
+                            }
+                        };
                         let is_http2 = tls_ctx.alpn_protocol() == Some(b"h2");
                         let restrict_path = match server
                             .connection_context(
@@ -997,6 +1002,7 @@ impl Debug for ServerConfig {
             .field("remote_server_idle_timeout", &self.remote_server_idle_timeout)
             .field("enable_webtransport", &self.enable_webtransport)
             .field("device_quotas", &self.device_quotas)
+            .field("tls_client_identity_field", &self.tls_client_identity_field)
             .field(
                 "mTLS",
                 &self

@@ -1,12 +1,61 @@
 use crate::tunnel::LocalProtocol;
 pub use hyper::http::{HeaderName, HeaderValue};
+use serde::{Deserialize, Serialize};
+use std::fmt::{self, Display, Formatter};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::time::Duration;
 use tokio_rustls::rustls::pki_types::DnsName;
 use url::{Host, Url};
 
 pub const DEFAULT_CLIENT_UPGRADE_PATH_PREFIX: &str = "v1";
+
+/// Identifies which field of the client certificate to extract as the client's verified identity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[serde(rename_all = "kebab-case")]
+pub enum ClientIdentityField {
+    /// Extract the certificate subject Common Name (CN).
+    #[default]
+    #[cfg_attr(feature = "clap", value(name = "cn"))]
+    Cn,
+    /// Extract the Subject Alternative Name Uniform Resource Identifier (SAN URI / SPIFFE ID).
+    #[cfg_attr(feature = "clap", value(name = "san-uri"))]
+    SanUri,
+    /// Extract the Subject Alternative Name DNS Name (SAN DNS).
+    #[cfg_attr(feature = "clap", value(name = "san-dns"))]
+    SanDns,
+}
+
+impl ClientIdentityField {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cn => "cn",
+            Self::SanUri => "san-uri",
+            Self::SanDns => "san-dns",
+        }
+    }
+}
+
+impl Display for ClientIdentityField {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ClientIdentityField {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "cn" => Ok(Self::Cn),
+            "san-uri" => Ok(Self::SanUri),
+            "san-dns" => Ok(Self::SanDns),
+            other => anyhow::bail!("unknown client identity field: '{other}'. Expected one of: cn, san-uri, san-dns"),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "clap", derive(clap::Args))]
@@ -229,6 +278,20 @@ pub struct ClientCreationRequest {
     #[cfg_attr(feature = "clap", arg(long, value_name = "FILE_PATH", verbatim_doc_comment))]
     pub tls_private_key: Option<PathBuf>,
 
+    /// [Optional] Field in the client certificate used to identify the client during mTLS authentication.
+    /// Choices: cn, san-uri, san-dns. Default is cn.
+    #[cfg_attr(
+        feature = "clap",
+        arg(
+            long,
+            value_name = "FIELD",
+            default_value = "cn",
+            env = "TUNWARD_TLS_CLIENT_IDENTITY_FIELD",
+            verbatim_doc_comment
+        )
+    )]
+    pub tls_client_identity_field: ClientIdentityField,
+
     /// Dns resolver to use to lookup ips of domain name. Can be specified multiple time
     /// Example:
     ///  dns://1.1.1.1 for using udp
@@ -381,6 +444,20 @@ pub struct ServerCreationRequest {
     /// The ca will be automatically reloaded if it changes
     #[cfg_attr(feature = "clap", arg(long, value_name = "FILE_PATH", verbatim_doc_comment))]
     pub tls_client_ca_certs: Option<PathBuf>,
+
+    /// [Optional] Field in the client certificate used to identify the client during mTLS authentication.
+    /// Choices: cn, san-uri, san-dns. Default is cn.
+    #[cfg_attr(
+        feature = "clap",
+        arg(
+            long,
+            value_name = "FIELD",
+            default_value = "cn",
+            env = "TUNWARD_TLS_CLIENT_IDENTITY_FIELD",
+            verbatim_doc_comment
+        )
+    )]
+    pub tls_client_identity_field: ClientIdentityField,
 
     /// If set, will use this http proxy to connect to the client
     #[cfg_attr(
@@ -918,6 +995,32 @@ mod parsers {
         ; "with full ipv6 tunnel")]
         fn test_parse_tunnel_arg(input: &str) -> LocalToRemote {
             parse_tunnel_arg(input).unwrap()
+        }
+
+        #[test]
+        fn test_client_identity_field_parsing_and_display() {
+            use crate::config::ClientIdentityField;
+            use std::str::FromStr;
+
+            assert_eq!(ClientIdentityField::from_str("cn").unwrap(), ClientIdentityField::Cn);
+            assert_eq!(ClientIdentityField::from_str("CN").unwrap(), ClientIdentityField::Cn);
+            assert_eq!(ClientIdentityField::from_str("san-uri").unwrap(), ClientIdentityField::SanUri);
+            assert_eq!(ClientIdentityField::from_str("SAN-URI").unwrap(), ClientIdentityField::SanUri);
+            assert_eq!(ClientIdentityField::from_str("san-dns").unwrap(), ClientIdentityField::SanDns);
+            assert_eq!(ClientIdentityField::from_str("San-Dns").unwrap(), ClientIdentityField::SanDns);
+
+            assert!(ClientIdentityField::from_str("email").is_err());
+            assert!(ClientIdentityField::from_str("unknown").is_err());
+
+            assert_eq!(ClientIdentityField::Cn.to_string(), "cn");
+            assert_eq!(ClientIdentityField::SanUri.to_string(), "san-uri");
+            assert_eq!(ClientIdentityField::SanDns.to_string(), "san-dns");
+
+            // Serde roundtrip
+            let json = serde_json::to_string(&ClientIdentityField::SanUri).unwrap();
+            assert_eq!(json, "\"san-uri\"");
+            let decoded: ClientIdentityField = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, ClientIdentityField::SanUri);
         }
     }
 }

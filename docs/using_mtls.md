@@ -88,15 +88,18 @@ WebTransport enable `--enable-webtransport` on a `wss://` server, or use
 
 ## Application identity and path binding
 
-With mTLS enabled, the server requires exactly one nonempty, readable Common
-Name on the verified client leaf certificate. WSS, HTTP/2, and WebTransport bind
-that CN to the requested path prefix. A trusted certificate with missing or
-ambiguous CN is rejected. SAN-only client identity is not implemented.
+With mTLS enabled, Tunward binds verified client certificate identities to the
+requested HTTP upgrade path prefix across WSS, HTTP/2, and WebTransport.
 
-The client normally derives its path from the certificate CN. Explicit `-P`
-must agree with that identity; the examples set it to make the relationship
-visible. The implementation treats the default prefix value `v1` as the
-signal to derive CN, even if that value is explicitly supplied.
+By default, the server and client inspect the certificate Common Name (`--tls-client-identity-field cn`).
+For modern PKI environments (e.g. SPIFFE, service meshes, or enterprise MDM profiles where CN is deprecated),
+operators can configure `--tls-client-identity-field`:
+
+- `--tls-client-identity-field cn` (Default): Requires exactly one nonempty Common Name on the verified leaf certificate.
+- `--tls-client-identity-field san-uri`: Requires exactly one Subject Alternative Name URI (e.g., SPIFFE ID `spiffe://example.org/ns/prod/sa/device-01` or URN `urn:uuid:...`).
+- `--tls-client-identity-field san-dns`: Requires exactly one Subject Alternative Name DNS Name (e.g., `device-01.corp.internal`).
+
+The client automatically derives its HTTP upgrade path prefix from the verified leaf certificate using the configured `--tls-client-identity-field`. Explicit `-P` must agree with that identity; the implementation treats the default prefix value `v1` as the signal to auto-derive identity from the leaf certificate.
 
 This is application authorization, separate from TLS server name validation.
 Server DNS/IP verification uses SANs. A `--client-id` or `--device-id` value

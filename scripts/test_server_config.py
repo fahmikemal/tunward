@@ -231,6 +231,15 @@ class ServerConfigTests(unittest.TestCase):
         self.assertEqual(res.returncode, 2)
         self.assertIn("cannot be used with", res.stderr)
 
+    def test_tls_client_identity_field_options(self):
+        for field in ("cn", "san-uri", "san-dns"):
+            with self.subTest(field=field):
+                self.invoke("-t", "--tls-client-identity-field", field, "ws://127.0.0.1:8443")
+        # Invalid field value
+        res = self.invoke("-t", "--tls-client-identity-field", "invalid-field", "ws://127.0.0.1:8443", valid=False)
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("invalid value 'invalid-field'", res.stderr)
+
     def test_systemd_prestart_uses_startup_arguments(self):
         lines = (ROOT / "deploy" / "tunward.service").read_text().replace("\\\n", "").splitlines()
         commands = {line.split("=", 1)[0]: line.split("=", 1)[1].split()

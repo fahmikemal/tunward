@@ -100,6 +100,7 @@ In accordance with enterprise secure defaults:
 - Any public or non-loopback listener (such as `0.0.0.0`, `[::]`, LAN, WAN, or non-localhost hostnames) strictly requires TLS (`wss://` or `wts://`), client certificate verification (`--tls-client-ca-certs`), and an explicit restriction policy (`--restrict-config`). For isolated local testing across interfaces, operators may supply `--allow-insecure-dev` to bypass these prerequisites (emits prominent security warnings on startup and does not relax loopback enforcement on `--management-api`).
 - **Deny-by-default access control**: In alignment with OWASP recommendations, Tunward denies all tunnel requests by default unless explicitly matched by `--restrict-to` or `--restrict-config`. Missing policies never synthesize an implicit `Allow All`.
 - **Default resource limits**: When mTLS is enabled, finite baseline limits (32 sessions, 256 tunnels, 100 rps / 200 burst, 10 MB/s bandwidth shaping) are enforced per verified device to protect against unrestricted resource consumption (OWASP API4:2023). Operators can supply custom limits via `--device-quota-config` or opt out via `--no-device-quotas`. Loopback listeners (`127.0.0.1`, `localhost`, `[::1]`) remain unrestricted for rapid local development.
+- **Modern PKI & SPIFFE/SAN Identity Extraction**: Supports extracting verified client identities from X.509 Common Name (`cn`), Subject Alternative Name URI (`san-uri` / SPIFFE ID), or Subject Alternative Name DNS (`san-dns`), enabling native integration with modern service meshes, MDM platforms, and enterprise PKI standards.
 
 Run it as the service user, with the intended arguments, environment and file
 permissions. It does not bind ports, resolve addresses, contact peers, start
@@ -403,14 +404,15 @@ tunward server --help
 | `--tls-verify-certificate[=true\|false]` | Client verification defaults to true; keep enabled for deployments |
 | `--tls-certificate`, `--tls-private-key` | Server identity or client mTLS identity, depending on subcommand |
 | `--tls-client-ca-certs FILE` | Server trust bundle for client certificate authentication |
-| `--device-quota-config FILE` | Startup-loaded per-device quotas; requires mTLS and uses verified CNs |
+| `--tls-client-identity-field cn\|san-uri\|san-dns` | Client certificate identity extraction field (default: `cn`; supports SPIFFE/SAN) |
+| `--device-quota-config FILE` | Startup-loaded per-device quotas; requires mTLS and uses verified device identity |
 | `--no-device-quotas` | Explicitly disable default finite device resource limits under mTLS |
-| `--device-revocation-config FILE` | Live mTLS CN/certificate denial; closes active sessions and reverse resources |
+| `--device-revocation-config FILE` | Live mTLS device identity denial; closes active sessions and reverse resources |
 | `--tenant-config FILE` | Startup-loaded device membership, tunnel roles, and reserved reverse scope; requires mTLS and named `--restrict-config` rules |
 | `--fleet-inventory FILE` | Persistent SQLite observations of verified mTLS devices |
 | `--fleet-inventory-max-devices N` | Maximum stored device identities; default 10000 |
 | `--management-api IP:PORT` | Loopback REST management API exposing `/healthz`, Prometheus `/metrics`, and client/session registry |
-| `-P, --http-upgrade-path-prefix VALUE` | Client path prefix; mTLS uses the certificate CN by default |
+| `-P, --http-upgrade-path-prefix VALUE` | Client path prefix; mTLS auto-derives from the verified identity field by default |
 | `-r, --restrict-http-upgrade-path-prefix VALUE` | Server path allowlist; not a substitute for TLS and target rules |
 | `--restrict-to HOST:PORT` | Server forward-destination allowlist; repeat as needed |
 | `--restrict-config FILE` | Reloadable YAML restriction rules; replaces CLI-generated restriction rules |

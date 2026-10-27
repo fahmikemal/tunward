@@ -82,12 +82,12 @@ pub async fn create_client(
     };
 
     let http_upgrade_path_prefix = if args.http_upgrade_path_prefix.eq(DEFAULT_CLIENT_UPGRADE_PATH_PREFIX) {
-        // When using mTLS and no manual http upgrade path is specified configure the HTTP upgrade path
-        // to be the common name (CN) of the client's certificate.
+        // When using mTLS and no manual http upgrade path is specified, configure the HTTP upgrade path
+        // to be the verified identity from the client's certificate according to the requested field.
         tls_certificate
             .as_ref()
             .and_then(|certs| tls::find_leaf_certificate(certs.as_slice()))
-            .and_then(|leaf_cert| tls::cn_from_certificate(&leaf_cert))
+            .and_then(|leaf_cert| tls::identity_from_certificate(&leaf_cert, args.tls_client_identity_field).ok())
             .unwrap_or(args.http_upgrade_path_prefix)
     } else {
         args.http_upgrade_path_prefix
@@ -590,6 +590,7 @@ async fn run_server_impl(
         fleet_inventory: args.fleet_inventory,
         fleet_inventory_max_devices: args.fleet_inventory_max_devices,
         tenant_config: args.tenant_config,
+        tls_client_identity_field: args.tls_client_identity_field,
     };
     let mut server = Server::new(server_config, executor);
     if let (Some(state), Some(reload)) = (managed, reload) {

@@ -91,12 +91,16 @@ pub(super) fn extract_path_prefix(path: &str) -> Result<&str, PathPrefixErr> {
         return Err(PathPrefixErr::BadPathPrefix);
     }
 
-    let (l, r) = path[1..].split_once('/').ok_or(PathPrefixErr::BadUpgradeRequest)?;
+    let without_leading_slash = &path[1..];
+    let prefix = without_leading_slash
+        .strip_suffix("/events")
+        .ok_or(PathPrefixErr::BadUpgradeRequest)?;
 
-    match r.ends_with("events") {
-        true => Ok(l),
-        false => Err(PathPrefixErr::BadUpgradeRequest),
+    if prefix.is_empty() {
+        return Err(PathPrefixErr::BadPathPrefix);
     }
+
+    Ok(prefix)
 }
 
 #[derive(Debug, Display, Error)]
@@ -630,8 +634,16 @@ mod tests {
     #[test]
     fn test_extract_path_prefix_happy_path() {
         assert_eq!(extract_path_prefix("/prefix/events"), Ok("prefix"));
-        assert_eq!(extract_path_prefix("/prefix/a/events"), Ok("prefix"));
-        assert_eq!(extract_path_prefix("/prefix/a/b/events"), Ok("prefix"));
+        assert_eq!(extract_path_prefix("/prefix/a/events"), Ok("prefix/a"));
+        assert_eq!(extract_path_prefix("/prefix/a/b/events"), Ok("prefix/a/b"));
+        assert_eq!(
+            extract_path_prefix("/spiffe://example.org/ns/prod/sa/device-1/events"),
+            Ok("spiffe://example.org/ns/prod/sa/device-1")
+        );
+        assert_eq!(
+            extract_path_prefix("/device-01.corp.internal/events"),
+            Ok("device-01.corp.internal")
+        );
     }
 
     #[test]

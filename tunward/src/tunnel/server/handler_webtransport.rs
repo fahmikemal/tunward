@@ -153,6 +153,7 @@ async fn handle_session(
     let restrict_path = match tls::client_path_from_certificate(
         peer_certificates.as_deref().map(|certs| certs.as_slice()),
         identity_required,
+        server.config.tls_client_identity_field,
     ) {
         Ok(identity) => identity,
         Err(err) => {
