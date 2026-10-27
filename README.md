@@ -35,7 +35,7 @@ with the qualification gates above still open.
 
 | Guide | Contents |
 | --- | --- |
-| [Roadmap](ROADMAP.md) | v0.1 beta scope, planned secure defaults, acceptance criteria, and stable-release gates |
+| [Roadmap](ROADMAP.md) | v0.1 beta scope, planned secure defaults, architectural limits, and stable-release gates |
 | [mTLS and certificates](docs/using_mtls.md) | Generate local certificates, configure trust, and separate deployment keys |
 | [Protocol v2](docs/PROTOCOL_V2.md) | Framing, readiness, shutdown, migration, and implementation limits |
 | [Device quotas](docs/DEVICE_QUOTAS.md) | Verified identities, session/tunnel admission, request rate, and bandwidth shaping |

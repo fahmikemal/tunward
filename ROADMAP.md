@@ -65,3 +65,14 @@ These gates remain separate from feature count:
 
 Complete the relevant gates with retained evidence before changing stability
 claims. They do not become complete merely by assigning a version number.
+
+## Architectural limitations and future scope (v0.2+ / v0.3+)
+
+The following architectural limitations are acknowledged in the v0.1 baseline, with future roadmap recommendations:
+
+| Domain | Current limitation | Impact | Future architectural scope |
+| --- | --- | --- | --- |
+| **State distribution** | Process-local token bucket quotas and SQLite inventory without cross-replica consensus. | Multi-replica deployments behind L4 load balancers enforce limits per pod rather than globally across the fleet. | Provide an optional distributed quota and state adapter (e.g., Redis/Dragonfly backend via atomic token-bucket Lua scripts or etcd coordination). |
+| **Identity extraction** | Strict x509 Common Name (CN) binding for verified mTLS device identity. | Modern PKI standards (RFC 5280) deprecate CN in favor of Subject Alternative Name (SAN) extensions, such as Hardware UUIDs (`otherName`) or SPIFFE/URI identifiers. | Add configurable identity extraction options (e.g., `--tls-client-identity-field [cn|san-uri|san-dns]`) to support modern MDM and service mesh certificate profiles. |
+| **Revocation lifecycle** | Application-level file polling denylist (`device-revocations.yaml`) without native CRL or OCSP responder integration. | Operators managing dynamic CA certificate revocation lists must manually translate CRLs into Tunward's local revocation YAML. | Integrate dynamic X.509 CRL distribution point ingestion and OCSP stapling/checking into the Rustls verification pipeline. |
+
