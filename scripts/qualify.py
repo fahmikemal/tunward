@@ -97,7 +97,7 @@ class Suite:
         temporary.replace(self.out / "results.json")
         print(json.dumps(row), flush=True)
 
-    async def spawn(self, label, *args, pipe=False, extra_env=None, log_level="WARN", workers=1):
+    async def spawn(self, label, *args, pipe=False, extra_env=None, log_level="WARN", workers=1, preexec_fn=None):
         if args[0] == "server":
             is_deny_test = "--deny-by-default-test" in args
             args = tuple(a for a in args if a != "--deny-by-default-test")
@@ -119,7 +119,8 @@ class Suite:
             proc = await asyncio.create_subprocess_exec(
                 str(self.binary), *args, "--nb-worker-threads", str(workers), "--log-lvl", log_level,
                 env=env, stdin=asyncio.subprocess.PIPE if pipe else asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE if pipe else log, stderr=log, start_new_session=True)
+                stdout=asyncio.subprocess.PIPE if pipe else log, stderr=log, start_new_session=True,
+                preexec_fn=preexec_fn)
         finally:
             log.close()
         self.processes.append(proc)
@@ -1153,9 +1154,10 @@ class Suite:
   - name: Qualification suite policy
     match: [Any]
     allow:
+      # Sections bind more targets on ephemeral ports after this file is written (HTTP proxy
+      # origins, half-close peers), so the policy confines the address rather than the port.
       - !Tunnel
         protocol: [Tcp, Udp]
-        port: ["{self.echo_port}", "{self.other_echo_port}", "{self.udp_port}"]
         cidr: [127.0.0.1/32]
       - !ReverseTunnel
         protocol: [Tcp, Udp, Socks5, HttpProxy, Unix]

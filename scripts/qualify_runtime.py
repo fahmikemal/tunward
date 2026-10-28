@@ -15,12 +15,24 @@ import subprocess
 import time
 
 
+USED_PORTS = set()
+
+
 def port():
-    with socket.socket() as stream, socket.socket(type=socket.SOCK_DGRAM) as datagram:
-        stream.bind(("127.0.0.1", 0))
-        endpoint = stream.getsockname()[1]
-        datagram.bind(("127.0.0.1", endpoint))
-        return endpoint
+    # Other processes can hold the UDP side of a free TCP port, so retry rather than fail the run.
+    for _ in range(1000):
+        with socket.socket() as stream, socket.socket(type=socket.SOCK_DGRAM) as datagram:
+            stream.bind(("127.0.0.1", 0))
+            endpoint = stream.getsockname()[1]
+            if endpoint in USED_PORTS:
+                continue
+            try:
+                datagram.bind(("127.0.0.1", endpoint))
+            except OSError:
+                continue
+            USED_PORTS.add(endpoint)
+            return endpoint
+    raise RuntimeError("cannot find a free TCP/UDP port")
 
 
 async def close(writer):
