@@ -3,7 +3,7 @@
 use crate::restrictions::types::RestrictionsRules;
 use crate::tunnel::{LocalProtocol, RemoteAddr};
 use anyhow::{Context, ensure};
-use rand::seq::SliceRandom;
+use rand::seq::IndexedRandom;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -361,10 +361,7 @@ impl TenantAccess {
             .flat_map(|binding| binding.ports.iter().flat_map(|range| range.clone()))
             .map(|port| SocketAddr::new(bind.ip(), port))
             .collect::<Vec<_>>();
-        candidates
-            .choose_multiple(&mut rand::thread_rng(), 32)
-            .copied()
-            .collect()
+        candidates.sample(&mut rand::rng(), 32).copied().collect()
     }
 }
 
