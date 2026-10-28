@@ -2,7 +2,6 @@ use anyhow::{Context, anyhow};
 use std::fs::File;
 use tokio_rustls::rustls::client::{EchConfig, EchMode};
 
-use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::net::TcpStream;
@@ -12,6 +11,7 @@ use crate::tunnel::client::ClientConfig;
 use crate::tunnel::server::TlsServerConfig;
 use crate::tunnel::transport::TransportAddr;
 use tokio_rustls::rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use tokio_rustls::rustls::pki_types::pem::{self, PemObject};
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use tokio_rustls::rustls::server::WebPkiClientVerifier;
 use tokio_rustls::rustls::server::danger::ClientCertVerifier;
@@ -75,8 +75,7 @@ pub fn load_certificates_from_pem(path: &Path) -> anyhow::Result<Vec<Certificate
     info!("Loading tls certificate from {:?}", path);
 
     let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let certs = rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
+    let certs = CertificateDer::pem_reader_iter(file).collect::<Result<Vec<_>, _>>()?;
     anyhow::ensure!(!certs.is_empty(), "No certificates found in {}", path.display());
     for cert in &certs {
         let (remaining, _) = x509_parser::parse_x509_certificate(cert.as_ref())
@@ -90,13 +89,11 @@ pub fn load_private_key_from_file(path: &Path) -> anyhow::Result<PrivateKeyDer<'
     info!("Loading tls private key from {:?}", path);
 
     let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-
-    let Some(private_key) = rustls_pemfile::private_key(&mut reader)? else {
-        return Err(anyhow!("No private key found in {path:?}"));
-    };
-
-    Ok(private_key)
+    match PrivateKeyDer::from_pem_reader(file) {
+        Ok(private_key) => Ok(private_key),
+        Err(pem::Error::NoItemsFound) => Err(anyhow!("No private key found in {path:?}")),
+        Err(err) => Err(err.into()),
+    }
 }
 
 pub fn tls_connector(
@@ -284,4 +281,105 @@ pub async fn connect(client_cfg: &ClientConfig, tcp_stream: TcpStream) -> anyhow
     let tls_stream = tls_connector.connect(sni, tcp_stream).await?;
 
     Ok(tls_stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+
+    /// A PEM block. Keys are random bytes under a key label: loading only classifies them by label.
+    fn pem(label: &str, der: &[u8]) -> String {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(der);
+        let lines = encoded
+            .as_bytes()
+            .chunks(64)
+            .map(|line| std::str::from_utf8(line).unwrap());
+        format!(
+            "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
+            lines.collect::<Vec<_>>().join("\n")
+        )
+    }
+
+    fn certificate(name: &str) -> Vec<u8> {
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let params = rcgen::CertificateParams::new(vec![name.to_string()]).unwrap();
+        params.self_signed(&key_pair).unwrap().der().to_vec()
+    }
+
+    fn write(name: &str, contents: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("tunward-pem-{}-{name}.pem", std::process::id()));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn certificates_keep_their_order_and_skip_other_blocks() {
+        let (first, second) = (certificate("first.test"), certificate("second.test"));
+        let contents = [
+            pem("CERTIFICATE", &first),
+            pem("PRIVATE KEY", &[7; 48]),
+            pem("CERTIFICATE", &second),
+        ]
+        .concat();
+        let path = write("chain", &contents);
+        let certs = load_certificates_from_pem(&path);
+        std::fs::remove_file(&path).unwrap();
+        let certs = certs.unwrap();
+        assert_eq!(certs.len(), 2);
+        assert_eq!(certs[0].as_ref(), first.as_slice());
+        assert_eq!(certs[1].as_ref(), second.as_slice());
+    }
+
+    #[test]
+    fn missing_or_invalid_certificates_are_rejected() {
+        let path = write("no-certificate", &pem("PRIVATE KEY", &[1; 48]));
+        let error = load_certificates_from_pem(&path).unwrap_err().to_string();
+        std::fs::remove_file(&path).unwrap();
+        assert!(error.starts_with("No certificates found in"), "{error}");
+
+        let path = write("invalid-certificate", &pem("CERTIFICATE", &[2; 48]));
+        let error = load_certificates_from_pem(&path).unwrap_err().to_string();
+        std::fs::remove_file(&path).unwrap();
+        assert!(error.starts_with("Invalid X.509 certificate in"), "{error}");
+    }
+
+    #[test]
+    fn private_keys_are_recognized_in_every_supported_encoding() {
+        for (label, expected) in [
+            ("PRIVATE KEY", "pkcs8"),
+            ("RSA PRIVATE KEY", "pkcs1"),
+            ("EC PRIVATE KEY", "sec1"),
+        ] {
+            let der = [label.len() as u8; 64];
+            // A certificate ahead of the key is skipped, and the first key in the file is used.
+            let contents = [
+                pem("CERTIFICATE", &certificate("key.test")),
+                pem(label, &der),
+                pem("PRIVATE KEY", &[9; 32]),
+            ]
+            .concat();
+            let path = write(expected, &contents);
+            let key = load_private_key_from_file(&path);
+            std::fs::remove_file(&path).unwrap();
+            let key = key.unwrap();
+            let kind = match &key {
+                PrivateKeyDer::Pkcs8(_) => "pkcs8",
+                PrivateKeyDer::Pkcs1(_) => "pkcs1",
+                PrivateKeyDer::Sec1(_) => "sec1",
+                _ => "other",
+            };
+            assert_eq!(kind, expected, "{label}");
+            assert_eq!(key.secret_der(), der.as_slice(), "{label}");
+        }
+    }
+
+    #[test]
+    fn a_file_without_a_private_key_names_itself_in_the_error() {
+        let path = write("no-key", &pem("CERTIFICATE", &certificate("no-key.test")));
+        let error = load_private_key_from_file(&path).unwrap_err().to_string();
+        std::fs::remove_file(&path).unwrap();
+        assert!(error.starts_with("No private key found in"), "{error}");
+        assert!(error.contains("no-key"), "{error}");
+    }
 }

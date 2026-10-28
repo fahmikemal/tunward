@@ -33,14 +33,13 @@ hyper = { version = "1.11.1", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1.20", features = ["tokio", "server", "server-auto"] }
 http-body-util = { version = "0.1.5" }
 log = "0.4.34"
-nix = { version = "0.31.3", features = ["socket", "net", "uio"] }
+nix = { version = "0.31.3", features = ["fs", "socket", "net", "uio"] }
 parking_lot = "0.12.5"
 pin-project = "1"
 notify = { version = "8.2.0", features = [] }
 httparse = { version = "1.10.1", features = [] }
 
 rustls-native-certs = { version = "0.8.4", features = [] }
-rustls-pemfile = { version = "2.2.0", features = [] }
 # WebTransport (HTTP/3 over QUIC) transport. Takes our own rustls config, so the
 # crypto provider follows from the aws-lc-rs/ring features below. Re-exports quinn.
 # Its default feature is aws-lc-rs, which would pull aws-lc-sys into the ring builds.
@@ -75,8 +74,6 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 crossterm = { version = "0.29.0" }
 tokio-util = { version = "0.7.19", features = ["io"] }
 
-[target.'cfg(target_family = "unix")'.dependencies]
-tokio-fd = "0.3.0"
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["test-util", "rt-multi-thread", "macros"] }
@@ -86,7 +83,7 @@ collection_macros = "0.2.0"
 rstest = "0.27.0"
 serial_test = "4.0.1"
 derive_more = { version = "2.1.1", features = ["from"] }
-get_if_addrs = "0.5.3"
+if-addrs = "0.15.0"
 
 [features]
 default = ["aws-lc-rs"]
