@@ -80,6 +80,9 @@ jobs:
           python3 -m unittest discover -s scripts -p 'test_check_release*.py'
           python3 -m unittest discover -s scripts -p test_package_release.py
 
+      - name: Verify issue templates pass the auto-close workflow
+        run: python3 -m unittest discover -s scripts -p test_issue_templates.py
+
       - name: Lint with Clippy
         run: cargo clippy --all --all-features --locked -- -D warnings
 
