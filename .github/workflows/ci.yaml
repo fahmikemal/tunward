@@ -87,6 +87,10 @@ jobs:
       - name: Check that every Rust toolchain pin matches rust-toolchain.toml
         run: python3 scripts/check_toolchain_pins.py
 
+      # Before Clippy, whose failure for this case is an opaque syn::File trait error inside bindgen.
+      - name: Check that locked crates share prettyplease's syn version
+        run: python3 scripts/check_prettyplease_syn.py
+
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 
@@ -98,6 +102,7 @@ jobs:
           python3 -m unittest discover -s scripts -p 'test_check_release*.py'
           python3 -m unittest discover -s scripts -p test_package_release.py
           python3 -m unittest discover -s scripts -p test_check_toolchain_pins.py
+          python3 -m unittest discover -s scripts -p test_check_prettyplease_syn.py
 
       - name: Verify issue templates pass the auto-close workflow
         run: python3 -m unittest discover -s scripts -p test_issue_templates.py
