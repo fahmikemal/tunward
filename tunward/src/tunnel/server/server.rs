@@ -531,6 +531,7 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                         listening_server,
                         fleet.cloned(),
                         (quota.cloned(), revocation.clone()),
+                        |_| false,
                     )
                     .await?;
 
@@ -558,6 +559,7 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                         listening_server,
                         fleet.cloned(),
                         (quota.cloned(), revocation.clone()),
+                        UdpDownstreamListener::serves_peers,
                     )
                     .await?;
                 Ok((remote, Box::pin(local_rx), Box::pin(local_tx)))
@@ -584,6 +586,7 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                         listening_server,
                         fleet.cloned(),
                         (quota.cloned(), revocation.clone()),
+                        |_| false,
                     )
                     .await?;
 
@@ -619,6 +622,7 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                         listening_server,
                         fleet.cloned(),
                         (quota.cloned(), revocation.clone()),
+                        |_| false,
                     )
                     .await?;
 
@@ -651,6 +655,7 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                         listening_server,
                         fleet.cloned(),
                         (quota.cloned(), revocation.clone()),
+                        |_| false,
                     )
                     .await?;
 
