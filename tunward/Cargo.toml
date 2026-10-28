@@ -82,7 +82,7 @@ tokio = { version = "1.53.1", features = ["test-util", "rt-multi-thread", "macro
 testcontainers = "0.28.0"
 test-case = "3.3.1"
 collection_macros = "0.2.0"
-rstest = "0.27.0"
+rstest = "0.28.0"
 serial_test = "4.0.1"
 derive_more = { version = "2.1.1", features = ["from"] }
 if-addrs = "0.15.0"
