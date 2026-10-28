@@ -182,8 +182,7 @@ impl<E: TokioExecutorRef> Client<E> {
                 attempt = attempt.saturating_add(1);
                 let ceiling = exp_secs.min(max_secs);
                 let jittered = if ceiling > 0.5 {
-                    use rand::Rng;
-                    rand::thread_rng().gen_range(0.5..=ceiling)
+                    rand::random_range(0.5..=ceiling)
                 } else {
                     ceiling
                 };
