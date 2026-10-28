@@ -93,8 +93,9 @@ Cancellation is sticky for old sessions, including work that had not started
 waiting yet; restoring access permits new sessions without reviving old work.
 
 Unknown fields, unsupported versions, empty CNs, invalid fingerprints, more than
-10000 entries, and files larger than 1 MiB are rejected. Empty lists are valid
-and impose no extra denial. Removal of a denial is an explicit access-restoring
+10000 entries, and files larger than 1 MiB are rejected. Empty lists (`[]`) are
+valid and impose no extra denial; a list key left blank is rejected, so a
+truncated file cannot lift every denial. Removal of a denial is an explicit access-restoring
 operation. On restart the configured file is read again; there is no separate
 in-memory revocation history or rollback protection for policy versions.
 

@@ -15,6 +15,7 @@ mod tenants;
 #[cfg(test)]
 mod test_integrations;
 pub mod tunnel;
+mod yaml;
 pub use server_config::check_server_config;
 
 pub use management::{

@@ -140,7 +140,7 @@ impl TenantPolicy {
     }
 
     fn parse(bytes: &[u8], restrictions: &RestrictionsRules) -> anyhow::Result<Self> {
-        let file: PolicyFile = serde_yaml::from_slice(bytes)?;
+        let file: PolicyFile = crate::yaml::from_slice(bytes)?;
         ensure!(file.version == 1, "unsupported tenant policy version; expected 1");
         ensure!(
             file.devices.len() <= 10000 && file.roles.len() <= 1000 && file.tenants.len() <= 1000,
@@ -372,7 +372,7 @@ impl TenantAccess {
 mod tests {
     use super::*;
     fn restrictions() -> RestrictionsRules {
-        serde_yaml::from_str("restrictions:\n - name: alpha\n   match: [Any]\n   allow: []\n - name: beta\n   match: [Any]\n   allow: []").unwrap()
+        crate::yaml::from_slice(b"restrictions:\n - name: alpha\n   match: [Any]\n   allow: []\n - name: beta\n   match: [Any]\n   allow: []").unwrap()
     }
     const POLICY: &str = "version: 1\nroles: {reader: [forward_tcp], agent: [reverse_tcp]}\ntenants:\n alpha:\n  restrictions: [alpha]\n  reverse_bindings: [{address: 127.0.0.1, ports: ['20000..20031'], allow_ephemeral: true}]\n beta:\n  restrictions: [beta]\n  reverse_bindings: [{address: 127.0.0.1, ports: ['21000..21031']}]\ndevices:\n a: {tenant: alpha, roles: [reader]}\n b: {tenant: beta, roles: [agent]}\n";
 

@@ -32,14 +32,17 @@ pub enum MatchConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[cfg_attr(test, derive(derive_more::From))]
 pub enum AllowConfig {
+    // A bare `!Tunnel` would otherwise read as `!Tunnel {}`, which allows every destination.
+    #[serde(deserialize_with = "crate::yaml::required")]
     ReverseTunnel(AllowReverseTunnelConfig),
+    #[serde(deserialize_with = "crate::yaml::required")]
     Tunnel(AllowTunnelConfig),
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AllowTunnelConfig {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::yaml::required")]
     pub protocol: Vec<TunnelProtocol>,
 
     #[serde(deserialize_with = "deserialize_port_range")]
@@ -57,7 +60,7 @@ pub struct AllowTunnelConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AllowReverseTunnelConfig {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::yaml::required")]
     pub protocol: Vec<ReverseTunnelProtocol>,
 
     #[serde(deserialize_with = "deserialize_port_range")]
@@ -105,7 +108,7 @@ fn deserialize_port_range<'de, D>(deserializer: D) -> Result<Vec<RangeInclusive<
 where
     D: Deserializer<'de>,
 {
-    let s = Vec::<String>::deserialize(deserializer)?;
+    let s: Vec<String> = crate::yaml::required(deserializer)?;
     let ranges = s
         .into_iter()
         .map(|s| {

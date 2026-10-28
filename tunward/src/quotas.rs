@@ -24,6 +24,7 @@ pub struct DeviceQuotaConfig {
     pub version: u32,
     #[serde(default = "default_tracked_devices")]
     pub max_tracked_devices: NonZeroU32,
+    #[serde(deserialize_with = "crate::yaml::required")]
     pub default: DeviceQuotaLimits,
     #[serde(default)]
     pub devices: HashMap<String, DeviceQuotaLimits>,
@@ -110,7 +111,7 @@ impl DeviceQuotaConfig {
     pub fn from_path(path: &Path) -> anyhow::Result<Self> {
         let file =
             std::fs::File::open(path).with_context(|| format!("Cannot open device quota config {}", path.display()))?;
-        let config: Self = serde_yaml::from_reader(file).context("Invalid device quota YAML")?;
+        let config: Self = crate::yaml::from_reader(file).context("Invalid device quota YAML")?;
         config.validate()?;
         Ok(config)
     }
@@ -531,7 +532,7 @@ mod tests {
     use std::future::poll_fn;
 
     fn config(yaml: &str) -> DeviceQuotaConfig {
-        let config: DeviceQuotaConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: DeviceQuotaConfig = crate::yaml::from_slice(yaml.as_bytes()).unwrap();
         config.validate().unwrap();
         config
     }
@@ -753,8 +754,10 @@ mod tests {
             "version: 1\ndefault: {max_tunels: 1}",
             "version: 1\ndefault: {max_sessions: 0}",
             "version: 1\ndefault: {upload_bytes_per_second: 0}",
+            // A blank default would read as `{}`, leaving unlisted devices without limits.
+            "version: 1\ndefault:\ndevices: {a: {max_sessions: 1}}",
         ] {
-            assert!(serde_yaml::from_str::<DeviceQuotaConfig>(yaml).is_err());
+            assert!(crate::yaml::from_slice::<DeviceQuotaConfig>(yaml.as_bytes()).is_err());
         }
         for yaml in [
             "version: 2\ndefault: {}",
@@ -764,7 +767,7 @@ mod tests {
             "version: 1\ndefault: {upload_bytes_per_second: 1, bandwidth_burst_bytes: 65535}",
         ] {
             assert!(
-                serde_yaml::from_str::<DeviceQuotaConfig>(yaml)
+                crate::yaml::from_slice::<DeviceQuotaConfig>(yaml.as_bytes())
                     .unwrap()
                     .validate()
                     .is_err()

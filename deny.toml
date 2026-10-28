@@ -6,12 +6,8 @@
 all-features = true
 
 [advisories]
-# Unmaintained crates are reported anywhere in the graph, so each one is either replaced or listed
-# below with a reason. Yanked releases are refused.
+# Unmaintained crates are reported anywhere in the graph and fail the check. Yanked releases are refused.
 yanked = "deny"
-ignore = [
-  { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml comes from serde_yaml, which parses the policy files; replacing that parser is a separate, tested migration" },
-]
 
 [licenses]
 # Permissive licenses actually present in the graph. Copyleft terms such as LGPL-2.1-or-later only

@@ -390,7 +390,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn bandwidth_wait_preserves_full_datagram_writes() {
-        let config = serde_yaml::from_str("version: 1\ndefault: {upload_bytes_per_second: 65536}").unwrap();
+        let config = crate::yaml::from_slice(b"version: 1\ndefault: {upload_bytes_per_second: 65536}").unwrap();
         let manager = crate::quotas::QuotaManager::new(config);
         let permit = manager.open_session("device").unwrap().open_tunnel().unwrap();
         let mut decoder = RecordDecoder::with_bandwidth(Packets::default(), permit.upload());
@@ -430,7 +430,7 @@ mod tests {
                 Poll::Ready(Ok(()))
             }
         }
-        let config = serde_yaml::from_str("version: 1\ndefault: {upload_bytes_per_second: 65536}").unwrap();
+        let config = crate::yaml::from_slice(b"version: 1\ndefault: {upload_bytes_per_second: 65536}").unwrap();
         let manager = crate::quotas::QuotaManager::new(config);
         let permit = manager.open_session("a").unwrap().open_tunnel().unwrap();
         let mut decoder = RecordDecoder::with_bandwidth(
