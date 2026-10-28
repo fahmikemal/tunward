@@ -12,7 +12,7 @@ use url::Host;
 // `run_server` yields these concrete types, so they can be named for a direct impl (a non-auto
 // trait like `TunnelConnectorWrite` does not leak through an `impl AsyncWrite` return type).
 #[cfg(unix)]
-impl DownstreamWrite for tokio_fd::AsyncFd {}
+impl DownstreamWrite for crate::protocols::stdio::StdioFd {}
 #[cfg(not(unix))]
 impl DownstreamWrite for tokio::io::DuplexStream {}
 

@@ -4,6 +4,6 @@ mod server_unix;
 mod server_windows;
 
 #[cfg(unix)]
-pub use server_unix::run_server;
+pub use server_unix::{StdioFd, run_server};
 #[cfg(not(unix))]
 pub use server_windows::run_server;

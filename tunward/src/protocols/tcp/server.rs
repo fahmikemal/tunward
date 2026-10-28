@@ -296,7 +296,7 @@ mod tests {
         let (network_name, host) = if cfg!(not(target_os = "macos")) {
             ("host", "127.0.0.1".parse::<IpAddr>().unwrap())
         } else {
-            let host = get_if_addrs::get_if_addrs()
+            let host = if_addrs::get_if_addrs()
                 .unwrap()
                 .into_iter()
                 .map(|iface| iface.addr.ip())
