@@ -88,15 +88,18 @@ WebTransport enable `--enable-webtransport` on a `wss://` server, or use
 
 ## Application identity and path binding
 
-With mTLS enabled, the server requires exactly one nonempty, readable Common
-Name on the verified client leaf certificate. WSS, HTTP/2, and WebTransport bind
-that CN to the requested path prefix. A trusted certificate with missing or
-ambiguous CN is rejected. SAN-only client identity is not implemented.
+With mTLS enabled, Tunward binds verified client certificate identities to the
+requested HTTP upgrade path prefix across WSS, HTTP/2, and WebTransport.
 
-The client normally derives its path from the certificate CN. Explicit `-P`
-must agree with that identity; the examples set it to make the relationship
-visible. The implementation treats the default prefix value `v1` as the
-signal to derive CN, even if that value is explicitly supplied.
+By default, the server and client inspect the certificate Common Name (`--tls-client-identity-field cn`).
+For modern PKI environments (e.g. SPIFFE, service meshes, or enterprise MDM profiles where CN is deprecated),
+operators can configure `--tls-client-identity-field`:
+
+- `--tls-client-identity-field cn` (Default): Requires exactly one nonempty Common Name on the verified leaf certificate.
+- `--tls-client-identity-field san-uri`: Requires exactly one Subject Alternative Name URI (e.g., SPIFFE ID `spiffe://example.org/ns/prod/sa/device-01` or URN `urn:uuid:...`).
+- `--tls-client-identity-field san-dns`: Requires exactly one Subject Alternative Name DNS Name (e.g., `device-01.corp.internal`).
+
+The client automatically derives its HTTP upgrade path prefix from the verified leaf certificate using the configured `--tls-client-identity-field`. Explicit `-P` must agree with that identity; the implementation treats the default prefix value `v1` as the signal to auto-derive identity from the leaf certificate.
 
 This is application authorization, separate from TLS server name validation.
 Server DNS/IP verification uses SANs. A `--client-id` or `--device-id` value
@@ -129,6 +132,25 @@ restrictions:
         port: ["0", "9000"]
         cidr: [127.0.0.1/32]
 ~~~
+
+A `!Tunnel` rule matches a literal IP destination against `cidr`. A domain
+destination must match `host`, and when `cidr` constrains addresses (anything
+except an empty list or one covering both `0.0.0.0/0` and `::/0`), the server
+also resolves the domain and allows it only at its resolved addresses inside
+`cidr`. It then connects to those checked addresses without resolving again, so
+a DNS answer that changes in between cannot redirect the tunnel. Omitting `host`
+keeps the default `^.*$`: a rule listing only `cidr` admits any name that
+resolves into it, and nothing else. `cidr: []` authorizes names by `host` alone,
+as `--restrict-to HOST:PORT` does. IPv4-mapped IPv6 addresses such as
+`::ffff:10.0.0.1` are matched as their IPv4 address, for forward and reverse
+rules. A domain that cannot be resolved does not match a constraining rule. With
+the server's `--http-proxy`, a checked domain is sent to the proxy as its first
+allowed address.
+
+Earlier builds allowed a domain matching `host` whatever it resolved to, even
+when `cidr` excluded that address. If a rule relied on that, list the
+destination's addresses in `cidr`, or authorize the name explicitly with a
+`host` pattern and `cidr: []`.
 
 Use `--restrict-config /path/to/your-restrictions.yaml` instead of
 `--restrict-to` in the server example. Then a client can use

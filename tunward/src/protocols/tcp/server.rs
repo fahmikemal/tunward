@@ -6,7 +6,7 @@ use base64::Engine;
 use bytes::BytesMut;
 use log::warn;
 use socket2::{SockRef, TcpKeepalive};
-use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use crate::protocols::dns::DnsResolver;
 use crate::somark::SoMark;
@@ -65,6 +65,29 @@ pub async fn connect(
         Host::Ipv6(ip) => vec![SocketAddr::V6(SocketAddrV6::new(*ip, port, 0, 0))],
     };
 
+    connect_socket_addrs(host, port, socket_addrs, so_mark, connect_timeout).await
+}
+
+/// Connect to `host:port` at the given addresses only, without resolving `host` again.
+pub async fn connect_to_addresses(
+    host: &Host<String>,
+    port: u16,
+    addresses: &[IpAddr],
+    so_mark: SoMark,
+    connect_timeout: Duration,
+) -> Result<TcpStream, anyhow::Error> {
+    info!("Opening TCP connection to {host}:{port} at {addresses:?}");
+    let socket_addrs = addresses.iter().map(|ip| SocketAddr::new(*ip, port)).collect();
+    connect_socket_addrs(host, port, socket_addrs, so_mark, connect_timeout).await
+}
+
+async fn connect_socket_addrs(
+    host: &Host<String>,
+    port: u16,
+    socket_addrs: Vec<SocketAddr>,
+    so_mark: SoMark,
+    connect_timeout: Duration,
+) -> Result<TcpStream, anyhow::Error> {
     let mut cnx = None;
     let mut last_err = None;
     let mut join_set = JoinSet::new();

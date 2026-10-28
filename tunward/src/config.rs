@@ -1,13 +1,64 @@
 use crate::tunnel::LocalProtocol;
 pub use hyper::http::{HeaderName, HeaderValue};
+use serde::{Deserialize, Serialize};
+use std::fmt::{self, Display, Formatter};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::time::Duration;
 use tokio_rustls::rustls::pki_types::DnsName;
 use url::{Host, Url};
 
 pub const DEFAULT_CLIENT_UPGRADE_PATH_PREFIX: &str = "v1";
 
+/// Identifies which field of the client certificate to extract as the client's verified identity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[serde(rename_all = "kebab-case")]
+pub enum ClientIdentityField {
+    /// Extract the certificate subject Common Name (CN).
+    #[default]
+    #[cfg_attr(feature = "clap", value(name = "cn"))]
+    Cn,
+    /// Extract the Subject Alternative Name Uniform Resource Identifier (SAN URI / SPIFFE ID).
+    #[cfg_attr(feature = "clap", value(name = "san-uri"))]
+    SanUri,
+    /// Extract the Subject Alternative Name DNS Name (SAN DNS).
+    #[cfg_attr(feature = "clap", value(name = "san-dns"))]
+    SanDns,
+}
+
+impl ClientIdentityField {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cn => "cn",
+            Self::SanUri => "san-uri",
+            Self::SanDns => "san-dns",
+        }
+    }
+}
+
+impl Display for ClientIdentityField {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ClientIdentityField {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "cn" => Ok(Self::Cn),
+            "san-uri" => Ok(Self::SanUri),
+            "san-dns" => Ok(Self::SanDns),
+            other => anyhow::bail!("unknown client identity field: '{other}'. Expected one of: cn, san-uri, san-dns"),
+        }
+    }
+}
+
+// Field docs double as the CLI help text, so bracketed examples such as `[::1]` and bare URLs stay as written.
+#[allow(rustdoc::broken_intra_doc_links, rustdoc::bare_urls)]
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "clap", derive(clap::Args))]
 pub struct ClientCreationRequest {
@@ -229,6 +280,20 @@ pub struct ClientCreationRequest {
     #[cfg_attr(feature = "clap", arg(long, value_name = "FILE_PATH", verbatim_doc_comment))]
     pub tls_private_key: Option<PathBuf>,
 
+    /// [Optional] Field in the client certificate used to identify the client during mTLS authentication.
+    /// Choices: cn, san-uri, san-dns. Default is cn.
+    #[cfg_attr(
+        feature = "clap",
+        arg(
+            long,
+            value_name = "FIELD",
+            default_value = "cn",
+            env = "TUNWARD_TLS_CLIENT_IDENTITY_FIELD",
+            verbatim_doc_comment
+        )
+    )]
+    pub tls_client_identity_field: ClientIdentityField,
+
     /// Dns resolver to use to lookup ips of domain name. Can be specified multiple time
     /// Example:
     ///  dns://1.1.1.1 for using udp
@@ -265,6 +330,8 @@ pub struct ClientCreationRequest {
     pub client_id: Option<String>,
 }
 
+// Field docs double as the CLI help text, so bracketed notes such as `[Optional]` and bare URLs stay as written.
+#[allow(rustdoc::broken_intra_doc_links, rustdoc::bare_urls)]
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "clap", derive(clap::Args))]
 pub struct ServerCreationRequest {
@@ -382,6 +449,50 @@ pub struct ServerCreationRequest {
     #[cfg_attr(feature = "clap", arg(long, value_name = "FILE_PATH", verbatim_doc_comment))]
     pub tls_client_ca_certs: Option<PathBuf>,
 
+    /// [Optional] Field in the client certificate used to identify the client during mTLS authentication.
+    /// Choices: cn, san-uri, san-dns. Default is cn.
+    #[cfg_attr(
+        feature = "clap",
+        arg(
+            long,
+            value_name = "FIELD",
+            default_value = "cn",
+            env = "TUNWARD_TLS_CLIENT_IDENTITY_FIELD",
+            verbatim_doc_comment
+        )
+    )]
+    pub tls_client_identity_field: ClientIdentityField,
+
+    /// Close a TLS connection whose handshake has not completed within this delay.
+    /// Until then the peer is unauthenticated, as its client certificate is only verified during
+    /// the handshake. A WebTransport connection must also send its session request in that time.
+    /// Must be greater than zero.
+    #[cfg_attr(feature = "clap", arg(
+        long,
+        value_name = "DURATION(s|m|h)",
+        default_value = "10s",
+        value_parser = parsers::parse_duration_sec,
+        env = "TUNWARD_TLS_HANDSHAKE_TIMEOUT",
+        verbatim_doc_comment
+    ))]
+    pub tls_handshake_timeout: Duration,
+
+    /// Maximum TLS handshakes in progress at once, for the TCP listener and separately for the
+    /// WebTransport listener. Further connections are closed (WebTransport: refused) as soon as they
+    /// arrive, until a pending handshake completes or times out, so peers that never authenticate
+    /// cannot exhaust file descriptors or memory. Established sessions do not count.
+    #[cfg_attr(
+        feature = "clap",
+        arg(
+            long,
+            value_name = "N",
+            default_value = "1024",
+            env = "TUNWARD_MAX_PENDING_TLS_HANDSHAKES",
+            verbatim_doc_comment
+        )
+    )]
+    pub max_pending_tls_handshakes: std::num::NonZeroU32,
+
     /// If set, will use this http proxy to connect to the client
     #[cfg_attr(
         feature = "clap",
@@ -443,10 +554,23 @@ pub struct ServerCreationRequest {
             long,
             value_name = "FILE",
             requires = "tls_client_ca_certs",
+            conflicts_with = "no_device_quotas",
             env = "TUNWARD_DEVICE_QUOTA_CONFIG"
         )
     )]
     pub device_quota_config: Option<PathBuf>,
+
+    /// Explicitly disable default device quota limits.
+    #[cfg_attr(
+        feature = "clap",
+        arg(
+            long,
+            default_value = "false",
+            conflicts_with = "device_quota_config",
+            env = "TUNWARD_NO_DEVICE_QUOTAS"
+        )
+    )]
+    pub no_device_quotas: bool,
 
     /// Live revocation YAML for verified mTLS device CNs or leaf-certificate SHA-256 fingerprints.
     /// Reloaded every second; unreadable/invalid policy closes sessions and denies access until recovery.
@@ -483,6 +607,19 @@ pub struct ServerCreationRequest {
     /// Startup tenant membership, role permissions, and reverse resource reservations. Requires mTLS and named restriction rules.
     #[cfg_attr(feature = "clap", arg(long, value_name = "FILE", requires_all = ["tls_client_ca_certs", "restrict_config"], env = "TUNWARD_TENANT_CONFIG"))]
     pub tenant_config: Option<PathBuf>,
+
+    /// Explicit exception permitting unauthenticated, cleartext, or non-loopback listeners for local development.
+    /// Emits a high-visibility security warning at startup. Does not relax loopback restriction on --management-api.
+    #[cfg_attr(
+        feature = "clap",
+        arg(
+            long,
+            default_value = "false",
+            verbatim_doc_comment,
+            env = "TUNWARD_ALLOW_INSECURE_DEV"
+        )
+    )]
+    pub allow_insecure_dev: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -892,6 +1029,32 @@ mod parsers {
         ; "with full ipv6 tunnel")]
         fn test_parse_tunnel_arg(input: &str) -> LocalToRemote {
             parse_tunnel_arg(input).unwrap()
+        }
+
+        #[test]
+        fn test_client_identity_field_parsing_and_display() {
+            use crate::config::ClientIdentityField;
+            use std::str::FromStr;
+
+            assert_eq!(ClientIdentityField::from_str("cn").unwrap(), ClientIdentityField::Cn);
+            assert_eq!(ClientIdentityField::from_str("CN").unwrap(), ClientIdentityField::Cn);
+            assert_eq!(ClientIdentityField::from_str("san-uri").unwrap(), ClientIdentityField::SanUri);
+            assert_eq!(ClientIdentityField::from_str("SAN-URI").unwrap(), ClientIdentityField::SanUri);
+            assert_eq!(ClientIdentityField::from_str("san-dns").unwrap(), ClientIdentityField::SanDns);
+            assert_eq!(ClientIdentityField::from_str("San-Dns").unwrap(), ClientIdentityField::SanDns);
+
+            assert!(ClientIdentityField::from_str("email").is_err());
+            assert!(ClientIdentityField::from_str("unknown").is_err());
+
+            assert_eq!(ClientIdentityField::Cn.to_string(), "cn");
+            assert_eq!(ClientIdentityField::SanUri.to_string(), "san-uri");
+            assert_eq!(ClientIdentityField::SanDns.to_string(), "san-dns");
+
+            // Serde roundtrip
+            let json = serde_json::to_string(&ClientIdentityField::SanUri).unwrap();
+            assert_eq!(json, "\"san-uri\"");
+            let decoded: ClientIdentityField = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, ClientIdentityField::SanUri);
         }
     }
 }

@@ -1,5 +1,6 @@
 use super::server::{ConnectionContext, EstablishedTunnel};
 use crate::executor::TokioExecutorRef;
+use crate::protocols::tcp::LogLimiter;
 use crate::protocols::tls;
 use crate::restrictions::types::RestrictionsRules;
 use crate::tunnel::server::Server;
@@ -17,6 +18,8 @@ use hyper::{Request, StatusCode};
 use std::any::Any;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Semaphore;
 use tokio_rustls::rustls::pki_types::CertificateDer;
 use tracing::{Instrument, Level, Span, debug, error, info, span, warn};
 use uuid::Uuid;
@@ -42,7 +45,6 @@ pub(super) async fn run_webtransport_server(
     if let Some(state) = &server.managed {
         state.register_endpoint(endpoint.clone());
     }
-    let mut endpoint = web_transport_quinn::Server::new(endpoint);
     let tls_reloader = if server.managed.is_some() {
         None
     } else {
@@ -56,11 +58,18 @@ pub(super) async fn run_webtransport_server(
     let mut reload_tick = tokio::time::interval(std::time::Duration::from_secs(1));
     reload_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // The QUIC and HTTP/3 handshakes are driven here instead of by web_transport_quinn::Server, which
+    // keeps every one pending with neither a deadline nor a bound: server keep-alives would hold a peer
+    // that completes QUIC but never sends its CONNECT forever. A connection stays pending, and counts
+    // against the same limits as the TCP listener, until that CONNECT request arrives.
+    let pending_handshakes = Arc::new(Semaphore::new(server.config.max_pending_tls_handshakes.get() as usize));
+    let refused_log = LogLimiter::new(Duration::from_secs(10));
+    let timeout_log = Arc::new(LogLimiter::new(Duration::from_secs(10)));
     loop {
-        let request = tokio::select! {
+        let incoming = tokio::select! {
             _ = reload_tick.tick() => {
-                // accept() waits for a successful TLS/H3 handshake. A new trust anchor must
-                // be installed even when every pending handshake rejects the old certificate.
+                // Handshakes may all fail with the old certificate, so do not wait for one to
+                // succeed before installing a new trust anchor.
                 if tls_reloader.as_ref().is_some_and(TlsReloader::should_reload_certificate) {
                     match mk_quic_server_config(&server, tls_config) {
                         Ok(config) => endpoint.set_server_config(Some(config)),
@@ -69,21 +78,56 @@ pub(super) async fn run_webtransport_server(
                 }
                 continue;
             }
-            request = endpoint.accept() => request,
+            incoming = endpoint.accept() => incoming,
         };
-        let Some(request) = request else {
+        let Some(incoming) = incoming else {
             warn!("webtransport endpoint closed, stopping to accept connections");
             return Ok(());
         };
 
-        let peer_addr = request.conn().remote_address();
+        let peer_addr = incoming.remote_address();
+        let Ok(handshake_permit) = pending_handshakes.clone().try_acquire_owned() else {
+            if let Some(suppressed) = refused_log.check() {
+                warn!(
+                    suppressed,
+                    "Refusing webtransport connection from {peer_addr}: {} handshakes already pending (--max-pending-tls-handshakes)",
+                    server.config.max_pending_tls_handshakes
+                );
+            }
+            incoming.refuse();
+            continue;
+        };
         let span = span!(Level::INFO, "cnx", peer = peer_addr.to_string());
         info!(parent: &span, "Accepting webtransport connection");
 
         let session_handler = {
             let server = server.clone();
             let restrictions = restrictions.clone();
+            let timeout_log = timeout_log.clone();
             async move {
+                let handshake_timeout = server.config.tls_handshake_timeout;
+                let handshake = async {
+                    let connection = incoming.accept()?.await?;
+                    anyhow::Ok(web_transport_quinn::Request::accept(connection).await?)
+                };
+                // On a timeout, dropping the handshake drops the connection, which closes it.
+                let request = match tokio::time::timeout(handshake_timeout, handshake).await {
+                    Ok(Ok(request)) => request,
+                    Ok(Err(err)) => {
+                        debug!("Webtransport handshake failed: {err:#}");
+                        return;
+                    }
+                    Err(_) => {
+                        if let Some(suppressed) = timeout_log.check() {
+                            warn!(
+                                suppressed,
+                                "Closing webtransport connection whose QUIC/HTTP3 handshake did not complete within {handshake_timeout:?} (--tls-handshake-timeout)"
+                            );
+                        }
+                        return;
+                    }
+                };
+                drop(handshake_permit);
                 if let Err(err) = handle_session(server, restrictions, request).await {
                     warn!("{err:?}");
                 }
@@ -153,6 +197,7 @@ async fn handle_session(
     let restrict_path = match tls::client_path_from_certificate(
         peer_certificates.as_deref().map(|certs| certs.as_slice()),
         identity_required,
+        server.config.tls_client_identity_field,
     ) {
         Ok(identity) => identity,
         Err(err) => {

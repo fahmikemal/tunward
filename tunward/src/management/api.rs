@@ -1,4 +1,5 @@
 use crate::management::registry::FleetRegistry;
+use crate::protocols::tcp::AcceptBackoff;
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::body::Incoming;
@@ -21,11 +22,15 @@ pub async fn run_management_server(bind_addr: SocketAddr, registry: FleetRegistr
 
     let auto_server = auto::Builder::new(TokioExecutor::new());
 
+    let mut accept_backoff = AcceptBackoff::new("Management API accept error");
     loop {
         let (stream, _remote_peer) = match listener.accept().await {
-            Ok(val) => val,
+            Ok(val) => {
+                accept_backoff.reset();
+                val
+            }
             Err(err) => {
-                error!("Management API accept error: {err}");
+                accept_backoff.wait(&err).await;
                 continue;
             }
         };
@@ -61,6 +66,48 @@ async fn handle_request<B: hyper::body::Body>(req: Request<B>, registry: FleetRe
             };
             let json = serde_json::to_vec(&health).unwrap_or_default();
             json_response(status, json)
+        }
+        (&Method::GET, "/metrics") => {
+            let health = registry.health();
+            let metrics = format!(
+                "# HELP tunward_health_status 1 if server is healthy, 0 otherwise\n\
+                 # TYPE tunward_health_status gauge\n\
+                 tunward_health_status {}\n\
+                 # HELP tunward_uptime_seconds Total server uptime in seconds\n\
+                 # TYPE tunward_uptime_seconds counter\n\
+                 tunward_uptime_seconds {}\n\
+                 # HELP tunward_active_clients Current number of active clients\n\
+                 # TYPE tunward_active_clients gauge\n\
+                 tunward_active_clients {}\n\
+                 # HELP tunward_active_sessions Current number of active authenticated sessions\n\
+                 # TYPE tunward_active_sessions gauge\n\
+                 tunward_active_sessions {}\n\
+                 # HELP tunward_active_connections Current number of active network connections\n\
+                 # TYPE tunward_active_connections gauge\n\
+                 tunward_active_connections {}\n\
+                 # HELP tunward_active_tunnels Current number of active forwarded or reverse tunnels\n\
+                 # TYPE tunward_active_tunnels gauge\n\
+                 tunward_active_tunnels {}\n\
+                 # HELP tunward_active_devices Current number of distinct active verified devices\n\
+                 # TYPE tunward_active_devices gauge\n\
+                 tunward_active_devices {}\n\
+                 # HELP tunward_inventory_healthy 1 if inventory database is healthy, 0 otherwise\n\
+                 # TYPE tunward_inventory_healthy gauge\n\
+                 tunward_inventory_healthy {}\n\
+                 # HELP tunward_build_info Build and version metadata\n\
+                 # TYPE tunward_build_info gauge\n\
+                 tunward_build_info{{version=\"{}\"}} 1\n",
+                if health.status == "healthy" { 1 } else { 0 },
+                health.uptime_seconds,
+                health.active_clients,
+                health.active_sessions,
+                health.active_connections,
+                health.active_tunnels,
+                health.active_devices,
+                if health.inventory_healthy.unwrap_or(true) { 1 } else { 0 },
+                health.version,
+            );
+            plain_response(StatusCode::OK, "text/plain; version=0.0.4; charset=utf-8", metrics.into_bytes())
         }
         (&Method::GET, "/api/v1/clients") => {
             let clients = registry.list_clients();
@@ -157,10 +204,19 @@ fn json_response(status: StatusCode, body: Vec<u8>) -> Response<Full<Bytes>> {
         .unwrap()
 }
 
+fn plain_response(status: StatusCode, content_type: &'static str, body: Vec<u8>) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .header(hyper::header::CONTENT_TYPE, content_type)
+        .header(hyper::header::CACHE_CONTROL, "no-store")
+        .body(Full::new(Bytes::from(body)))
+        .unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http_body_util::Empty;
+    use http_body_util::{BodyExt, Empty};
 
     #[tokio::test]
     async fn test_management_api_routes() {
@@ -172,6 +228,21 @@ mod tests {
         let req = Request::builder().uri("/healthz").body(Empty::<Bytes>::new()).unwrap();
         let resp = handle_request(req, registry.clone()).await;
         assert_eq!(resp.status(), StatusCode::OK);
+
+        // Test GET /metrics (Prometheus format)
+        let req = Request::builder().uri("/metrics").body(Empty::<Bytes>::new()).unwrap();
+        let resp = handle_request(req, registry.clone()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(hyper::header::CONTENT_TYPE).unwrap(),
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("tunward_health_status 1"));
+        assert!(body_str.contains("tunward_active_clients 1"));
+        assert!(body_str.contains("tunward_uptime_seconds"));
+        assert!(body_str.contains("tunward_build_info{version="));
 
         // Test GET /api/v1/clients
         let req = Request::builder()

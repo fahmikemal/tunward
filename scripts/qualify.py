@@ -97,7 +97,16 @@ class Suite:
         temporary.replace(self.out / "results.json")
         print(json.dumps(row), flush=True)
 
-    async def spawn(self, label, *args, pipe=False, extra_env=None, log_level="WARN", workers=1):
+    async def spawn(self, label, *args, pipe=False, extra_env=None, log_level="WARN", workers=1, preexec_fn=None):
+        if args[0] == "server":
+            is_deny_test = "--deny-by-default-test" in args
+            args = tuple(a for a in args if a != "--deny-by-default-test")
+            if (
+                not is_deny_test
+                and not any(str(a).startswith(("--restrict-config", "--restrict-to")) for a in args)
+                and getattr(self, "policy", None) is not None
+            ):
+                args = (args[0], "--restrict-config", str(self.policy)) + args[1:]
         if args[0] == "client" and any(str(a).startswith(("wss://", "https://", "wts://")) for a in args) and not any(str(a).startswith("--tls-verify-certificate") for a in args):
             args += ("--tls-verify-certificate=false",)
         env = {k: v for k, v in os.environ.items() if k not in
@@ -110,7 +119,8 @@ class Suite:
             proc = await asyncio.create_subprocess_exec(
                 str(self.binary), *args, "--nb-worker-threads", str(workers), "--log-lvl", log_level,
                 env=env, stdin=asyncio.subprocess.PIPE if pipe else asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE if pipe else log, stderr=log, start_new_session=True)
+                stdout=asyncio.subprocess.PIPE if pipe else log, stderr=log, start_new_session=True,
+                preexec_fn=preexec_fn)
         finally:
             log.close()
         self.processes.append(proc)
@@ -430,6 +440,27 @@ class Suite:
             await self.check("security/restriction-allowed-control", lambda: restriction("allow", self.echo_port, "qualification-secret", True))
             await self.check("security/restriction-denied-target", lambda: restriction("target", self.other_echo_port, "qualification-secret", False))
             await self.check("security/restriction-denied-path", lambda: restriction("path", self.echo_port, "wrong", False))
+
+            # Priority 3: Deny tunnel access without an explicit policy (even with --allow-insecure-dev)
+            bare_sp = port()
+            bare_server = await self.spawn("security-deny-default-server", "server", f"ws://127.0.0.1:{bare_sp}",
+                                           "--allow-insecure-dev", "--deny-by-default-test")
+            await self.ready(bare_sp, bare_server)
+            async def test_denied_without_policy():
+                dp = port()
+                c = await self.spawn("security-deny-client", "client", "-L", f"tcp://127.0.0.1:{dp}:127.0.0.1:{self.echo_port}",
+                                     "--connection-retry-max-backoff", "1s", f"ws://127.0.0.1:{bare_sp}")
+                clients.append(c)
+                await self.ready(dp, c)
+                try:
+                    await asyncio.wait_for(self.exchange("tcp", dp), 2)
+                    success = True
+                except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError):
+                    success = False
+                assert not success, "Expected tunnel connection to be rejected when no restriction policy is configured"
+                return {"denied": not success}
+            await self.check("security/deny-without-explicit-policy", test_denied_without_policy)
+            await self.stop(bare_server)
 
             async def malformed():
                 payloads = [b"not-http\r\n\r\n", b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n", b"GET / HTTP/1.1\r\nBad Header: x\r\n\r\n"]
@@ -1118,6 +1149,20 @@ class Suite:
         self.other_echo_port = other.sockets[0].getsockname()[1]
         udp, _ = await asyncio.get_running_loop().create_datagram_endpoint(EchoUDP, local_addr=("127.0.0.1", 0))
         self.udp_port = udp.get_extra_info("sockname")[1]
+        self.policy = self.out / "qualification-restrictions.yaml"
+        self.policy.write_text(f"""restrictions:
+  - name: Qualification suite policy
+    match: [Any]
+    allow:
+      # Sections bind more targets on ephemeral ports after this file is written (HTTP proxy
+      # origins, half-close peers), so the policy confines the address rather than the port.
+      - !Tunnel
+        protocol: [Tcp, Udp]
+        cidr: [127.0.0.1/32]
+      - !ReverseTunnel
+        protocol: [Tcp, Udp, Socks5, HttpProxy, Unix]
+        cidr: [127.0.0.1/32]
+""")
         binary = self.binary
         metadata = {"started_at": time.strftime('%Y-%m-%dT%H:%M:%S%z'), "binary": str(binary),
                     "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),

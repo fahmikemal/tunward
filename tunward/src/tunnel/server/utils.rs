@@ -14,6 +14,7 @@ use http_body_util::combinators::BoxBody;
 use hyper::body::Body;
 use hyper::header::{AUTHORIZATION, COOKIE, HeaderValue, SEC_WEBSOCKET_PROTOCOL};
 use hyper::{Request, Response, StatusCode, http};
+use ipnet::IpNet;
 use std::net::IpAddr;
 use tracing::{error, info};
 use url::Host;
@@ -91,12 +92,16 @@ pub(super) fn extract_path_prefix(path: &str) -> Result<&str, PathPrefixErr> {
         return Err(PathPrefixErr::BadPathPrefix);
     }
 
-    let (l, r) = path[1..].split_once('/').ok_or(PathPrefixErr::BadUpgradeRequest)?;
+    let without_leading_slash = &path[1..];
+    let prefix = without_leading_slash
+        .strip_suffix("/events")
+        .ok_or(PathPrefixErr::BadUpgradeRequest)?;
 
-    match r.ends_with("events") {
-        true => Ok(l),
-        false => Err(PathPrefixErr::BadUpgradeRequest),
+    if prefix.is_empty() {
+        return Err(PathPrefixErr::BadPathPrefix);
     }
+
+    Ok(prefix)
 }
 
 #[derive(Debug, Display, Error)]
@@ -134,6 +139,41 @@ impl RestrictionConfig {
     }
 }
 
+/// Where a forward destination allowed by a restriction may be connected to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum DestinationGrant {
+    /// The destination is allowed as requested; a domain is resolved when connecting.
+    AsRequested,
+    /// The domain is only allowed at these resolved addresses, in resolver order. Connecting to them,
+    /// instead of resolving again, keeps a changed DNS answer from escaping the CIDR rules.
+    Addresses(Vec<IpAddr>),
+}
+
+impl DestinationGrant {
+    pub(super) fn into_addresses(self) -> Option<Vec<IpAddr>> {
+        match self {
+            Self::AsRequested => None,
+            Self::Addresses(addresses) => Some(addresses),
+        }
+    }
+}
+
+/// Match IPv4-mapped IPv6 addresses as the IPv4 address they reach, so `::ffff:10.0.0.1` is subject
+/// to IPv4 CIDR rules instead of IPv6 ones.
+#[inline]
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or(IpAddr::V6(ip), IpAddr::V4),
+        ip => ip,
+    }
+}
+
+#[inline]
+fn cidr_contains(cidr: &[IpNet], ip: IpAddr) -> bool {
+    let ip = canonical_ip(ip);
+    cidr.iter().any(|net| net.contains(&ip))
+}
+
 impl AllowReverseTunnelConfig {
     #[inline]
     fn is_allowed(&self, remote: &RemoteAddr) -> bool {
@@ -158,42 +198,97 @@ impl AllowReverseTunnelConfig {
 
         match &remote.host {
             Host::Domain(_) => false,
-            Host::Ipv4(ip) => self.cidr.iter().any(|cidr| cidr.contains(&IpAddr::from(*ip))),
-            Host::Ipv6(ip) => self.cidr.iter().any(|cidr| cidr.contains(&IpAddr::from(*ip))),
+            Host::Ipv4(ip) => cidr_contains(&self.cidr, IpAddr::V4(*ip)),
+            Host::Ipv6(ip) => cidr_contains(&self.cidr, IpAddr::V6(*ip)),
         }
     }
 }
 
 impl AllowTunnelConfig {
+    /// Protocol and port checks, which hold whatever address the destination resolves to.
     #[inline]
-    fn is_allowed(&self, remote: &RemoteAddr) -> bool {
-        if remote.protocol.is_reverse_tunnel() {
-            return false;
-        }
+    fn admits(&self, remote: &RemoteAddr) -> bool {
+        !remote.protocol.is_reverse_tunnel()
+            && (self.port.is_empty() || self.port.iter().any(|range| range.contains(&remote.port)))
+            && (self.protocol.is_empty() || self.protocol.contains(&TunnelProtocol::from(&remote.protocol)))
+    }
 
-        if !self.port.is_empty() && !self.port.iter().any(|range| range.contains(&remote.port)) {
-            return false;
-        }
+    /// Whether a domain must also resolve inside `cidr`. An empty list authorizes names on their own,
+    /// as `--restrict-to HOST:PORT` does, and a list covering both address families checks nothing.
+    #[inline]
+    fn constrains_domains(&self) -> bool {
+        let covers = |v4: bool| {
+            self.cidr
+                .iter()
+                .any(|net| net.prefix_len() == 0 && matches!(net, IpNet::V4(_)) == v4)
+        };
+        !self.cidr.is_empty() && !(covers(true) && covers(false))
+    }
 
-        if !self.protocol.is_empty() && !self.protocol.contains(&TunnelProtocol::from(&remote.protocol)) {
-            return false;
+    #[inline]
+    fn needs_resolution(&self, remote: &RemoteAddr) -> bool {
+        matches!(&remote.host, Host::Domain(host) if self.host.is_match(host))
+            && self.admits(remote)
+            && self.constrains_domains()
+    }
+
+    fn grant(&self, remote: &RemoteAddr, resolved: Option<&[IpAddr]>) -> Option<DestinationGrant> {
+        if !self.admits(remote) {
+            return None;
         }
 
         match &remote.host {
-            Host::Domain(host) => self.host.is_match(host),
-            Host::Ipv4(ip) => self.cidr.iter().any(|cidr| cidr.contains(&IpAddr::from(*ip))),
-            Host::Ipv6(ip) => self.cidr.iter().any(|cidr| cidr.contains(&IpAddr::from(*ip))),
+            Host::Domain(host) if !self.host.is_match(host) => None,
+            Host::Domain(_) if !self.constrains_domains() => Some(DestinationGrant::AsRequested),
+            // An unresolved domain cannot be shown to stay inside the CIDRs.
+            Host::Domain(_) => {
+                let addresses: Vec<IpAddr> = resolved?
+                    .iter()
+                    .map(|ip| canonical_ip(*ip))
+                    .filter(|ip| cidr_contains(&self.cidr, *ip))
+                    .collect();
+                (!addresses.is_empty()).then_some(DestinationGrant::Addresses(addresses))
+            }
+            Host::Ipv4(ip) => cidr_contains(&self.cidr, IpAddr::V4(*ip)).then_some(DestinationGrant::AsRequested),
+            Host::Ipv6(ip) => cidr_contains(&self.cidr, IpAddr::V6(*ip)).then_some(DestinationGrant::AsRequested),
         }
     }
 }
 
 impl AllowConfig {
     #[inline]
-    fn is_allowed(&self, remote: &RemoteAddr) -> bool {
+    fn needs_resolution(&self, remote: &RemoteAddr) -> bool {
+        matches!(self, AllowConfig::Tunnel(config) if config.needs_resolution(remote))
+    }
+
+    #[inline]
+    fn grant(&self, remote: &RemoteAddr, resolved: Option<&[IpAddr]>) -> Option<DestinationGrant> {
         match self {
-            AllowConfig::ReverseTunnel(config) => config.is_allowed(remote),
-            AllowConfig::Tunnel(config) => config.is_allowed(remote),
+            AllowConfig::ReverseTunnel(config) => config.is_allowed(remote).then_some(DestinationGrant::AsRequested),
+            AllowConfig::Tunnel(config) => config.grant(remote, resolved),
         }
+    }
+}
+
+impl RestrictionConfig {
+    /// Merge what each allow rule grants: any rule allowing the destination as requested wins,
+    /// otherwise the union of the addresses the rules allow, kept in resolver order.
+    fn grant(&self, remote: &RemoteAddr, resolved: Option<&[IpAddr]>) -> Option<DestinationGrant> {
+        let mut allowed = Vec::new();
+        for grant in self.allow.iter().filter_map(|allow| allow.grant(remote, resolved)) {
+            match grant {
+                DestinationGrant::AsRequested => return Some(DestinationGrant::AsRequested),
+                DestinationGrant::Addresses(addresses) => allowed.extend(addresses),
+            }
+        }
+
+        let mut addresses: Vec<IpAddr> = Vec::with_capacity(allowed.len());
+        for ip in resolved.unwrap_or_default().iter().map(|ip| canonical_ip(*ip)) {
+            if allowed.contains(&ip) && !addresses.contains(&ip) {
+                addresses.push(ip);
+            }
+        }
+        (!addresses.is_empty()).then_some(DestinationGrant::Addresses(addresses))
     }
 }
 
@@ -203,36 +298,61 @@ impl AllowConfig {
 /// If no restriction matches, the tunnel will be rejected.
 ///
 /// # Return value:
-/// * `Some(restriction)` - Tunnel is allowed. Encapsulates the restriction that allowed the tunnel.
+/// * `Some((restriction, grant))` - Tunnel is allowed by `restriction`, at the addresses in `grant`.
 /// * `None` - Tunnel is not allowed.
-#[inline]
+#[cfg(test)]
 pub(super) fn validate_tunnel<'a>(
     remote: &RemoteAddr,
     path_prefix: &str,
     authorization: Option<&str>,
     restrictions: &'a RestrictionsRules,
-) -> Option<&'a RestrictionConfig> {
-    validate_tunnel_with_scope(remote, path_prefix, authorization, restrictions, |_| true)
+    resolved: Option<&[IpAddr]>,
+) -> Option<(&'a RestrictionConfig, DestinationGrant)> {
+    validate_tunnel_with_scope(remote, path_prefix, authorization, restrictions, resolved, |_| true)
 }
 
+/// Validate if the requested tunnel is allowed by the restrictions in `scope`, checked in order.
+///
+/// Returns the first restriction that allows the tunnel, with the addresses it may be dialed at.
+/// `resolved` holds the addresses a domain destination resolves to, when [`needs_resolution`] asked
+/// for them. Rules that only allow the domain inside their CIDRs do not match without them.
 pub(super) fn validate_tunnel_with_scope<'a>(
     remote: &RemoteAddr,
     path_prefix: &str,
     authorization: Option<&str>,
     restrictions: &'a RestrictionsRules,
+    resolved: Option<&[IpAddr]>,
     scope: impl Fn(&RestrictionConfig) -> bool,
-) -> Option<&'a RestrictionConfig> {
+) -> Option<(&'a RestrictionConfig, DestinationGrant)> {
     restrictions
         .restrictions
         .iter()
         .filter(|restriction| scope(restriction))
         .filter(|restriction| restriction.filter(path_prefix, authorization))
-        .find(|restriction| restriction.allow.iter().any(|allow| allow.is_allowed(remote)))
+        .find_map(|restriction| restriction.grant(remote, resolved).map(|grant| (restriction, grant)))
+}
+
+/// Whether a candidate restriction allows the requested domain only inside its CIDRs, so the
+/// addresses the domain resolves to must be passed to [`validate_tunnel_with_scope`].
+pub(super) fn needs_resolution(
+    remote: &RemoteAddr,
+    path_prefix: &str,
+    authorization: Option<&str>,
+    restrictions: &RestrictionsRules,
+    scope: impl Fn(&RestrictionConfig) -> bool,
+) -> bool {
+    matches!(remote.host, Host::Domain(_))
+        && restrictions
+            .restrictions
+            .iter()
+            .filter(|restriction| scope(restriction))
+            .filter(|restriction| restriction.filter(path_prefix, authorization))
+            .any(|restriction| restriction.allow.iter().any(|allow| allow.needs_resolution(remote)))
 }
 
 /// Whether any restriction could allow a tunnel for this path prefix and authorization.
 ///
-/// This is the destination-independent half of [`validate_tunnel`]: it answers "may this client
+/// This is the destination-independent half of [`validate_tunnel_with_scope`]: it answers "may this client
 /// talk to us at all", without knowing where it wants to go. Webtransport checks it when accepting
 /// a session, since one session is shared by every tunnel the client opens on it and the
 /// destination only arrives per stream. Streams are still validated in full afterwards.
@@ -244,6 +364,7 @@ pub(super) fn matches_any_restriction(
     restrictions
         .restrictions
         .iter()
+        .filter(|restriction| !restriction.allow.is_empty())
         .any(|restriction| restriction.filter(path_prefix, authorization))
 }
 
@@ -262,10 +383,239 @@ mod tests {
     use super::*;
     use crate::restrictions::types::{AllowReverseTunnelConfig, AllowTunnelConfig, default_cidr, default_host};
     use crate::tunnel::LocalProtocol;
-    use ipnet::{IpNet, Ipv4Net};
+    use ipnet::{IpNet, Ipv4Net, Ipv6Net};
     use regex::Regex;
-    use std::net::Ipv6Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
     use std::path::PathBuf;
+
+    fn allows(config: impl Into<AllowConfig>, remote: &RemoteAddr) -> bool {
+        config.into().grant(remote, None).is_some()
+    }
+
+    fn net(value: &str) -> IpNet {
+        value.parse().unwrap()
+    }
+
+    fn tcp_to(host: Host, port: u16) -> RemoteAddr {
+        RemoteAddr {
+            protocol: LocalProtocol::Tcp { proxy_protocol: false },
+            host,
+            port,
+        }
+    }
+
+    fn forward_rule(name: &str, cidr: Vec<IpNet>) -> RestrictionConfig {
+        RestrictionConfig {
+            name: name.into(),
+            r#match: vec![MatchConfig::Any],
+            allow: vec![AllowConfig::Tunnel(AllowTunnelConfig {
+                protocol: vec![],
+                port: vec![],
+                host: default_host(),
+                cidr,
+            })],
+        }
+    }
+
+    #[test]
+    fn test_domain_cannot_bypass_constraining_cidr() {
+        // A rule that only names a CIDR keeps the default `^.*$` host regex. A domain must not reach
+        // addresses outside that CIDR just because its name matches the regex.
+        let restrictions = RestrictionsRules {
+            restrictions: vec![forward_rule("only-10-net", vec![net("10.0.0.0/8")])],
+        };
+        let remote = tcp_to(Host::Domain("localhost".into()), 3000);
+        let loopback: [IpAddr; 2] = [Ipv4Addr::LOCALHOST.into(), Ipv6Addr::LOCALHOST.into()];
+        let mixed: [IpAddr; 3] = [Ipv4Addr::LOCALHOST.into(), [10, 1, 2, 3].into(), [10, 4, 5, 6].into()];
+
+        assert!(needs_resolution(&remote, "p", None, &restrictions, |_| true));
+        assert!(validate_tunnel(&remote, "p", None, &restrictions, None).is_none());
+        assert!(validate_tunnel(&remote, "p", None, &restrictions, Some(&loopback)).is_none());
+        assert!(validate_tunnel(&remote, "p", None, &restrictions, Some(&[])).is_none());
+        let (_, grant) = validate_tunnel(&remote, "p", None, &restrictions, Some(&mixed)).unwrap();
+        assert_eq!(
+            grant,
+            DestinationGrant::Addresses(vec![[10, 1, 2, 3].into(), [10, 4, 5, 6].into()]),
+            "only the resolved addresses inside the CIDR may be dialed, in resolver order"
+        );
+
+        // The literal address keeps being denied, as before.
+        assert!(
+            validate_tunnel(&tcp_to(Host::Ipv4(Ipv4Addr::LOCALHOST), 3000), "p", None, &restrictions, None).is_none()
+        );
+    }
+
+    #[test]
+    fn test_unconstrained_cidr_authorizes_domain_by_name() {
+        let remote = tcp_to(Host::Domain("example.com".into()), 443);
+        for cidr in [vec![], default_cidr()] {
+            let restrictions = RestrictionsRules {
+                restrictions: vec![forward_rule("by-name", cidr)],
+            };
+            assert!(!needs_resolution(&remote, "p", None, &restrictions, |_| true));
+            let (_, grant) = validate_tunnel(&remote, "p", None, &restrictions, None).unwrap();
+            assert_eq!(grant, DestinationGrant::AsRequested);
+        }
+
+        // `--restrict-to HOST:PORT` authorizes that exact name, without constraining its addresses,
+        // and still denies literal addresses and other names.
+        let restrictions = RestrictionsRules::from_path_prefix(&[], &[("localhost".into(), 443)]).unwrap();
+        let localhost = tcp_to(Host::Domain("localhost".into()), 443);
+        assert!(!needs_resolution(&localhost, "p", None, &restrictions, |_| true));
+        assert_eq!(
+            validate_tunnel(&localhost, "p", None, &restrictions, None).unwrap().1,
+            DestinationGrant::AsRequested
+        );
+        assert!(
+            validate_tunnel(&tcp_to(Host::Ipv4(Ipv4Addr::LOCALHOST), 443), "p", None, &restrictions, None).is_none()
+        );
+        assert!(
+            validate_tunnel(
+                &tcp_to(Host::Domain("localhost.evil".into()), 443),
+                "p",
+                None,
+                &restrictions,
+                None
+            )
+            .is_none()
+        );
+
+        // `--restrict-to IP:PORT` never authorizes a name, whatever it resolves to.
+        let restrictions = RestrictionsRules::from_path_prefix(&[], &[("127.0.0.1".into(), 443)]).unwrap();
+        let resolved: [IpAddr; 1] = [Ipv4Addr::LOCALHOST.into()];
+        assert!(validate_tunnel(&localhost, "p", None, &restrictions, Some(&resolved)).is_none());
+    }
+
+    #[test]
+    fn test_single_family_cidr_constrains_domains() {
+        // Covering all of IPv4 says nothing about where a domain's IPv6 addresses lead.
+        let restrictions = RestrictionsRules {
+            restrictions: vec![forward_rule("ipv4-only", vec![net("0.0.0.0/0")])],
+        };
+        let remote = tcp_to(Host::Domain("dual.example".into()), 80);
+        let resolved: [IpAddr; 2] = [Ipv6Addr::LOCALHOST.into(), [192, 0, 2, 10].into()];
+        assert!(needs_resolution(&remote, "p", None, &restrictions, |_| true));
+        assert_eq!(
+            validate_tunnel(&remote, "p", None, &restrictions, Some(&resolved))
+                .unwrap()
+                .1,
+            DestinationGrant::Addresses(vec![[192, 0, 2, 10].into()])
+        );
+    }
+
+    #[test]
+    fn test_ipv4_mapped_addresses_follow_ipv4_rules() {
+        let mapped = Ipv4Addr::LOCALHOST.to_ipv6_mapped();
+        let remote = tcp_to(Host::Ipv6(mapped), 80);
+
+        let ipv6_only = RestrictionsRules {
+            restrictions: vec![forward_rule("ipv6-only", vec![IpNet::V6(Ipv6Net::default())])],
+        };
+        assert!(validate_tunnel(&remote, "p", None, &ipv6_only, None).is_none());
+
+        let loopback_v4 = RestrictionsRules {
+            restrictions: vec![forward_rule("loopback-v4", vec![net("127.0.0.1/32")])],
+        };
+        assert!(validate_tunnel(&remote, "p", None, &loopback_v4, None).is_some());
+
+        // A resolver answering with a mapped address is dialed at the IPv4 address it reaches.
+        let domain = tcp_to(Host::Domain("mapped.example".into()), 80);
+        let resolved: [IpAddr; 1] = [mapped.into()];
+        assert_eq!(
+            validate_tunnel(&domain, "p", None, &loopback_v4, Some(&resolved))
+                .unwrap()
+                .1,
+            DestinationGrant::Addresses(vec![Ipv4Addr::LOCALHOST.into()])
+        );
+        assert!(validate_tunnel(&domain, "p", None, &ipv6_only, Some(&resolved)).is_none());
+
+        // Reverse listeners cannot bind an IPv4 address through its mapped form either.
+        let reverse = AllowReverseTunnelConfig {
+            protocol: vec![],
+            port: vec![],
+            port_mapping: Default::default(),
+            cidr: vec![IpNet::V6(Ipv6Net::default())],
+            unix_path: default_host(),
+        };
+        let bind = RemoteAddr {
+            protocol: LocalProtocol::ReverseTcp,
+            host: Host::Ipv6(mapped),
+            port: 8080,
+        };
+        assert!(!reverse.is_allowed(&bind));
+    }
+
+    #[test]
+    fn test_restriction_merges_allow_rules_in_resolver_order() {
+        let mut restriction = forward_rule("merged", vec![net("10.0.0.0/8")]);
+        restriction.allow.push(AllowConfig::Tunnel(AllowTunnelConfig {
+            protocol: vec![],
+            port: vec![],
+            host: default_host(),
+            cidr: vec![net("192.168.0.0/16")],
+        }));
+        let restrictions = RestrictionsRules {
+            restrictions: vec![restriction],
+        };
+        let remote = tcp_to(Host::Domain("multi.example".into()), 80);
+        let resolved: [IpAddr; 4] = [
+            [192, 168, 1, 1].into(),
+            [8, 8, 8, 8].into(),
+            [10, 0, 0, 1].into(),
+            [192, 168, 1, 1].into(),
+        ];
+        assert_eq!(
+            validate_tunnel(&remote, "p", None, &restrictions, Some(&resolved))
+                .unwrap()
+                .1,
+            DestinationGrant::Addresses(vec![[192, 168, 1, 1].into(), [10, 0, 0, 1].into()])
+        );
+
+        // An allow rule authorizing the name outright makes the addresses irrelevant.
+        let mut restrictions = restrictions;
+        restrictions.restrictions[0]
+            .allow
+            .push(AllowConfig::Tunnel(AllowTunnelConfig {
+                protocol: vec![],
+                port: vec![],
+                host: Regex::new("^multi[.]example$").unwrap(),
+                cidr: vec![],
+            }));
+        assert_eq!(
+            validate_tunnel(&remote, "p", None, &restrictions, Some(&resolved))
+                .unwrap()
+                .1,
+            DestinationGrant::AsRequested
+        );
+    }
+
+    #[test]
+    fn test_restriction_order_is_kept_with_resolution() {
+        // The first matching restriction still wins: resolution decides whether the constrained one
+        // matches instead of skipping it for a later, broader restriction.
+        let restrictions = RestrictionsRules {
+            restrictions: vec![
+                forward_rule("constrained", vec![net("127.0.0.0/8")]),
+                forward_rule("broad", default_cidr()),
+            ],
+        };
+        let remote = tcp_to(Host::Domain("localhost".into()), 80);
+        let inside: [IpAddr; 1] = [Ipv4Addr::LOCALHOST.into()];
+        let outside: [IpAddr; 1] = [[203, 0, 113, 9].into()];
+        assert_eq!(
+            validate_tunnel(&remote, "p", None, &restrictions, Some(&inside))
+                .unwrap()
+                .0
+                .name,
+            "constrained"
+        );
+        let (restriction, grant) = validate_tunnel(&remote, "p", None, &restrictions, Some(&outside)).unwrap();
+        assert_eq!((restriction.name.as_str(), grant), ("broad", DestinationGrant::AsRequested));
+
+        // Rules out of scope (another tenant's) neither match nor trigger a lookup.
+        let scope = |rule: &RestrictionConfig| rule.name == "broad";
+        assert!(!needs_resolution(&remote, "p", None, &restrictions, scope));
+    }
 
     #[test]
     fn test_validate_tunnel() {
@@ -303,8 +653,9 @@ mod tests {
             port: 80,
         };
         assert_eq!(
-            validate_tunnel(&remote, "/doesnt/matter", None, &restrictions)
+            validate_tunnel(&remote, "/doesnt/matter", None, &restrictions, None)
                 .unwrap()
+                .0
                 .name,
             restrictions.restrictions[0].name
         );
@@ -315,8 +666,9 @@ mod tests {
             port: 80,
         };
         assert_eq!(
-            validate_tunnel(&remote, "/doesnt/matter", None, &restrictions)
+            validate_tunnel(&remote, "/doesnt/matter", None, &restrictions, None)
                 .unwrap()
+                .0
                 .name,
             restrictions.restrictions[1].name
         );
@@ -326,40 +678,45 @@ mod tests {
             host: Host::Ipv4([127, 0, 0, 1].into()),
             port: 81,
         };
-        assert!(validate_tunnel(&remote, "/doesnt/matter", None, &restrictions).is_none());
+        assert!(validate_tunnel(&remote, "/doesnt/matter", None, &restrictions, None).is_none());
 
         let remote = RemoteAddr {
             protocol: LocalProtocol::Tcp { proxy_protocol: false },
             host: Host::Ipv4([127, 0, 1, 1].into()),
             port: 80,
         };
-        assert!(validate_tunnel(&remote, "/doesnt/matter", None, &restrictions).is_none());
+        assert!(validate_tunnel(&remote, "/doesnt/matter", None, &restrictions, None).is_none());
 
+        // The rule constrains its CIDR, so the domain is allowed only where it resolves inside it.
         let remote = RemoteAddr {
             protocol: LocalProtocol::Tcp { proxy_protocol: false },
             host: Host::Domain("example.com".into()),
             port: 80,
         };
-        assert_eq!(
-            validate_tunnel(&remote, "/doesnt/matter", None, &restrictions)
-                .unwrap()
-                .name,
-            restrictions.restrictions[0].name
-        );
+        assert!(needs_resolution(&remote, "/doesnt/matter", None, &restrictions, |_| true));
+        let inside: [IpAddr; 2] = [[8, 8, 8, 8].into(), [127, 0, 0, 7].into()];
+        let (restriction, grant) =
+            validate_tunnel(&remote, "/doesnt/matter", None, &restrictions, Some(&inside)).unwrap();
+        assert_eq!(restriction.name, restrictions.restrictions[0].name);
+        assert_eq!(grant, DestinationGrant::Addresses(vec![[127, 0, 0, 7].into()]));
+        let outside: [IpAddr; 1] = [[8, 8, 8, 8].into()];
+        assert!(validate_tunnel(&remote, "/doesnt/matter", None, &restrictions, Some(&outside)).is_none());
+        assert!(validate_tunnel(&remote, "/doesnt/matter", None, &restrictions, None).is_none());
 
         let remote = RemoteAddr {
             protocol: LocalProtocol::Tcp { proxy_protocol: false },
             host: Host::Domain("not.com".into()),
             port: 80,
         };
-        assert!(validate_tunnel(&remote, "/doesnt/matter", None, &restrictions).is_none());
+        assert!(!needs_resolution(&remote, "/doesnt/matter", None, &restrictions, |_| true));
+        assert!(validate_tunnel(&remote, "/doesnt/matter", None, &restrictions, Some(&inside)).is_none());
 
         let remote = RemoteAddr {
             protocol: LocalProtocol::Tcp { proxy_protocol: false },
             host: Host::Ipv6(Ipv6Addr::LOCALHOST),
             port: 80,
         };
-        assert!(validate_tunnel(&remote, "/doesnt/matter", None, &restrictions).is_none());
+        assert!(validate_tunnel(&remote, "/doesnt/matter", None, &restrictions, None).is_none());
     }
 
     #[test]
@@ -385,13 +742,23 @@ mod tests {
             port: 80,
         };
         assert_eq!(
-            validate_tunnel(&remote, "/doesnt/matter", Some("Bearer the-bearer-token"), &restrictions)
+            validate_tunnel(&remote, "/doesnt/matter", Some("Bearer the-bearer-token"), &restrictions, None)
                 .unwrap()
+                .0
                 .name,
             restrictions.restrictions[0].name
         );
-        assert!(validate_tunnel(&remote, "/doesnt/matter", Some("Bearer other-bearer-token"), &restrictions).is_none());
-        assert!(validate_tunnel(&remote, "/doesnt/matter", None, &restrictions).is_none());
+        assert!(
+            validate_tunnel(
+                &remote,
+                "/doesnt/matter",
+                Some("Bearer other-bearer-token"),
+                &restrictions,
+                None
+            )
+            .is_none()
+        );
+        assert!(validate_tunnel(&remote, "/doesnt/matter", None, &restrictions, None).is_none());
     }
 
     #[test]
@@ -410,7 +777,7 @@ mod tests {
             port: 80,
         };
         assert!(config.is_allowed(&remote));
-        assert!(AllowConfig::from(config.clone()).is_allowed(&remote));
+        assert!(allows(config.clone(), &remote));
 
         // another ip on the same subnet
         let remote = RemoteAddr {
@@ -419,7 +786,7 @@ mod tests {
             port: 80,
         };
         assert!(config.is_allowed(&remote));
-        assert!(AllowConfig::from(config.clone()).is_allowed(&remote));
+        assert!(allows(config.clone(), &remote));
     }
 
     #[test]
@@ -439,7 +806,7 @@ mod tests {
             port: 80,
         };
         assert!(!config.is_allowed(&remote));
-        assert!(!AllowConfig::from(config.clone()).is_allowed(&remote));
+        assert!(!allows(config.clone(), &remote));
 
         // ipv6
         let remote = RemoteAddr {
@@ -448,7 +815,7 @@ mod tests {
             port: 80,
         };
         assert!(!config.is_allowed(&remote));
-        assert!(!AllowConfig::from(config.clone()).is_allowed(&remote));
+        assert!(!allows(config.clone(), &remote));
 
         // wrong port
         let remote = RemoteAddr {
@@ -457,7 +824,7 @@ mod tests {
             port: 81,
         };
         assert!(!config.is_allowed(&remote));
-        assert!(!AllowConfig::from(config.clone()).is_allowed(&remote));
+        assert!(!allows(config.clone(), &remote));
 
         // wrong protocol - remote
         let remote = RemoteAddr {
@@ -466,7 +833,7 @@ mod tests {
             port: 80,
         };
         assert!(!config.is_allowed(&remote));
-        assert!(!AllowConfig::from(config.clone()).is_allowed(&remote));
+        assert!(!allows(config.clone(), &remote));
 
         // wrong protocol - local
         let remote = RemoteAddr {
@@ -475,7 +842,7 @@ mod tests {
             port: 80,
         };
         assert!(!config.is_allowed(&remote));
-        assert!(!AllowConfig::from(config.clone()).is_allowed(&remote));
+        assert!(!allows(config.clone(), &remote));
 
         // host is domain
         let remote = RemoteAddr {
@@ -484,7 +851,7 @@ mod tests {
             port: 80,
         };
         assert!(!config.is_allowed(&remote));
-        assert!(!AllowConfig::from(config.clone()).is_allowed(&remote));
+        assert!(!allows(config.clone(), &remote));
     }
 
     #[test]
@@ -540,8 +907,8 @@ mod tests {
             host: Host::Ipv4([127, 0, 0, 1].into()),
             port: 80,
         };
-        assert!(config.is_allowed(&remote));
-        assert!(AllowConfig::from(config.clone()).is_allowed(&remote));
+        assert!(config.grant(&remote, None).is_some());
+        assert!(allows(config.clone(), &remote));
 
         // another ip on the same subnet
         let remote = RemoteAddr {
@@ -549,17 +916,22 @@ mod tests {
             host: Host::Ipv4([127, 0, 1, 1].into()),
             port: 80,
         };
-        assert!(config.is_allowed(&remote));
-        assert!(AllowConfig::from(config.clone()).is_allowed(&remote));
+        assert!(config.grant(&remote, None).is_some());
+        assert!(allows(config.clone(), &remote));
 
-        // host is domain
+        // host is domain: the CIDR constrains it, so it is allowed at its resolved addresses inside
         let remote = RemoteAddr {
             protocol: LocalProtocol::Tcp { proxy_protocol: false },
             host: Host::Domain("example.com".into()),
             port: 80,
         };
-        assert!(config.is_allowed(&remote));
-        assert!(AllowConfig::from(config.clone()).is_allowed(&remote));
+        let resolved: [IpAddr; 2] = [[93, 184, 215, 14].into(), [127, 0, 0, 9].into()];
+        assert_eq!(
+            config.grant(&remote, Some(&resolved)),
+            Some(DestinationGrant::Addresses(vec![[127, 0, 0, 9].into()]))
+        );
+        assert!(config.grant(&remote, None).is_none());
+        assert!(!allows(config.clone(), &remote));
     }
 
     #[test]
@@ -577,8 +949,8 @@ mod tests {
             host: Host::Ipv4([127, 0, 1, 1].into()),
             port: 80,
         };
-        assert!(!config.is_allowed(&remote));
-        assert!(!AllowConfig::from(config.clone()).is_allowed(&remote));
+        assert!(config.grant(&remote, None).is_none());
+        assert!(!allows(config.clone(), &remote));
 
         // ipv6
         let remote = RemoteAddr {
@@ -586,8 +958,8 @@ mod tests {
             host: Host::Ipv6(Ipv6Addr::LOCALHOST),
             port: 80,
         };
-        assert!(!config.is_allowed(&remote));
-        assert!(!AllowConfig::from(config.clone()).is_allowed(&remote));
+        assert!(config.grant(&remote, None).is_none());
+        assert!(!allows(config.clone(), &remote));
 
         // wrong port
         let remote = RemoteAddr {
@@ -595,8 +967,8 @@ mod tests {
             host: Host::Ipv4([127, 0, 0, 1].into()),
             port: 81,
         };
-        assert!(!config.is_allowed(&remote));
-        assert!(!AllowConfig::from(config.clone()).is_allowed(&remote));
+        assert!(config.grant(&remote, None).is_none());
+        assert!(!allows(config.clone(), &remote));
 
         // wrong protocol - remote
         let remote = RemoteAddr {
@@ -604,8 +976,8 @@ mod tests {
             host: Host::Ipv4([127, 0, 0, 1].into()),
             port: 80,
         };
-        assert!(!config.is_allowed(&remote));
-        assert!(!AllowConfig::from(config.clone()).is_allowed(&remote));
+        assert!(config.grant(&remote, None).is_none());
+        assert!(!allows(config.clone(), &remote));
 
         // wrong protocol - local
         let remote = RemoteAddr {
@@ -613,8 +985,8 @@ mod tests {
             host: Host::Ipv4([127, 0, 0, 1].into()),
             port: 80,
         };
-        assert!(!config.is_allowed(&remote));
-        assert!(!AllowConfig::from(config.clone()).is_allowed(&remote));
+        assert!(config.grant(&remote, None).is_none());
+        assert!(!allows(config.clone(), &remote));
 
         // wrong host
         let remote = RemoteAddr {
@@ -622,15 +994,23 @@ mod tests {
             host: Host::Domain("not.com".into()),
             port: 80,
         };
-        assert!(!config.is_allowed(&remote));
-        assert!(!AllowConfig::from(config.clone()).is_allowed(&remote));
+        assert!(config.grant(&remote, None).is_none());
+        assert!(!allows(config.clone(), &remote));
     }
 
     #[test]
     fn test_extract_path_prefix_happy_path() {
         assert_eq!(extract_path_prefix("/prefix/events"), Ok("prefix"));
-        assert_eq!(extract_path_prefix("/prefix/a/events"), Ok("prefix"));
-        assert_eq!(extract_path_prefix("/prefix/a/b/events"), Ok("prefix"));
+        assert_eq!(extract_path_prefix("/prefix/a/events"), Ok("prefix/a"));
+        assert_eq!(extract_path_prefix("/prefix/a/b/events"), Ok("prefix/a/b"));
+        assert_eq!(
+            extract_path_prefix("/spiffe://example.org/ns/prod/sa/device-1/events"),
+            Ok("spiffe://example.org/ns/prod/sa/device-1")
+        );
+        assert_eq!(
+            extract_path_prefix("/device-01.corp.internal/events"),
+            Ok("device-01.corp.internal")
+        );
     }
 
     #[test]
@@ -651,5 +1031,23 @@ mod tests {
         assert_eq!(extract_path_prefix("prefix/events"), Err(PathPrefixErr::BadPathPrefix));
         assert_eq!(extract_path_prefix("prefix/a/events"), Err(PathPrefixErr::BadPathPrefix));
         assert_eq!(extract_path_prefix("prefix/a/b/events"), Err(PathPrefixErr::BadPathPrefix));
+    }
+
+    #[test]
+    fn test_empty_restrictions_deny_tunnel_and_session() {
+        let empty_rules = RestrictionsRules {
+            restrictions: vec![RestrictionConfig {
+                name: "empty".into(),
+                r#match: vec![MatchConfig::Any],
+                allow: vec![],
+            }],
+        };
+        let remote = RemoteAddr {
+            protocol: LocalProtocol::Tcp { proxy_protocol: false },
+            host: Host::Ipv4([127, 0, 0, 1].into()),
+            port: 80,
+        };
+        assert!(validate_tunnel(&remote, "events", None, &empty_rules, None).is_none());
+        assert!(!matches_any_restriction("events", None, &empty_rules));
     }
 }

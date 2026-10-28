@@ -9,8 +9,6 @@ use std::str::FromStr;
 use std::vec;
 use types::RestrictionsRules;
 
-use crate::restrictions::types::{default_cidr, default_host};
-
 pub mod config_reloader;
 pub mod types;
 
@@ -22,21 +20,9 @@ impl RestrictionsRules {
 
     pub fn from_path_prefix(path_prefixes: &[String], restrict_to: &[(String, u16)]) -> anyhow::Result<Self> {
         let tunnels_restrictions = if restrict_to.is_empty() {
-            let r = types::AllowConfig::Tunnel(types::AllowTunnelConfig {
-                protocol: vec![],
-                port: vec![],
-                host: default_host(),
-                cidr: default_cidr(),
-            });
-            let reverse_tunnel = types::AllowConfig::ReverseTunnel(types::AllowReverseTunnelConfig {
-                protocol: vec![],
-                port: vec![],
-                port_mapping: Default::default(),
-                cidr: default_cidr(),
-                unix_path: default_host(),
-            });
-
-            vec![r, reverse_tunnel]
+            // OWASP Deny-by-default: If no explicit destination rules are provided,
+            // synthesize an empty allow list rather than allowing all destinations.
+            vec![]
         } else {
             restrict_to
                 .iter()
@@ -66,9 +52,8 @@ impl RestrictionsRules {
         };
 
         let restrictions = if path_prefixes.is_empty() {
-            // if no path prefixes are provided, we allow all
             let r = types::RestrictionConfig {
-                name: "Allow All".to_string(),
+                name: "Default Policy".to_string(),
                 r#match: vec![types::MatchConfig::Any],
                 allow: tunnels_restrictions,
             };
@@ -112,7 +97,7 @@ mod tests {
         let restriction = &rules.restrictions[0];
 
         // Validate the restriction name
-        assert_eq!(restriction.name, "Allow All");
+        assert_eq!(restriction.name, "Default Policy");
 
         // Validate that there's exactly one allow rule
         assert_eq!(restriction.allow.len(), 1);
@@ -151,7 +136,7 @@ mod tests {
         let restriction = &rules.restrictions[0];
 
         // Validate the restriction name
-        assert_eq!(restriction.name, "Allow All");
+        assert_eq!(restriction.name, "Default Policy");
 
         // Validate that there's exactly one allow rule
         assert_eq!(restriction.allow.len(), 1);
@@ -201,19 +186,20 @@ mod tests {
             panic!("Expected Match configuration");
         }
 
-        if let AllowConfig::Tunnel(tunnel_config) = &restriction.allow[0] {
-            // Validate the host regex pattern
-            assert_eq!(tunnel_config.host.as_str(), "^.*$");
+        // Under Priority 3 (deny by default), without an explicit destination restriction,
+        // allow rules must be empty so that no tunnel can be established.
+        assert!(restriction.allow.is_empty());
 
-            // Validate the port configuration
-            assert_eq!(tunnel_config.port.len(), 0);
+        Ok(())
+    }
 
-            // Validate that CIDR is correct
-            assert_eq!(tunnel_config.cidr, default_cidr());
-        } else {
-            panic!("Expected Tunnel configuration");
-        }
-
+    #[test]
+    fn test_empty_restrictions_rules_deny_by_default() -> anyhow::Result<()> {
+        let rules = RestrictionsRules::from_path_prefix(&[], &[])?;
+        assert_eq!(rules.restrictions.len(), 1);
+        let restriction = &rules.restrictions[0];
+        assert_eq!(restriction.name, "Default Policy");
+        assert!(restriction.allow.is_empty());
         Ok(())
     }
 }

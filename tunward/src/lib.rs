@@ -82,12 +82,12 @@ pub async fn create_client(
     };
 
     let http_upgrade_path_prefix = if args.http_upgrade_path_prefix.eq(DEFAULT_CLIENT_UPGRADE_PATH_PREFIX) {
-        // When using mTLS and no manual http upgrade path is specified configure the HTTP upgrade path
-        // to be the common name (CN) of the client's certificate.
+        // When using mTLS and no manual http upgrade path is specified, configure the HTTP upgrade path
+        // to be the verified identity from the client's certificate according to the requested field.
         tls_certificate
             .as_ref()
             .and_then(|certs| tls::find_leaf_certificate(certs.as_slice()))
-            .and_then(|leaf_cert| tls::cn_from_certificate(&leaf_cert))
+            .and_then(|leaf_cert| tls::identity_from_certificate(&leaf_cert, args.tls_client_identity_field).ok())
             .unwrap_or(args.http_upgrade_path_prefix)
     } else {
         args.http_upgrade_path_prefix
@@ -536,6 +536,12 @@ async fn run_server_impl(
     reload: Option<reload::ServerReload>,
 ) -> anyhow::Result<()> {
     let files = server_config::load_server_files(&args)?;
+    if args.allow_insecure_dev {
+        tracing::warn!(
+            "INSECURE DEVELOPMENT EXCEPTION ACTIVE: Server is running with --allow-insecure-dev on listener {}. Cleartext or unauthenticated connections are permitted. DO NOT USE IN PRODUCTION.",
+            args.remote_addr
+        );
+    }
     let managed = reload
         .as_ref()
         .map(|_| {
@@ -584,6 +590,9 @@ async fn run_server_impl(
         fleet_inventory: args.fleet_inventory,
         fleet_inventory_max_devices: args.fleet_inventory_max_devices,
         tenant_config: args.tenant_config,
+        tls_client_identity_field: args.tls_client_identity_field,
+        tls_handshake_timeout: args.tls_handshake_timeout,
+        max_pending_tls_handshakes: args.max_pending_tls_handshakes,
     };
     let mut server = Server::new(server_config, executor);
     if let (Some(state), Some(reload)) = (managed, reload) {

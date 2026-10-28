@@ -1,7 +1,7 @@
 //! WebTransport (HTTP/3 over QUIC) transport.
 //!
-//! The stream transports for ordinary tunnels live here; [`udp`] holds the framed variants a UDP
-//! tunnel needs, [`endpoint`] the QUIC endpoint they are dialled from, [`client`] the dialling
+//! The stream transports for ordinary tunnels live here; `udp` holds the framed variants a UDP
+//! tunnel needs, `endpoint` the QUIC endpoint they are dialled from, `client` the dialling
 //! itself, and [`utils`] the socket, transport-config and JWT-preamble helpers.
 
 use super::io::{MAX_PACKET_LENGTH, TransportRead, TransportWrite};

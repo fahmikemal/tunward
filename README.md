@@ -43,6 +43,7 @@ with the qualification gates above still open.
 | [Tenant isolation and roles](docs/TENANT_ISOLATION.md) | Verified membership, named destination scope, and reverse resource ownership |
 | [Fleet and inventory](docs/FLEET_INVENTORY.md) | Consistent transport records and persistent verified-device observations |
 | [Deployment lifecycle](docs/DEPLOYMENT.md) | Certificate validation, renewal, canary rollout, and rollback |
+| [Monitoring and Prometheus](docs/MONITORING.md) | Built-in `/metrics` scraping, Grafana metrics reference, and alerting rules |
 | [Publication cleanup](docs/PUBLICATION.md) | Exposed-key history, safe mirror preparation, and hosting cutover |
 | [Qualification](docs/STAGING_QUALIFICATION.md) | Local, container, WAN, capacity, and endurance checks |
 | [Contributing](CONTRIBUTING.md) | Build requirements, Docker/Podman tests, and CI |
@@ -95,6 +96,14 @@ When an authenticated feature lacks TLS/mTLS, the error names that feature.
 Restriction YAML rejects unknown fields and descending port ranges. These same
 checks apply at server startup; correct previously ignored field typos before upgrading.
 
+In accordance with enterprise secure defaults:
+- Any public or non-loopback listener (such as `0.0.0.0`, `[::]`, LAN, WAN, or non-localhost hostnames) strictly requires TLS (`wss://` or `wts://`), client certificate verification (`--tls-client-ca-certs`), and an explicit restriction policy (`--restrict-config`). For isolated local testing across interfaces, operators may supply `--allow-insecure-dev` to bypass these prerequisites (emits prominent security warnings on startup and does not relax loopback enforcement on `--management-api`).
+- **Deny-by-default access control**: In alignment with OWASP recommendations, Tunward denies all tunnel requests by default unless explicitly matched by `--restrict-to` or `--restrict-config`. Missing policies never synthesize an implicit `Allow All`.
+- **Destination CIDRs also bind domain names**: A restriction rule whose `cidr` constrains addresses allows a domain destination only at its resolved addresses inside that CIDR, and the server connects to those checked addresses without resolving again. See [destination policy](docs/using_mtls.md#destination-and-reverse-listener-policy) for the exact matching rules and migration.
+- **Bounded unauthenticated connections**: A TLS handshake must complete within `--tls-handshake-timeout` (default 10s), and at most `--max-pending-tls-handshakes` (default 1024) may be in progress on the TCP listener, and separately on the WebTransport listener, where a connection stays pending until it sends its session request; further connections are closed or refused on arrival while established sessions keep forwarding. After resource errors such as file-descriptor exhaustion, every accept loop pauses briefly and rate-limits its warnings instead of spinning.
+- **Default resource limits**: When mTLS is enabled, finite baseline limits (32 sessions, 256 tunnels, 100 rps / 200 burst, 10 MB/s bandwidth shaping) are enforced per verified device to protect against unrestricted resource consumption (OWASP API4:2023). Operators can supply custom limits via `--device-quota-config` or opt out via `--no-device-quotas`. Loopback listeners (`127.0.0.1`, `localhost`, `[::1]`) remain unrestricted for rapid local development.
+- **Modern PKI & SPIFFE/SAN Identity Extraction**: Supports extracting verified client identities from X.509 Common Name (`cn`), Subject Alternative Name URI (`san-uri` / SPIFFE ID), or Subject Alternative Name DNS (`san-dns`), enabling native integration with modern service meshes, MDM platforms, and enterprise PKI standards.
+
 Run it as the service user, with the intended arguments, environment and file
 permissions. It does not bind ports, resolve addresses, contact peers, start
 watchers, create an inventory database, or write TLS key logs. It can run while
@@ -136,7 +145,7 @@ server log; use the socket command when completion must be acknowledged.
 | Tenant membership, roles, and resource scope | New requests use the current policy; removed, moved, or reduced grants disconnect that device's sessions and retained reverse listeners; equivalent/expanded grants and other devices stay connected |
 | Server certificate/key and client CA | TCP and QUIC acceptors switch for new handshakes; established sessions retain their original TLS authentication |
 | Device revocation | Keeps its independent one-second fail-closed reload and can terminate active work even when a grouped reload is rejected |
-| Listener address/port, transport enablement, file paths, inventory options, proxy/DNS/heartbeat/startup arguments | Restart required |
+| Listener address/port, transport enablement, file paths, inventory options, TLS handshake bounds, proxy/DNS/heartbeat/startup arguments | Restart required |
 
 In managed mode, restriction and TLS file watchers are disabled: edit all
 candidates, validate them with `server -t`, then request one reload. The default
@@ -397,15 +406,21 @@ tunward server --help
 | `--tls-verify-certificate[=true\|false]` | Client verification defaults to true; keep enabled for deployments |
 | `--tls-certificate`, `--tls-private-key` | Server identity or client mTLS identity, depending on subcommand |
 | `--tls-client-ca-certs FILE` | Server trust bundle for client certificate authentication |
-| `--device-quota-config FILE` | Startup-loaded per-device quotas; requires mTLS and uses verified CNs |
-| `--device-revocation-config FILE` | Live mTLS CN/certificate denial; closes active sessions and reverse resources |
+| `--tls-client-identity-field cn\|san-uri\|san-dns` | Client certificate identity extraction field (default: `cn`; supports SPIFFE/SAN) |
+| `--device-quota-config FILE` | Startup-loaded per-device quotas; requires mTLS and uses verified device identity |
+| `--no-device-quotas` | Explicitly disable default finite device resource limits under mTLS |
+| `--device-revocation-config FILE` | Live mTLS device identity denial; closes active sessions and reverse resources |
 | `--tenant-config FILE` | Startup-loaded device membership, tunnel roles, and reserved reverse scope; requires mTLS and named `--restrict-config` rules |
 | `--fleet-inventory FILE` | Persistent SQLite observations of verified mTLS devices |
 | `--fleet-inventory-max-devices N` | Maximum stored device identities; default 10000 |
-| `-P, --http-upgrade-path-prefix VALUE` | Client path prefix; mTLS uses the certificate CN by default |
+| `--management-api IP:PORT` | Loopback REST management API exposing `/healthz`, Prometheus `/metrics`, and client/session registry |
+| `-P, --http-upgrade-path-prefix VALUE` | Client path prefix; mTLS auto-derives from the verified identity field by default |
 | `-r, --restrict-http-upgrade-path-prefix VALUE` | Server path allowlist; not a substitute for TLS and target rules |
 | `--restrict-to HOST:PORT` | Server forward-destination allowlist; repeat as needed |
 | `--restrict-config FILE` | Reloadable YAML restriction rules; replaces CLI-generated restriction rules |
+| `--allow-insecure-dev` | Explicit exception permitting cleartext or unauthenticated non-loopback listeners for local testing; emits security warnings |
+| `--tls-handshake-timeout DURATION` | Close a TLS connection whose handshake (for WebTransport, also its session request) has not completed in time; default 10s, must be nonzero |
+| `--max-pending-tls-handshakes N` | TLS handshakes allowed in progress at once, per TCP and WebTransport listener; excess connections are closed or refused; default 1024 |
 | `-c, --connection-min-idle N` | Idle pool setting, default 0; accepted range 0..1000; WebTransport clamps to one session |
 | `--connection-retry-max-backoff DURATION` | Pool acquisition deadline, default 5m, must be nonzero |
 | `--reverse-tunnel-connection-retry-max-backoff DURATION` | Reverse reconnect backoff ceiling, default 1s |

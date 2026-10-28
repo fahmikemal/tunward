@@ -7,7 +7,34 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from qualify_runtime import RuntimeChecks, udp_exchange
+import qualify_runtime
+from qualify_runtime import RuntimeChecks, port, udp_exchange
+
+
+class PortTests(unittest.TestCase):
+    def test_port_skips_candidates_whose_udp_side_is_taken(self):
+        # Hold the UDP side of the first candidate the OS will hand out, as another process might.
+        real_socket = socket.socket
+        taken = []
+
+        class FirstUdpBusy(real_socket):
+            def bind(self, address):
+                if self.type == socket.SOCK_DGRAM and not taken:
+                    taken.append(address[1])
+                    raise OSError(98, "Address already in use")
+                return super().bind(address)
+
+        with patch.object(qualify_runtime.socket, "socket", FirstUdpBusy):
+            endpoint = port()
+        self.assertEqual(len(taken), 1)
+        self.assertNotEqual(endpoint, taken[0])
+        with real_socket() as stream, real_socket(type=socket.SOCK_DGRAM) as datagram:
+            stream.bind(("127.0.0.1", endpoint))
+            datagram.bind(("127.0.0.1", endpoint))
+
+    def test_port_is_not_handed_out_twice(self):
+        endpoints = [port() for _ in range(20)]
+        self.assertEqual(len(endpoints), len(set(endpoints)))
 
 
 @unittest.skipUnless(shutil.which("openssl"), "OpenSSL CLI required")

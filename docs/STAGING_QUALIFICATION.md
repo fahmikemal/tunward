@@ -32,6 +32,7 @@ dependencies in `scripts/requirements-qualification.txt`. Standalone generation 
 | `scripts/qualify_fleet.py` | Shared transport records, verified inventory, abrupt restart/key rotation, capacity, pagination, and database failures |
 | `scripts/qualify_tenants.py` | Tenant roles/rule scope, reverse ownership and reserved binds, header spoofing, Unix paths, and combined quotas/revocation |
 | `scripts/qualify_pool_timeout.py` | Delayed TLS establishment versus pool acquisition deadline |
+| `scripts/qualify_hardening.py` | Domain confinement to restriction CIDRs, DNS rebinding, refused UDP retries, TCP and WebTransport handshake bounds, and descriptor exhaustion |
 | `scripts/qualify_wan.py` | Expiring staging agent, native WAN clients, direct mTLS control, per-stream traces and client/server TCP diagnostics |
 | `scripts/qualify_wan_endurance.py` | Periodic native WAN probes over a declared 24–72 hour window; separate cycle reports |
 | `scripts/verify_endurance.py` | Completion receipt/service-exit verification, actual duration, and resource observations |
@@ -75,7 +76,25 @@ python3 scripts/qualify_quotas.py --output target/qualification/quota-review
 python3 scripts/qualify_revocation.py --output target/qualification/revocation-review
 python3 scripts/qualify_fleet.py --output target/qualification/fleet-review
 python3 scripts/qualify_tenants.py --output target/qualification/tenant-review
+python3 scripts/qualify_hardening.py --output target/qualification/hardening-review
 ~~~
+
+The hardening runner checks, on WS and on mTLS WSS, HTTPS, and WebTransport, that a
+domain is only reached at resolved addresses inside a constraining restriction
+CIDR, over TCP and UDP, that IPv4-mapped destinations follow IPv4 rules, and that a
+refused UDP tunnel is attempted once per datagram. A loopback DNS responder that
+changes its answer shows the checked address is the one dialed (Linux only, as it
+uses 127.0.0.2). It verifies the TLS handshake timeout and the pending-handshake
+limit while an established session keeps forwarding, on the TCP listener and on
+the WebTransport listener, where authenticated QUIC peers that never send their
+session request are closed with QUIC's own idle timeout disabled. That
+WebTransport part needs an OpenSSL 3.5+ `s_client -quic`, selected with
+`--openssl PATH`; without one it is recorded as `not_run`, or fails with
+`--require-quic`. CI builds a pinned, SHA-256-verified OpenSSL 3.5 LTS into its
+own cached prefix for this test client only, leaving the runner's system OpenSSL
+untouched, and passes `--require-quic`. Then descriptor exhaustion
+of the tunnel, management, and reverse listeners and of a client listener: CPU and
+accept warnings stay bounded and service recovers once descriptors are released.
 
 The identity runner verifies the two valid device identities, wrong target/path
 denial, missing certificate, missing CN, and multiple-CN denial on WSS, HTTPS,

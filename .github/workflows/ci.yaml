@@ -13,6 +13,10 @@ concurrency:
 
 env:
   RUST_VERSION: 1.97
+  # Test client only: the runner's OpenSSL 3.0 has no QUIC client to drive WebTransport handshakes.
+  # The system library stays untouched; this build lives in its own prefix.
+  OPENSSL_QUIC_VERSION: 3.5.9
+  OPENSSL_QUIC_SHA256: 603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
 
 jobs:
   native-runtime:
@@ -75,6 +79,9 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts -p 'test_check_release*.py'
           python3 -m unittest discover -s scripts -p test_package_release.py
+
+      - name: Verify issue templates pass the auto-close workflow
+        run: python3 -m unittest discover -s scripts -p test_issue_templates.py
 
       - name: Lint with Clippy
         run: cargo clippy --all --all-features --locked -- -D warnings
@@ -148,6 +155,29 @@ jobs:
       - name: Verify delayed TLS pool deadline behavior
         timeout-minutes: 2
         run: python3 scripts/qualify_pool_timeout.py --output "$QUALIFICATION_ROOT/pool-delay"
+      - name: Restore the OpenSSL QUIC test client
+        id: openssl-quic
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/openssl-quic
+          key: openssl-quic-${{ env.OPENSSL_QUIC_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+      - name: Build the OpenSSL QUIC test client
+        if: steps.openssl-quic.outputs.cache-hit != 'true'
+        timeout-minutes: 10
+        run: |
+          source="$RUNNER_TEMP/openssl-$OPENSSL_QUIC_VERSION.tar.gz"
+          curl -fsSLo "$source" "https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_QUIC_VERSION/openssl-$OPENSSL_QUIC_VERSION.tar.gz"
+          echo "$OPENSSL_QUIC_SHA256  $source" | sha256sum -c -
+          tar -xzf "$source" -C "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP/openssl-$OPENSSL_QUIC_VERSION"
+          ./Configure --prefix="$HOME/.cache/openssl-quic" --libdir=lib no-shared no-docs no-tests
+          make -j"$(nproc)"
+          make install_sw
+      - name: Qualify destination CIDR confinement and pre-authentication bounds
+        timeout-minutes: 8
+        run: >-
+          python3 scripts/qualify_hardening.py --output "$QUALIFICATION_ROOT/hardening"
+          --openssl "$HOME/.cache/openssl-quic/bin/openssl" --require-quic
       - name: Qualify authenticated device quotas
         timeout-minutes: 5
         run: python3 scripts/qualify_quotas.py --output "$QUALIFICATION_ROOT/quotas"

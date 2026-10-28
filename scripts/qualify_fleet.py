@@ -89,6 +89,12 @@ class FleetChecks(QuotaChecks):
             devices = (await self.api(stack, "/api/v1/devices"))["devices"]
             assert {d["id"] for d in devices} == {"device-a", "device-b"}, devices
             assert sum(d["active_tunnels"] for d in devices) == 4
+            def fetch_metrics():
+                with urllib.request.urlopen(f'http://127.0.0.1:{stack["management"]}/metrics') as r:
+                    return r.read().decode()
+            metrics = await asyncio.to_thread(fetch_metrics)
+            assert "tunward_health_status 1" in metrics
+            assert "tunward_active_tunnels 4" in metrics
             connections = await self.api(stack, "/api/v1/connections")
             assert {c["verified_device_id"] for c in connections} == {"device-a", "device-b"}
             assert all(c["certificate_sha256"] and c["peer_addr"].startswith("127.0.0.1:") for c in connections)

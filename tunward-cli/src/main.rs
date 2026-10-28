@@ -116,6 +116,11 @@ fn main() -> anyhow::Result<()> {
     {
         EnvFilter::builder().parse(&args.log_lvl)?;
         tunward::check_server_config(&server.config)?;
+        if server.config.allow_insecure_dev {
+            eprintln!(
+                "tunward: WARNING: --allow-insecure-dev is active. Cleartext/unauthenticated non-loopback connections are permitted. DO NOT USE IN PRODUCTION."
+            );
+        }
         eprintln!("tunward: configuration test is successful");
         return Ok(());
     }

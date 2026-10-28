@@ -6,13 +6,14 @@ use pin_project::{pin_project, pinned_drop};
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::{Error, ErrorKind};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::{io, task};
 use tokio::task::JoinSet;
 
 use log::warn;
 use socket2::SockRef;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::task::{Poll, ready};
 use std::time::Duration;
@@ -30,6 +31,8 @@ use url::Host;
 struct IoInner {
     has_data_to_read: Notify,
     has_read_data: Notify,
+    /// Whether the stream ever read a datagram, as `has_read_data` is also notified when it is dropped.
+    has_read: AtomicBool,
 }
 struct UdpServer {
     listener: Arc<UdpSocket>,
@@ -145,6 +148,7 @@ impl UdpStream {
         let io = Arc::pin(IoInner {
             has_data_to_read,
             has_read_data,
+            has_read: AtomicBool::new(false),
         });
         let mut s = Self {
             recv_socket,
@@ -212,6 +216,7 @@ impl AsyncRead for UdpStream {
         project.pending_notification.as_pin_mut().unwrap().enable();
 
         // Let know server that we have read data
+        project.io.has_read.store(true, Ordering::Release);
         project.io.has_read_data.notify_one();
 
         Poll::Ready(Ok(()))
@@ -263,6 +268,15 @@ pub async fn run_server(
                 && let Some(peer) = server.peers.get(&await_peer)
             {
                 peer.has_read_data.notified().await;
+                // A stream dropped before reading the datagram it was created for, as when its tunnel
+                // is rejected, leaves that datagram queued. Peeking it again would open a new stream for
+                // it, and fail again, in a loop as fast as the tunnel can be refused.
+                if !peer.has_read.load(Ordering::Acquire)
+                    && matches!(server.listener.peek_sender().await, Ok(sender) if sender == await_peer)
+                {
+                    debug!("Discarding the datagram of {await_peer}, whose stream closed before reading it");
+                    let _ = server.listener.recv_from(&mut [0u8; 1]).await;
+                }
             };
 
             loop {
@@ -352,6 +366,29 @@ pub async fn connect(
         Host::Ipv6(ip) => vec![SocketAddr::V6(SocketAddrV6::new(*ip, port, 0, 0))],
     };
 
+    connect_socket_addrs(host, port, socket_addrs, connect_timeout, so_mark).await
+}
+
+/// Connect to `host:port` at the given addresses only, without resolving `host` again.
+pub async fn connect_to_addresses(
+    host: &Host<String>,
+    port: u16,
+    addresses: &[IpAddr],
+    connect_timeout: Duration,
+    so_mark: SoMark,
+) -> anyhow::Result<WsUdpStream> {
+    info!("Opening UDP connection to {host}:{port} at {addresses:?}");
+    let socket_addrs = addresses.iter().map(|ip| SocketAddr::new(*ip, port)).collect();
+    connect_socket_addrs(host, port, socket_addrs, connect_timeout, so_mark).await
+}
+
+async fn connect_socket_addrs(
+    host: &Host<String>,
+    port: u16,
+    socket_addrs: Vec<SocketAddr>,
+    connect_timeout: Duration,
+    so_mark: SoMark,
+) -> anyhow::Result<WsUdpStream> {
     let mut cnx = None;
     let mut last_err = None;
     let mut join_set = JoinSet::new();
@@ -553,6 +590,85 @@ mod tests {
         let ret = timeout(Duration::from_millis(100), stream.read(&mut buf[10..])).await;
         assert!(matches!(ret, Ok(Ok(5))));
         assert_eq!(&buf[..16], b"helloworld test\0");
+    }
+
+    #[tokio::test]
+    async fn test_stream_dropped_before_reading_does_not_replay_its_datagram() {
+        let server_addr = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let server = run_server(server_addr, None, |_| Ok(()), |l| Ok(l.clone()))
+            .await
+            .unwrap();
+        pin_mut!(server);
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // Dropping the stream without reading is what a rejected tunnel does.
+        client.send_to(b"rejected", server_addr).await.unwrap();
+        let rejected = timeout(Duration::from_secs(1), server.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        drop(rejected);
+
+        // The rejected datagram must not come back as a new stream on its own.
+        let replay = timeout(Duration::from_millis(200), server.next()).await;
+        assert!(matches!(replay, Err(Elapsed { .. })), "the rejected datagram was replayed");
+
+        // The next datagram from the same peer opens one new stream, which reads that datagram.
+        client.send_to(b"next", server_addr).await.unwrap();
+        let stream = timeout(Duration::from_secs(1), server.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        pin_mut!(stream);
+        let mut buf = [0u8; 16];
+        let len = timeout(Duration::from_secs(1), stream.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..len], b"next");
+    }
+
+    #[tokio::test]
+    async fn test_stream_that_read_keeps_later_datagrams() {
+        // A stream closing after it read must not cost the peer its next datagram.
+        let server_addr = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let server = run_server(server_addr, None, |_| Ok(()), |l| Ok(l.clone()))
+            .await
+            .unwrap();
+        pin_mut!(server);
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        client.send_to(b"first", server_addr).await.unwrap();
+        let stream = timeout(Duration::from_secs(1), server.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        {
+            pin_mut!(stream);
+            let mut buf = [0u8; 16];
+            let len = timeout(Duration::from_secs(1), stream.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&buf[..len], b"first");
+        }
+
+        client.send_to(b"second", server_addr).await.unwrap();
+        let stream = timeout(Duration::from_secs(1), server.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        pin_mut!(stream);
+        let mut buf = [0u8; 16];
+        let len = timeout(Duration::from_secs(1), stream.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..len], b"second");
     }
 
     #[tokio::test]

@@ -53,6 +53,18 @@ class ServerConfigTests(unittest.TestCase):
                     self.invoke(flag, f"{scheme}://127.0.0.1:8443")
         self.invoke("-t", "--enable-webtransport", "wss://127.0.0.1:8443")
 
+    def test_tls_handshake_bounds(self):
+        self.invoke("-t", *self.tls(), "--tls-handshake-timeout", "3s", "--max-pending-tls-handshakes", "8",
+                    "wss://127.0.0.1:8443")
+        zero = self.invoke("-t", "--tls-handshake-timeout", "0s", "wss://127.0.0.1:8443", valid=False)
+        self.assertEqual(zero.returncode, 1, zero.stderr)
+        self.assertIn("--tls-handshake-timeout must be greater than zero", zero.stderr)
+        from_env = self.invoke("-t", "wss://127.0.0.1:8443", valid=False,
+                               env={**self.env, "TUNWARD_TLS_HANDSHAKE_TIMEOUT": "0"})
+        self.assertIn("--tls-handshake-timeout must be greater than zero", from_env.stderr)
+        no_slots = self.invoke("-t", "--max-pending-tls-handshakes", "0", "wss://127.0.0.1:8443", valid=False)
+        self.assertEqual(no_slots.returncode, 2, no_slots.stderr)
+
     def test_complete_policy_without_inventory_or_keylog_writes(self):
         with tempfile.TemporaryDirectory(dir=self.root) as directory:
             directory = Path(directory)
@@ -76,7 +88,62 @@ class ServerConfigTests(unittest.TestCase):
             api.listen()
             self.invoke("-t", *self.tls(), "--management-api", f"127.0.0.1:{api.getsockname()[1]}",
                         f"wts://127.0.0.1:{endpoint}")
-        self.invoke("-t", "wss://no-such-listener.invalid:8443")
+        self.invoke("-t", "--allow-insecure-dev", "wss://no-such-listener.invalid:8443")
+        self.invoke("-t", *self.tls(), "--restrict-config", ROOT / "tenant-restrictions.example.yaml",
+                    "wss://no-such-listener.invalid:8443")
+
+    def test_secure_public_listeners_and_dev_exceptions(self):
+        policy = ROOT / "tenant-restrictions.example.yaml"
+        # 1. Non-loopback listener requires TLS (wss:// or wts://)
+        for host in ("0.0.0.0", "[::]", "10.0.0.1", "192.168.1.1", "example.com", "127.0.0.1.nip.io"):
+            with self.subTest(public_host=host, test="requires_tls"):
+                res = self.invoke("-t", f"ws://{host}:8443", valid=False)
+                self.assertIn("requires TLS (wss:// or wts://)", res.stderr)
+                self.assertIn("--allow-insecure-dev", res.stderr)
+
+        # 2. Non-loopback listener requires client authentication (--tls-client-ca-certs)
+        for scheme in ("wss", "wts"):
+            with self.subTest(scheme=scheme, test="requires_client_ca"):
+                res = self.invoke("-t", f"{scheme}://0.0.0.0:8443", valid=False)
+                self.assertIn("requires client authentication (--tls-client-ca-certs)", res.stderr)
+                self.assertIn("--allow-insecure-dev", res.stderr)
+
+        # 3. Non-loopback listener requires explicit restriction config (--restrict-config)
+        with self.subTest(test="requires_restrict_config"):
+            # Has TLS + client CA, but missing --restrict-config
+            res = self.invoke("-t", "--tls-client-ca-certs", self.certs / "ca.pem", "wss://0.0.0.0:8443", valid=False)
+            self.assertIn("requires an explicit restriction policy file (--restrict-config)", res.stderr)
+            self.assertIn("--allow-insecure-dev", res.stderr)
+
+            # Having --restrict-to without --restrict-config still rejects on public listener
+            res = self.invoke("-t", "--tls-client-ca-certs", self.certs / "ca.pem",
+                              "--restrict-to", "127.0.0.1:80", "wss://0.0.0.0:8443", valid=False)
+            self.assertIn("requires an explicit restriction policy file (--restrict-config)", res.stderr)
+
+        # 4. Valid complete configuration succeeds on non-loopback listeners
+        for listener in ("wts://0.0.0.0:8443", "wss://[::]:8443", "wss://example.com:8443"):
+            with self.subTest(listener=listener, test="valid_public_complete"):
+                self.invoke("-t", *self.tls(), "--restrict-config", policy, listener)
+
+        # 5. --allow-insecure-dev permits unauthenticated or cleartext non-loopback listeners
+        res = self.invoke("-t", "--allow-insecure-dev", "ws://0.0.0.0:8443")
+        self.assertIn("WARNING: --allow-insecure-dev is active", res.stderr)
+
+        res = self.invoke("-t", "--allow-insecure-dev", "wss://0.0.0.0:8443")
+        self.assertIn("WARNING: --allow-insecure-dev is active", res.stderr)
+
+        # TUNWARD_ALLOW_INSECURE_DEV env var also enables the exception
+        res = self.invoke("-t", "ws://0.0.0.0:8443", env={**self.env, "TUNWARD_ALLOW_INSECURE_DEV": "true"})
+        self.assertIn("WARNING: --allow-insecure-dev is active", res.stderr)
+
+        # 6. --allow-insecure-dev does NOT relax the management API loopback restriction
+        res = self.invoke("-t", "--allow-insecure-dev", "--management-api", "0.0.0.0:8081", "ws://0.0.0.0:8443", valid=False)
+        self.assertIn("management API must bind to loopback", res.stderr)
+
+        # 7. Loopback listeners work by default without --allow-insecure-dev
+        for loopback in ("ws://127.0.0.1:8443", "ws://localhost:8443", "ws://[::1]:8443"):
+            with self.subTest(loopback=loopback, test="loopback_default"):
+                self.invoke("-t", loopback)
 
     def test_invalid_argument_combinations(self):
         cases = [(["--enable-webtransport", "ws://127.0.0.1:8443"], "requires TLS"),
@@ -166,6 +233,24 @@ class ServerConfigTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 1)
                     self.assertIn(message, result.stderr)
         self.assertFalse((self.root / "never-created.sqlite3").exists())
+
+    def test_no_device_quotas_options(self):
+        # --no-device-quotas is valid on loopback or with complete config
+        self.invoke("-t", "--no-device-quotas", "ws://127.0.0.1:8443")
+        # --no-device-quotas conflicts with --device-quota-config
+        res = self.invoke("-t", "--no-device-quotas", "--device-quota-config",
+                          ROOT / "device-quotas.example.yaml", "ws://127.0.0.1:8443", valid=False)
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("cannot be used with", res.stderr)
+
+    def test_tls_client_identity_field_options(self):
+        for field in ("cn", "san-uri", "san-dns"):
+            with self.subTest(field=field):
+                self.invoke("-t", "--tls-client-identity-field", field, "ws://127.0.0.1:8443")
+        # Invalid field value
+        res = self.invoke("-t", "--tls-client-identity-field", "invalid-field", "ws://127.0.0.1:8443", valid=False)
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("invalid value 'invalid-field'", res.stderr)
 
     def test_systemd_prestart_uses_startup_arguments(self):
         lines = (ROOT / "deploy" / "tunward.service").read_text().replace("\\\n", "").splitlines()

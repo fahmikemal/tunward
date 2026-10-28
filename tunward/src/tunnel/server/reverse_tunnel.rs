@@ -1,5 +1,6 @@
 use crate::executor::TokioExecutorRef;
 use crate::management::registry::TunnelLease;
+use crate::protocols::tcp::AcceptBackoff;
 use crate::quotas::TunnelPermit;
 use crate::revocation::RevocationGuard;
 use crate::tunnel::RemoteAddr;
@@ -125,6 +126,7 @@ impl<T: DownstreamListener> ReverseTunnelServer<T> {
                     idle_timeout
                 };
                 let mut timer = time::interval(check_interval);
+                let mut accept_backoff = AcceptBackoff::new("Error while listening for incoming connections");
                 pin_mut!(listening_server);
                 loop {
                     select! {
@@ -136,10 +138,11 @@ impl<T: DownstreamListener> ReverseTunnelServer<T> {
                                     break
                                 },
                                 Some(Err(err)) => {
-                                    warn!("Error while listening for incoming connections {err:?}");
+                                    accept_backoff.wait(err.as_ref()).await;
                                     continue;
                                 }
                                 Some(Ok(cnx)) => {
+                                    accept_backoff.reset();
                                     if time::timeout(idle_timeout, tx.send(cnx)).await.is_err() {
                                         info!("New reverse connection failed to be picked by client after {}s. Closing reverse tunnel server", idle_timeout.as_secs());
                                         break;
