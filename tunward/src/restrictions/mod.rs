@@ -14,7 +14,7 @@ pub mod types;
 
 impl RestrictionsRules {
     pub fn from_config_file(config_path: &Path) -> anyhow::Result<Self> {
-        let restrictions: Self = serde_yaml::from_reader(BufReader::new(File::open(config_path)?))?;
+        let restrictions: Self = crate::yaml::from_reader(BufReader::new(File::open(config_path)?))?;
         Ok(restrictions)
     }
 
@@ -81,6 +81,44 @@ mod tests {
     use super::*;
     use crate::restrictions::types::{AllowConfig, MatchConfig};
     use std::net::Ipv4Addr;
+
+    fn parse(allow: &str) -> anyhow::Result<RestrictionsRules> {
+        let yaml = format!("restrictions:\n  - name: r\n    match: [Any]\n    allow:\n{allow}");
+        Ok(crate::yaml::from_slice(yaml.as_bytes())?)
+    }
+
+    #[test]
+    fn blank_values_are_refused_where_empty_would_allow_everything() {
+        for allow in [
+            "      - !Tunnel",
+            "      - !ReverseTunnel ~",
+            "      - !Tunnel\n        port:",
+            "      - !Tunnel {protocol: ~}",
+            "      - !ReverseTunnel {port: null}",
+            "      - !ReverseTunnel {protocol:}",
+        ] {
+            assert!(parse(allow).is_err(), "{allow}");
+        }
+        // Spelled out, an empty rule still allows every port and protocol.
+        let rules = parse("      - !Tunnel {}\n      - !ReverseTunnel {protocol: [], port: []}").unwrap();
+        assert!(
+            matches!(&rules.restrictions[0].allow[0], AllowConfig::Tunnel(t) if t.port.is_empty() && t.protocol.is_empty())
+        );
+        assert!(matches!(&rules.restrictions[0].allow[1], AllowConfig::ReverseTunnel(t) if t.port.is_empty()));
+    }
+
+    #[test]
+    fn tagged_and_mapping_forms_read_the_same_rule() {
+        let tagged = parse("      - !Tunnel {protocol: [Tcp], port: [443, 8000..8010]}").unwrap();
+        let mapping = parse("      - Tunnel: {protocol: [Tcp], port: ['443', '8000..8010']}").unwrap();
+        for rules in [tagged, mapping] {
+            let AllowConfig::Tunnel(tunnel) = &rules.restrictions[0].allow[0] else {
+                panic!("Expected Tunnel configuration");
+            };
+            assert_eq!(tunnel.protocol, [crate::restrictions::types::TunnelProtocol::Tcp]);
+            assert_eq!(tunnel.port, [443..=443, 8000..=8010]);
+        }
+    }
 
     #[test]
     fn test_restriction_rule_with_host_restriction() -> anyhow::Result<()> {

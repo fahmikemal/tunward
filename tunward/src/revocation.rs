@@ -23,9 +23,9 @@ const MAX_ENTRIES: usize = 10000;
 #[serde(deny_unknown_fields)]
 struct PolicyFile {
     version: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::yaml::required")]
     blocked_devices: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::yaml::required")]
     blocked_cert_sha256: Vec<String>,
 }
 
@@ -38,7 +38,7 @@ struct Policy {
 impl Policy {
     fn parse(bytes: &[u8]) -> anyhow::Result<Self> {
         ensure!(bytes.len() <= MAX_POLICY_BYTES as usize, "revocation policy exceeds 1 MiB");
-        let file: PolicyFile = serde_yaml::from_slice(bytes).context("Invalid revocation YAML")?;
+        let file: PolicyFile = crate::yaml::from_slice(bytes).context("Invalid revocation YAML")?;
         ensure!(file.version == 1, "unsupported revocation version; expected 1");
         ensure!(
             file.blocked_devices
@@ -330,6 +330,9 @@ mod tests {
             "version: 1\nblocked_devices: ['']",
             "version: 1\nblocked_cert_sha256: [abc]",
             "version: 1\nblocked_device: []",
+            // Left blank, a list would read as empty and silently lift every revocation.
+            "version: 1\nblocked_devices:",
+            "version: 1\nblocked_cert_sha256: ~",
         ] {
             assert!(Policy::parse(invalid.as_bytes()).is_err(), "{invalid}");
         }

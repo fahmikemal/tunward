@@ -93,7 +93,9 @@ with code `2`. The check reads the selected YAML/PEM files, validates policy
 values and tenant/role/restriction references, checks the certificate/key match
 and client trust bundle, and checks TLS/mTLS and transport prerequisites.
 When an authenticated feature lacks TLS/mTLS, the error names that feature.
-Restriction YAML rejects unknown fields and descending port ranges. These same
+Policy YAML rejects unknown fields, duplicate keys, `<<` merge keys, and blank values
+where an empty list would mean "any" (such as `port:` or a bare `!Tunnel`; write `[]`
+or `{}` to mean empty). Restriction YAML also rejects descending port ranges. These same
 checks apply at server startup; correct previously ignored field typos before upgrading.
 
 In accordance with enterprise secure defaults:

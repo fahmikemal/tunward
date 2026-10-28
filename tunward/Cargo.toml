@@ -28,7 +28,7 @@ arc-swap = { version = "1.9.2", features = [] }
 # For config file parsing
 regex = { version = "1.13.1", default-features = false, features = ["std", "perf"] }
 serde_regex = "1.2.0"
-serde_yaml = { version = "0.9.34", features = [] }
+serde-saphyr = { version = "2.0.0", default-features = false, features = ["deserialize"] }
 ipnet = { version = "2.12.2", features = ["serde"] }
 
 hyper = { version = "1.11.1", features = ["client", "http1", "http2"] }
