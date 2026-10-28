@@ -1,6 +1,6 @@
+use super::devices::{DevicePage, DeviceRecord, Observation};
 use anyhow::{Context, anyhow, ensure};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
-use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -11,31 +11,6 @@ use tokio::sync::{mpsc, oneshot};
 
 const APPLICATION_ID: i32 = 0x54554e57;
 const SCHEMA_VERSION: i32 = 1;
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DeviceRecord {
-    pub id: String,
-    pub first_seen_at: u64,
-    pub last_seen_at: u64,
-    pub last_certificate_sha256: String,
-    pub last_transport: String,
-    pub observed_connections: u64,
-    pub active_connections: usize,
-    pub active_tunnels: usize,
-}
-
-#[derive(Debug, Serialize)]
-pub struct DevicePage {
-    pub devices: Vec<DeviceRecord>,
-    pub next_cursor: Option<String>,
-}
-
-pub(crate) struct Observation {
-    pub identity: String,
-    pub fingerprint: String,
-    pub transport: String,
-    pub timestamp: u64,
-}
 
 enum Command {
     Observe(Observation, oneshot::Sender<anyhow::Result<()>>),

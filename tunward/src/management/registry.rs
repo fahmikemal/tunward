@@ -1,4 +1,5 @@
-use super::inventory::{DevicePage, DeviceRecord, Inventory, Observation};
+use super::devices::{DevicePage, DeviceRecord, Observation};
+use super::inventory::Inventory;
 use ahash::AHashMap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};

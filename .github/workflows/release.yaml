@@ -85,7 +85,7 @@ jobs:
 
       # What the armv7, armv6, freebsd and windows-x86 builds ship with.
       - name: Test with ring
-        run: cargo nextest run --locked --no-default-features --features ring
+        run: cargo nextest run --locked --no-default-features --features ring,fleet-inventory
 
   build:
     name: Build - ${{ matrix.platform.name }}
@@ -112,19 +112,19 @@ jobs:
             build-args: "--release --features=jemalloc -vv"
           - name: Linux armv7hf
             target: armv7-unknown-linux-musleabihf
-            build-args: "--release --no-default-features --features ring"
+            build-args: "--release --no-default-features --features ring,fleet-inventory"
 
           - name: Linux armv6
             target: arm-unknown-linux-musleabihf
-            build-args: "--release --no-default-features --features ring"
+            build-args: "--release --no-default-features --features ring,fleet-inventory"
 
           - name: Freebsd x86_64
             target: x86_64-unknown-freebsd
-            build-args: "--release --no-default-features --features ring --features=jemalloc"
+            build-args: "--release --no-default-features --features ring,fleet-inventory --features=jemalloc"
 
           - name: Freebsd x86
             target: i686-unknown-freebsd
-            build-args: "--release --no-default-features --features ring"
+            build-args: "--release --no-default-features --features ring,fleet-inventory"
 
           - name: Android aarch64
             target: aarch64-linux-android
@@ -132,7 +132,7 @@ jobs:
 
           - name: Android armv7
             target: armv7-linux-androideabi
-            build-args: "--release --no-default-features --features ring"
+            build-args: "--release --no-default-features --features ring,fleet-inventory"
 
           #- name: Linux mips
           #  target: mips-unknown-linux-musl
@@ -168,7 +168,7 @@ jobs:
           - name: Windows x86
             os: windows-2022
             target: i686-pc-windows-msvc
-            build-args: "--profile release-with-symbols --no-default-features --features ring"
+            build-args: "--profile release-with-symbols --no-default-features --features ring,fleet-inventory"
 
           - name: Windows aarch64
             os: windows-2022

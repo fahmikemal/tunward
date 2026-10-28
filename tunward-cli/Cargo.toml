@@ -20,7 +20,8 @@ tunward = { path = "../tunward", default-features = false, features = ["clap"] }
 tikv-jemallocator = { version = "0.7", optional = true }
 
 [features]
-default = ["aws-lc-rs"]
+default = ["aws-lc-rs", "fleet-inventory"]
+fleet-inventory = ["tunward/fleet-inventory"]
 jemalloc = ["dep:tikv-jemallocator"]
 aws-lc-rs = ["tunward/aws-lc-rs"]
 ring = ["tunward/ring"]

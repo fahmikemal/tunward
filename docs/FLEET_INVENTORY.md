@@ -201,10 +201,16 @@ cluster consistency, every filesystem/OS, or production endurance.
 
 ## Architectural decoupling and future control plane
 
-In the `v0.1.0-beta` baseline, the fleet observation module (`src/management/`) is in-tree within the core `tunward` crate, and the SQLite C-library (`rusqlite`) is linked into the compiled binary. While the feature is runtime-optional (omitting `--fleet-inventory` leaves the database uninitialized and zero-cost during forwarding), the binary still carries SQLite dependencies.
+The fleet observation module (`src/management/`) is in-tree within the core `tunward` crate. The SQLite inventory is the `fleet-inventory` Cargo feature, on by default. A data-plane build without it carries no SQLite (`rusqlite`), about 2.2 MB less on x86_64 Linux:
+
+~~~sh
+cargo build --release --locked -p tunward-cli --no-default-features --features aws-lc-rs
+~~~
+
+That build refuses `--fleet-inventory` in `server -t` and at startup. It keeps the in-memory registry, so the management API still reports connections, tunnels, sessions, and health; the device routes report the inventory as unavailable, as in a default build started without `--fleet-inventory`. Builds that select `--no-default-features` and still need the inventory must add `--features fleet-inventory`.
 
 Planned evolutions (see [ROADMAP.md](../ROADMAP.md#architectural-limitations-and-future-scope-v02--v03)):
-1. **Cargo Feature Separation (`features = ["fleet"]`)**: Decouple `rusqlite` and the management REST API into an optional Cargo feature or separate crate (`tunward-fleet`). This allows compiling minimal, stripped-down data-plane binaries for embedded environments, OpenWrt routers, and microVMs.
+1. **Cargo Feature Separation**: implemented for SQLite through `fleet-inventory`, as described above. Moving the registry and management REST API into a separate crate (`tunward-fleet`) remains planned.
 2. **Control Plane / Data Plane Decoupling**: Evolve the fleet subsystem into an external control-plane collector (communicating via gRPC, Unix socket events, or OpenTelemetry), enabling a central fleet management instance to aggregate observations from multiple edge Tunward forwarders.
 3. **Pluggable Storage Backends**: Provide adapters for centralized databases (PostgreSQL, Redis) to enable cross-replica device observation and clustered state coordination.
 

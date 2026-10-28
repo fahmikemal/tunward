@@ -108,7 +108,10 @@ jobs:
         run: python3 -m unittest discover -s scripts -p test_issue_templates.py
 
       - name: Lint with Clippy
-        run: cargo clippy --all --all-features --locked -- -D warnings
+        run: |
+          cargo clippy --all --all-features --locked -- -D warnings
+          # The data-plane build without the SQLite fleet inventory.
+          cargo clippy --all --all-targets --locked --no-default-features --features aws-lc-rs -- -D warnings
 
       - name: Check advisories, licenses, bans and sources (cargo-deny)
         run: cargo deny --locked check
@@ -141,7 +144,15 @@ jobs:
         run: cargo nextest run --locked
 
       - name: Test with ring
-        run: cargo nextest run --locked --no-default-features --features ring
+        run: cargo nextest run --locked --no-default-features --features ring,fleet-inventory
+
+      - name: Test without the fleet inventory
+        run: |
+          if cargo tree --locked -p tunward-cli --no-default-features --features aws-lc-rs -e normal,build | grep -E 'rusqlite|libsqlite3-sys'; then
+            echo "SQLite is still linked without the fleet-inventory feature"
+            exit 1
+          fi
+          cargo nextest run --locked -p tunward --no-default-features --features aws-lc-rs
 
   qualification:
     name: Local protocol and security regressions

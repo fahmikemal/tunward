@@ -585,7 +585,8 @@ pub struct ServerCreationRequest {
     )]
     pub device_revocation_config: Option<PathBuf>,
 
-    /// SQLite file for persistent observations of verified mTLS device identities.
+    /// SQLite file for persistent observations of verified mTLS device identities. Needs the
+    /// fleet-inventory build feature, which is on by default.
     #[cfg_attr(
         feature = "clap",
         arg(

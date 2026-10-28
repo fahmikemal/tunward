@@ -33,7 +33,7 @@ jobs:
         shell: pwsh
         run: '"C:\Program Files\Git\usr\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append'
       - name: Build native ring binary
-        run: cargo build --release --locked -p tunward-cli --no-default-features --features ring
+        run: cargo build --release --locked -p tunward-cli --no-default-features --features ring,fleet-inventory
       - name: Verify portable certificate generation and setup evidence
         run: python -m unittest discover -s scripts -p test_qualify_runtime.py
       - name: Verify offline server configuration checks

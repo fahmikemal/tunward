@@ -86,6 +86,10 @@ pub(crate) fn load_server_files(args: &ServerCreationRequest) -> anyhow::Result<
         );
     }
     ensure!(
+        cfg!(feature = "fleet-inventory") || args.fleet_inventory.is_none(),
+        "--fleet-inventory needs a build with the fleet-inventory feature (it is on by default)"
+    );
+    ensure!(
         tls_enabled || !args.enable_webtransport,
         "--enable-webtransport requires TLS: use wss:// or wts://"
     );
@@ -394,6 +398,29 @@ mod tests {
         let files = load_server_files(&req).expect("valid configuration with --no-device-quotas");
         let _ = std::fs::remove_file(ca_path);
         assert_eq!(files.device_quotas, None);
+    }
+
+    #[test]
+    fn test_fleet_inventory_follows_the_build_feature() {
+        let ca_path = write_test_ca_pem("fleet-inventory");
+        let mut req = sample_server_request("wss://127.0.0.1:8080");
+        req.tls_client_ca_certs = Some(ca_path.clone());
+        // The offline check never opens the database, so the file need not exist.
+        req.fleet_inventory = Some(std::env::temp_dir().join("tunward-test-unopened-inventory.sqlite3"));
+
+        let result = load_server_files(&req);
+        let _ = std::fs::remove_file(ca_path);
+        if cfg!(feature = "fleet-inventory") {
+            result.expect("an mTLS listener accepts --fleet-inventory");
+        } else {
+            let Err(err) = result else {
+                panic!("expected a build without the fleet-inventory feature to refuse --fleet-inventory");
+            };
+            assert!(
+                err.to_string()
+                    .contains("needs a build with the fleet-inventory feature")
+            );
+        }
     }
 
     #[test]
