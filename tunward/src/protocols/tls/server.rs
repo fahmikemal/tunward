@@ -127,9 +127,9 @@ pub fn tls_connector(
     config.enable_sni = enable_sni;
     config.key_log = Arc::new(KeyLogFile::new());
 
-    // To bypass certificate verification
+    // To bypass certificate verification, only when the operator passes --tls-verify-certificate=false.
     if !tls_verify_certificate {
-        config.dangerous().set_certificate_verifier(Arc::new(NullVerifier));
+        config.dangerous().set_certificate_verifier(Arc::new(NullVerifier)); // nosemgrep: rust.lang.security.rustls-dangerous.rustls-dangerous
     }
 
     config.alpn_protocols = alpn_protocols;
@@ -235,9 +235,9 @@ pub fn quic_client_config(
 
     config.key_log = Arc::new(KeyLogFile::new());
 
-    // To bypass certificate verification
+    // To bypass certificate verification, only when the operator passes --tls-verify-certificate=false.
     if !tls_verify_certificate {
-        config.dangerous().set_certificate_verifier(Arc::new(NullVerifier));
+        config.dangerous().set_certificate_verifier(Arc::new(NullVerifier)); // nosemgrep: rust.lang.security.rustls-dangerous.rustls-dangerous
     }
 
     config.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];

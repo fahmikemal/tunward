@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM debian:trixie-slim
+FROM debian:trixie-slim@sha256:89c1ea91e897f0fe0a3731595330bc45b8bdef4047464a07116f891a94054b31
 
 RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin app && \
     apt-get update && \

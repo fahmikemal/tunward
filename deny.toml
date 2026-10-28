@@ -1,0 +1,45 @@
+# cargo-deny policy for the dependency graph: advisories, licenses, duplicate or wildcard
+# requirements, and where crates may come from. Run with `cargo deny --locked check`.
+
+[graph]
+# Release builds enable jemalloc, ring and bindgen, so check every feature's dependencies.
+all-features = true
+
+[advisories]
+# Unmaintained crates are reported anywhere in the graph, so each one is either replaced or listed
+# below with a reason. Yanked releases are refused.
+yanked = "deny"
+ignore = [
+  { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml comes from serde_yaml, which parses the policy files; replacing that parser is a separate, tested migration" },
+]
+
+[licenses]
+# Permissive licenses actually present in the graph. Copyleft terms such as LGPL-2.1-or-later only
+# appear as one alternative of an OR expression, which a permitted license satisfies.
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "MIT-0",
+  "Unicode-3.0",
+  "Zlib",
+]
+confidence-threshold = 0.9
+unused-allowed-license = "warn"
+
+[bans]
+# Several crates legitimately exist in two versions during ecosystem migrations; keep them visible.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -4,3 +4,6 @@ target
 dist/
 state/
 certs/mTLS/
+# The builder image already pins the toolchain (checked against this file by
+# scripts/check_toolchain_pins.py); copying it in would make rustup download the same release again.
+rust-toolchain.toml

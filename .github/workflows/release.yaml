@@ -13,17 +13,18 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  RUST_VERSION: 1.97
+  RUST_VERSION: "1.97"
   BIN_NAME: "tunward"
 
 jobs:
   release-tag:
     name: Validate release tag and publication credentials
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Require a version tag matching both packages
         id: tag
         run: python3 scripts/check_release_tag.py >> "$GITHUB_OUTPUT"
@@ -45,25 +46,26 @@ jobs:
     name: Check - format, lint & tests
     needs: release-tag
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - name: Checkout Git repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Install rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "${{ env.RUST_VERSION }}"
           components: rustfmt, clippy
 
       - name: Install taplo-cli and cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: taplo-cli,cargo-nextest
 
       - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Reject private keys in reachable publication history
         run: python3 scripts/check_publication.py --history
@@ -90,6 +92,7 @@ jobs:
     needs: [ check, native-runtime ]
     # By default, runs on Ubuntu, otherwise, override with the desired os
     runs-on: ${{ matrix.platform.os || 'ubuntu-24.04' }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -184,20 +187,20 @@ jobs:
 
       - name: Set up JDK 17
         if: contains(matrix.platform.target, 'android')
-        uses: actions/setup-java@v6
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           java-version: '17'
           distribution: 'temurin'
 
       - name: Setup Android SDK
         if: contains(matrix.platform.target, 'android')
-        uses: android-actions/setup-android@v4
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
 
       - name: Checkout Git repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain and target
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "${{ env.RUST_VERSION }}"
           targets: ${{ matrix.platform.target }}
@@ -209,7 +212,7 @@ jobs:
 
       - name: Install bindgen-cli
         if: contains(matrix.platform.build-args, 'aws-lc-rs-bindgen')
-        run: cargo install bindgen-cli
+        run: cargo install bindgen-cli --locked --version 0.73.2
 
       - name: Build ${{ matrix.platform.name }} binary
         shell: bash
@@ -225,7 +228,7 @@ jobs:
           "$driver" build "${build_args[@]}" --locked --bin tunward --target "$BUILD_TARGET"
 
       - name: Store artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           # Finally, we store the binary as GitHub artifact for later usage
           name: ${{ env.BIN_NAME }}-${{ matrix.platform.target }}
@@ -241,12 +244,12 @@ jobs:
       IMAGE: docker.io/oph1uchus/tunward
       RELEASE_TAG: ${{ needs.release-tag.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: tunward-x86_64-unknown-linux-musl
           path: target/docker-release/artifacts/linux/amd64
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: tunward-aarch64-unknown-linux-musl
           path: target/docker-release/artifacts/linux/arm64
@@ -316,32 +319,52 @@ jobs:
     if: startsWith( github.ref, 'refs/tags/v' )
     permissions:
       contents: write
-    runs-on: ubuntu-22.04
+      # Sign build provenance attestations for the published archives.
+      id-token: write
+      attestations: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - name: Checkout Git repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Download release binaries only
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: tunward-*
           merge-multiple: false
           path: artifacts
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.13'
 
       - name: Verify binary set and restore executable permissions
         run: python3 scripts/check_release_artifacts.py --artifacts artifacts
 
-      - name: Package verified Rust binaries and publish
+      - name: Package verified Rust binaries
         run: |
           python3 scripts/package_release.py --artifacts artifacts --output dist \
-            --tag "$RELEASE_TAG" --run-id "$SOURCE_RUN_ID" --publish
+            --tag "$RELEASE_TAG" --run-id "$SOURCE_RUN_ID"
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          SOURCE_RUN_ID: ${{ github.run_id }}
+
+      # Before publication, so a failed attestation leaves nothing published without provenance.
+      # Verify a download with: gh attestation verify <archive> --repo fahmikemal/tunward
+      - name: Attest build provenance of the release files
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+
+      # The same files and options as package_release.py --publish.
+      - name: Publish the attested release files
+        run: |
+          options=(--verify-tag --latest=false --title "$RELEASE_TAG" --generate-notes)
+          if [[ "$RELEASE_TAG" == *-* ]]; then options+=(--prerelease); fi
+          gh release create "$RELEASE_TAG" dist/* --repo "$GITHUB_REPOSITORY" "${options[@]}"
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
-          SOURCE_RUN_ID: ${{ github.run_id }}

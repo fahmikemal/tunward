@@ -11,8 +11,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
-  RUST_VERSION: 1.97
+  RUST_VERSION: "1.97"
   # Test client only: the runner's OpenSSL 3.0 has no QUIC client to drive WebTransport handshakes.
   # The system library stays untouched; this build lives in its own prefix.
   OPENSSL_QUIC_VERSION: 3.5.9
@@ -24,50 +27,65 @@ jobs:
 
   secret-scan:
     name: Secret Scan (Gitleaks)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # Lists the pull request's commits to scan only those.
+      pull-requests: read
     steps:
       - name: Checkout Git repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Run Gitleaks Secret Detection
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   sast-scan:
     name: SAST Scan (Semgrep)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    container:
+      image: semgrep/semgrep:1.182.0@sha256:4a34048c04fef049f71665047f074cffb00cc3d89482f965a5cd151d589237af
     steps:
       - name: Checkout Git repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # Every finding fails the job. The excluded JavaScript rule only matches the ws:// scheme here:
+      # cleartext WebSocket is a supported transport, limited to loopback or --allow-insecure-dev
+      # and covered by the secure-defaults tests. Other intentional patterns carry nosemgrep notes.
       - name: Run Semgrep SAST
-        uses: returntocorp/semgrep-action@v1
-        with:
-          config: auto
+        run: >-
+          semgrep scan --config auto --error --metrics on
+          --exclude-rule javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
 
   scan-and-lint:
     name: Lint, Format & RustSec Audit
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - name: Checkout Git repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "${{ env.RUST_VERSION }}"
           components: rustfmt, clippy
 
-      - name: Install taplo-cli
-        uses: taiki-e/install-action@v2
+      - name: Install taplo-cli and cargo-deny
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
-          tool: taplo-cli
+          tool: taplo-cli,cargo-deny@0.20.2
 
       - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Check that every Rust toolchain pin matches rust-toolchain.toml
+        run: python3 scripts/check_toolchain_pins.py
 
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
@@ -79,6 +97,7 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts -p 'test_check_release*.py'
           python3 -m unittest discover -s scripts -p test_package_release.py
+          python3 -m unittest discover -s scripts -p test_check_toolchain_pins.py
 
       - name: Verify issue templates pass the auto-close workflow
         run: python3 -m unittest discover -s scripts -p test_issue_templates.py
@@ -86,28 +105,32 @@ jobs:
       - name: Lint with Clippy
         run: cargo clippy --all --all-features --locked -- -D warnings
 
+      - name: Check advisories, licenses, bans and sources (cargo-deny)
+        run: cargo deny --locked check
+
       - name: Security Vulnerability Scan (cargo-audit)
-        uses: actions-rust-lang/audit@v1
+        uses: actions-rust-lang/audit@72c09e02f132669d52284a3323acdb503cfc1a24 # v1.2.7
 
   test:
     name: Tests
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - name: Checkout Git repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "${{ env.RUST_VERSION }}"
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: cargo-nextest
 
       - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Test with aws-lc-rs
         run: cargo nextest run --locked
@@ -118,12 +141,13 @@ jobs:
   qualification:
     name: Local protocol and security regressions
     runs-on: ubuntu-24.04
+    timeout-minutes: 75
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "${{ env.RUST_VERSION }}"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Isolate qualification evidence from the build cache
         run: |
           echo "QUALIFICATION_ROOT=$RUNNER_TEMP/tw-q-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
@@ -157,7 +181,7 @@ jobs:
         run: python3 scripts/qualify_pool_timeout.py --output "$QUALIFICATION_ROOT/pool-delay"
       - name: Restore the OpenSSL QUIC test client
         id: openssl-quic
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/openssl-quic
           key: openssl-quic-${{ env.OPENSSL_QUIC_VERSION }}-${{ runner.os }}-${{ runner.arch }}
@@ -213,7 +237,7 @@ jobs:
           exit "$status"
       - name: Preserve qualification evidence
         if: always() && env.QUALIFICATION_ROOT != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: qualification-evidence
           path: |
