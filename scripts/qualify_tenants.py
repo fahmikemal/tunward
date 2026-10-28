@@ -204,6 +204,20 @@ class TenantChecks(QuotaChecks):
             return {"tenant_mode": enabled, "different_verified_device_cannot_reuse_cached_listener": True,
                     "quotas_and_revocation_not_required": True}
 
+    @staticmethod
+    async def udp_peer(endpoint, pause):
+        """Echoes datagrams of one peer before and after a pause longer than the listener's idle check."""
+        loop = asyncio.get_running_loop()
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as peer:
+            peer.setblocking(False)
+            peer.connect(("127.0.0.1", endpoint))
+            for seq in range(4):
+                if seq == 2:
+                    await asyncio.sleep(pause)
+                data = seq.to_bytes(4, "big") + random.randbytes(1196)
+                await loop.sock_sendall(peer, data)
+                assert await asyncio.wait_for(loop.sock_recv(peer, 65535), 2) == data, f"datagram {seq} was not echoed"
+
     async def ephemeral_protocols(self):
         async with self.server("ephemeral") as stack:
             for scheme in ("wss", "https", "wts"):
@@ -216,11 +230,13 @@ class TenantChecks(QuotaChecks):
                     endpoint = listener["assigned_port"]
                     assert self.pools[0] <= endpoint < self.pools[0] + 32, listener
                     if mode == "udp":
-                        await self.suite.udp(endpoint, 1200, 4)
+                        # With device quotas the listener checks for idleness every second; a UDP peer
+                        # depends on that listener, so it must still be served after a longer pause.
+                        await self.udp_peer(endpoint, 1.5)
                     else:
                         await self.suite.exchange(mode, endpoint, 1024)
             return {"transports": 3, "reverse_protocols": ["tcp", "udp", "socks5", "http"],
-                    "port_zero_allocations_stay_inside_owned_pool": True}
+                    "port_zero_allocations_stay_inside_owned_pool": True, "udp_peer_served_past_idle_check": True}
 
     async def unix(self):
         async with self.server("unix") as stack:
