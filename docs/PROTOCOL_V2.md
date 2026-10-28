@@ -171,7 +171,11 @@ this does not change wire protocol v2.
 Cleanup depends on receiver/waiter lifecycle and an idle timer. Ephemeral
 listeners use checks capped at five seconds by the configured idle timeout;
 fixed listeners use the configured interval. Quota-enabled unused listeners
-instead check at intervals capped at one second by that timeout. Transport
+instead check at intervals capped at one second by that timeout. A UDP listener
+stays open past these checks while it still serves a peer, because the listener
+sorts that peer's datagrams. An ephemeral listener belongs to the request that
+opened it: once that request has its connection, later connections to the same
+endpoint are dropped instead of waiting for a request that never comes. Transport
 teardown must be observed before reclaim, so do not promise immediate release
 on every disconnect. Validate cleanup and reconnection for the intended workload.
 An explicit policy revocation cancels its creator's listener independently of
