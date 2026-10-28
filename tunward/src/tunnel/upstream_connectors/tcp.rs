@@ -139,7 +139,7 @@ mod tests {
     #[tokio::test]
     async fn unpinned_connector_still_resolves_the_host() {
         let connector = TcpUpstreamConnector::new(
-            Host::Domain("unpinned.invalid".into()),
+            Host::Domain("unpinned.invalid.".into()),
             9,
             SoMark::new(None),
             Duration::from_secs(2),
