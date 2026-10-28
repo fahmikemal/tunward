@@ -99,6 +99,8 @@ checks apply at server startup; correct previously ignored field typos before up
 In accordance with enterprise secure defaults:
 - Any public or non-loopback listener (such as `0.0.0.0`, `[::]`, LAN, WAN, or non-localhost hostnames) strictly requires TLS (`wss://` or `wts://`), client certificate verification (`--tls-client-ca-certs`), and an explicit restriction policy (`--restrict-config`). For isolated local testing across interfaces, operators may supply `--allow-insecure-dev` to bypass these prerequisites (emits prominent security warnings on startup and does not relax loopback enforcement on `--management-api`).
 - **Deny-by-default access control**: In alignment with OWASP recommendations, Tunward denies all tunnel requests by default unless explicitly matched by `--restrict-to` or `--restrict-config`. Missing policies never synthesize an implicit `Allow All`.
+- **Destination CIDRs also bind domain names**: A restriction rule whose `cidr` constrains addresses allows a domain destination only at its resolved addresses inside that CIDR, and the server connects to those checked addresses without resolving again. See [destination policy](docs/using_mtls.md#destination-and-reverse-listener-policy) for the exact matching rules and migration.
+- **Bounded unauthenticated connections**: A TLS handshake must complete within `--tls-handshake-timeout` (default 10s), and at most `--max-pending-tls-handshakes` (default 1024) may be in progress on the TCP listener, and separately on the WebTransport listener, where a connection stays pending until it sends its session request; further connections are closed or refused on arrival while established sessions keep forwarding. After resource errors such as file-descriptor exhaustion, every accept loop pauses briefly and rate-limits its warnings instead of spinning.
 - **Default resource limits**: When mTLS is enabled, finite baseline limits (32 sessions, 256 tunnels, 100 rps / 200 burst, 10 MB/s bandwidth shaping) are enforced per verified device to protect against unrestricted resource consumption (OWASP API4:2023). Operators can supply custom limits via `--device-quota-config` or opt out via `--no-device-quotas`. Loopback listeners (`127.0.0.1`, `localhost`, `[::1]`) remain unrestricted for rapid local development.
 - **Modern PKI & SPIFFE/SAN Identity Extraction**: Supports extracting verified client identities from X.509 Common Name (`cn`), Subject Alternative Name URI (`san-uri` / SPIFFE ID), or Subject Alternative Name DNS (`san-dns`), enabling native integration with modern service meshes, MDM platforms, and enterprise PKI standards.
 
@@ -143,7 +145,7 @@ server log; use the socket command when completion must be acknowledged.
 | Tenant membership, roles, and resource scope | New requests use the current policy; removed, moved, or reduced grants disconnect that device's sessions and retained reverse listeners; equivalent/expanded grants and other devices stay connected |
 | Server certificate/key and client CA | TCP and QUIC acceptors switch for new handshakes; established sessions retain their original TLS authentication |
 | Device revocation | Keeps its independent one-second fail-closed reload and can terminate active work even when a grouped reload is rejected |
-| Listener address/port, transport enablement, file paths, inventory options, proxy/DNS/heartbeat/startup arguments | Restart required |
+| Listener address/port, transport enablement, file paths, inventory options, TLS handshake bounds, proxy/DNS/heartbeat/startup arguments | Restart required |
 
 In managed mode, restriction and TLS file watchers are disabled: edit all
 candidates, validate them with `server -t`, then request one reload. The default
@@ -417,6 +419,8 @@ tunward server --help
 | `--restrict-to HOST:PORT` | Server forward-destination allowlist; repeat as needed |
 | `--restrict-config FILE` | Reloadable YAML restriction rules; replaces CLI-generated restriction rules |
 | `--allow-insecure-dev` | Explicit exception permitting cleartext or unauthenticated non-loopback listeners for local testing; emits security warnings |
+| `--tls-handshake-timeout DURATION` | Close a TLS connection whose handshake (for WebTransport, also its session request) has not completed in time; default 10s, must be nonzero |
+| `--max-pending-tls-handshakes N` | TLS handshakes allowed in progress at once, per TCP and WebTransport listener; excess connections are closed or refused; default 1024 |
 | `-c, --connection-min-idle N` | Idle pool setting, default 0; accepted range 0..1000; WebTransport clamps to one session |
 | `--connection-retry-max-backoff DURATION` | Pool acquisition deadline, default 5m, must be nonzero |
 | `--reverse-tunnel-connection-retry-max-backoff DURATION` | Reverse reconnect backoff ceiling, default 1s |

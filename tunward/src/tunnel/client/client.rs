@@ -1,4 +1,5 @@
 use crate::executor::{DefaultTokioExecutor, TokioExecutorRef};
+use crate::protocols::tcp::AcceptBackoff;
 use crate::tunnel;
 use crate::tunnel::RemoteAddr;
 use crate::tunnel::client::ClientConfig;
@@ -129,12 +130,16 @@ impl<E: TokioExecutorRef> Client<E> {
 
     pub async fn run_tunnel(self, tunnel_listener: impl DownstreamListener) -> anyhow::Result<()> {
         pin_mut!(tunnel_listener);
+        let mut accept_backoff = AcceptBackoff::new("Error accepting connection");
         // everybody who connects to the local socket gets their own tunnel
         while let Some(cnx) = tunnel_listener.next().await {
             let (cnx_stream, remote_addr) = match cnx {
-                Ok((cnx_stream, remote_addr)) => (cnx_stream, remote_addr),
+                Ok((cnx_stream, remote_addr)) => {
+                    accept_backoff.reset();
+                    (cnx_stream, remote_addr)
+                }
                 Err(err) => {
-                    error!("Error accepting connection: {:?}", err);
+                    accept_backoff.wait(err.as_ref()).await;
                     continue;
                 }
             };

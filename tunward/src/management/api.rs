@@ -1,4 +1,5 @@
 use crate::management::registry::FleetRegistry;
+use crate::protocols::tcp::AcceptBackoff;
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::body::Incoming;
@@ -21,11 +22,15 @@ pub async fn run_management_server(bind_addr: SocketAddr, registry: FleetRegistr
 
     let auto_server = auto::Builder::new(TokioExecutor::new());
 
+    let mut accept_backoff = AcceptBackoff::new("Management API accept error");
     loop {
         let (stream, _remote_peer) = match listener.accept().await {
-            Ok(val) => val,
+            Ok(val) => {
+                accept_backoff.reset();
+                val
+            }
             Err(err) => {
-                error!("Management API accept error: {err}");
+                accept_backoff.wait(&err).await;
                 continue;
             }
         };

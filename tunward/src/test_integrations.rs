@@ -31,6 +31,7 @@ use tokio::pin;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use url::Host;
+use web_transport_quinn::quinn;
 
 /// Ports already handed out by [`free_port`] in this process. A port becomes free again as soon
 /// as the probe socket is dropped, so without this two calls could hand out the same one.
@@ -75,9 +76,9 @@ fn dns_resolver() -> DnsResolver {
     DnsResolver::new_from_urls(&[], None, SoMark::new(None), true).expect("Cannot create DNS resolver")
 }
 
-#[fixture]
-fn server_no_tls(dns_resolver: DnsResolver) -> Server {
-    let server_config = ServerConfig {
+/// Cleartext server configuration on a free loopback port, for tests to adjust before `Server::new`.
+fn server_config(dns_resolver: DnsResolver) -> ServerConfig {
+    ServerConfig {
         socket_so_mark: SoMark::new(None),
         bind: free_addr().0,
         websocket_ping_frequency: Some(Duration::from_secs(10)),
@@ -96,39 +97,35 @@ fn server_no_tls(dns_resolver: DnsResolver) -> Server {
         tenant_config: None,
         fleet_inventory_max_devices: std::num::NonZeroU32::new(10000).unwrap(),
         tls_client_identity_field: ClientIdentityField::default(),
-    };
-    Server::new(server_config, DefaultTokioExecutor::default())
+        tls_handshake_timeout: Duration::from_secs(10),
+        max_pending_tls_handshakes: std::num::NonZeroU32::new(1024).unwrap(),
+    }
+}
+
+/// The embedded self-signed certificate, without client authentication.
+fn embedded_tls() -> TlsServerConfig {
+    TlsServerConfig {
+        tls_certificate: parking_lot::Mutex::new(embedded_certificate::TLS_CERTIFICATE.0.clone()),
+        tls_key: parking_lot::Mutex::new(embedded_certificate::TLS_CERTIFICATE.1.clone_key()),
+        tls_client_ca_certificates: None,
+        tls_certificate_path: None,
+        tls_key_path: None,
+        tls_client_ca_certs_path: None,
+    }
+}
+
+#[fixture]
+fn server_no_tls(dns_resolver: DnsResolver) -> Server {
+    Server::new(server_config(dns_resolver), DefaultTokioExecutor::default())
 }
 
 /// Server serving webtransport over UDP, alongside websocket/http2 over TCP.
 #[fixture]
 fn server_webtransport(dns_resolver: DnsResolver) -> Server {
     let server_config = ServerConfig {
-        socket_so_mark: SoMark::new(None),
-        bind: free_addr().0,
-        websocket_ping_frequency: Some(Duration::from_secs(10)),
-        timeout_connect: Duration::from_secs(10),
-        websocket_mask_frame: false,
-        tls: Some(TlsServerConfig {
-            tls_certificate: parking_lot::Mutex::new(embedded_certificate::TLS_CERTIFICATE.0.clone()),
-            tls_key: parking_lot::Mutex::new(embedded_certificate::TLS_CERTIFICATE.1.clone_key()),
-            tls_client_ca_certificates: None,
-            tls_certificate_path: None,
-            tls_key_path: None,
-            tls_client_ca_certs_path: None,
-        }),
-        dns_resolver,
-        restriction_config: None,
-        http_proxy: None,
-        remote_server_idle_timeout: Duration::from_secs(30),
+        tls: Some(embedded_tls()),
         enable_webtransport: true,
-        management_api: None,
-        device_quotas: None,
-        device_revocation_config: None,
-        fleet_inventory: None,
-        tenant_config: None,
-        fleet_inventory_max_devices: std::num::NonZeroU32::new(10000).unwrap(),
-        tls_client_identity_field: ClientIdentityField::default(),
+        ..server_config(dns_resolver)
     };
     Server::new(server_config, DefaultTokioExecutor::default())
 }
@@ -784,6 +781,8 @@ async fn test_fleet_management_and_ephemeral_reverse_tunnel(
         tenant_config: None,
         fleet_inventory_max_devices: std::num::NonZeroU32::new(10000).unwrap(),
         tls_client_identity_field: ClientIdentityField::default(),
+        tls_handshake_timeout: Duration::from_secs(10),
+        max_pending_tls_handshakes: std::num::NonZeroU32::new(1024).unwrap(),
     };
     let server = Server::new(server_config, DefaultTokioExecutor::default());
     let server_port = server.config.bind.port();
@@ -907,4 +906,477 @@ async fn test_fleet_management_and_ephemeral_reverse_tunnel(
     let mut resp = String::new();
     stream.read_to_string(&mut resp).await.unwrap();
     assert!(resp.contains("\"active_clients\":1"));
+}
+
+/// Wss client with no idle pooled connection, so every tunnel opens and authenticates its own.
+async fn client_wss(server_port: u16, dns_resolver: DnsResolver) -> Client {
+    // The embedded certificate is self-signed with no SAN, so verification must be off.
+    let tls_connector =
+        crate::protocols::tls::tls_connector(false, TransportScheme::Wss.alpn_protocols(), true, None, None, None)
+            .unwrap();
+    let tls = TlsClientConfig {
+        tls_sni_disabled: false,
+        tls_sni_override: None,
+        tls_verify_certificate: false,
+        tls_connector: Arc::new(parking_lot::RwLock::new(tls_connector)),
+        tls_certificate_path: None,
+        tls_key_path: None,
+    };
+    let client = client_ws(server_port, dns_resolver).await;
+    let mut config = (*client.config).clone();
+    drop(client);
+    config.remote_addr =
+        TransportAddr::new(TransportScheme::Wss, Host::Ipv4(Ipv4Addr::LOCALHOST), server_port, Some(tls)).unwrap();
+    Client::new(
+        config,
+        0,
+        Duration::from_secs(5),
+        Duration::from_secs(1),
+        DefaultTokioExecutor::default(),
+    )
+    .await
+    .unwrap()
+}
+
+/// One allow rule per port: `cidr` constrains every destination on `port`.
+fn cidr_by_port(rules: &[(u16, &str)]) -> RestrictionsRules {
+    RestrictionsRules {
+        restrictions: vec![RestrictionConfig {
+            name: "cidr-by-port".into(),
+            r#match: vec![MatchConfig::Any],
+            allow: rules
+                .iter()
+                .map(|(port, cidr)| {
+                    AllowConfig::Tunnel(types::AllowTunnelConfig {
+                        protocol: vec![],
+                        port: std::iter::once(*port..=*port).collect(),
+                        host: types::default_host(),
+                        cidr: vec![cidr.parse().unwrap()],
+                    })
+                })
+                .collect(),
+        }],
+    }
+}
+
+/// Open a TCP tunnel to `destination` and report whether it reached `endpoint`, carrying data both
+/// ways. A rejected tunnel must close the local connection without the endpoint seeing a connection.
+async fn tcp_tunnel_reaches(client: &Client, destination: (Host, u16), endpoint: &TcpListener) -> bool {
+    let (tunnel_listen, _) = free_addr();
+    let listener = TcpDownstreamListener::new(tunnel_listen, destination, false)
+        .await
+        .unwrap();
+    let tunnel_client = client.clone();
+    let tunnel_h = tokio::spawn(async move {
+        let _ = tunnel_client.run_tunnel(listener).await;
+    });
+    defer! { tunnel_h.abort(); };
+
+    let mut local = TcpStream::connect(tunnel_listen).await.unwrap();
+    local.write_all(b"ping").await.unwrap();
+    let mut probe = [0; 4];
+    let reached = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            accepted = endpoint.accept() => {
+                let (mut accepted, _) = accepted.unwrap();
+                accepted.read_exact(&mut probe).await.unwrap();
+                assert_eq!(&probe, b"ping");
+                accepted.write_all(b"pong").await.unwrap();
+                local.read_exact(&mut probe).await.unwrap();
+                assert_eq!(&probe, b"pong");
+                true
+            }
+            read = local.read(&mut probe) => {
+                assert_eq!(read.unwrap_or(0), 0, "a rejected tunnel must not deliver data");
+                false
+            }
+        }
+    })
+    .await
+    .expect("the tunnel neither reached the endpoint nor was closed");
+    if !reached {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), endpoint.accept())
+                .await
+                .is_err(),
+            "a rejected tunnel reached the endpoint late"
+        );
+    }
+    reached
+}
+
+/// UDP counterpart of [`tcp_tunnel_reaches`]: a rejected tunnel delivers no datagram.
+async fn udp_tunnel_reaches(client: &Client, destination: (Host, u16), endpoint: &tokio::net::UdpSocket) -> bool {
+    let (tunnel_listen, _) = free_addr();
+    let listener = UdpDownstreamListener::new(tunnel_listen, destination, None)
+        .await
+        .unwrap();
+    let tunnel_client = client.clone();
+    let tunnel_h = tokio::spawn(async move {
+        let _ = tunnel_client.run_tunnel(listener).await;
+    });
+    defer! { tunnel_h.abort(); };
+
+    let local = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    local.connect(tunnel_listen).await.unwrap();
+    local.send(b"ping").await.unwrap();
+    let mut buf = [0; 16];
+    match tokio::time::timeout(Duration::from_secs(2), endpoint.recv_from(&mut buf)).await {
+        Ok(Ok((len, peer))) => {
+            assert_eq!(&buf[..len], b"ping");
+            endpoint.send_to(b"pong", peer).await.unwrap();
+            let len = tokio::time::timeout(Duration::from_secs(5), local.recv(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&buf[..len], b"pong");
+            true
+        }
+        _ => false,
+    }
+}
+
+#[rstest]
+#[case::websocket(TransportScheme::Ws)]
+#[case::http2(TransportScheme::Http)]
+#[case::webtransport(TransportScheme::Wts)]
+#[timeout(Duration::from_secs(60))]
+#[tokio::test]
+#[serial]
+async fn test_domain_destination_is_confined_to_restriction_cidr(
+    server_no_tls: Server,
+    server_webtransport: Server,
+    dns_resolver: DnsResolver,
+    #[case] scheme: TransportScheme,
+) {
+    // Endpoints listen on IPv4 loopback only. `localhost` also resolves to ::1, so the allowed case
+    // proves the tunnel dials the address its rule admitted.
+    let allowed_tcp = TcpListener::bind(free_addr().0).await.unwrap();
+    let decoy_tcp = TcpListener::bind(free_addr().0).await.unwrap();
+    let allowed_udp = tokio::net::UdpSocket::bind(free_addr().0).await.unwrap();
+    let decoy_udp = tokio::net::UdpSocket::bind(free_addr().0).await.unwrap();
+    let mapped_decoy = TcpListener::bind(free_addr().0).await.unwrap();
+    let [
+        allowed_tcp_port,
+        decoy_tcp_port,
+        allowed_udp_port,
+        decoy_udp_port,
+        mapped_decoy_port,
+    ] = [
+        allowed_tcp.local_addr().unwrap().port(),
+        decoy_tcp.local_addr().unwrap().port(),
+        allowed_udp.local_addr().unwrap().port(),
+        decoy_udp.local_addr().unwrap().port(),
+        mapped_decoy.local_addr().unwrap().port(),
+    ];
+    let restrictions = cidr_by_port(&[
+        (allowed_tcp_port, "127.0.0.1/32"),
+        (allowed_udp_port, "127.0.0.1/32"),
+        (decoy_tcp_port, "10.0.0.0/8"),
+        (decoy_udp_port, "10.0.0.0/8"),
+        (mapped_decoy_port, "::/0"),
+    ]);
+
+    let server = match scheme {
+        TransportScheme::Wts => server_webtransport,
+        _ => server_no_tls,
+    };
+    let port = server.config.bind.port();
+    let server_h = tokio::spawn(server.serve(restrictions));
+    defer! { server_h.abort(); };
+    let client = match scheme {
+        TransportScheme::Wts => client_webtransport(port, dns_resolver.clone()).await,
+        _ => {
+            let client = client_ws(port, dns_resolver.clone()).await;
+            let mut config = (*client.config).clone();
+            drop(client);
+            config.remote_addr = TransportAddr::new(scheme, Host::Ipv4(Ipv4Addr::LOCALHOST), port, None).unwrap();
+            Client::new(
+                config,
+                1,
+                Duration::from_secs(5),
+                Duration::from_secs(1),
+                DefaultTokioExecutor::default(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    let localhost = |port| (Host::Domain("localhost".to_string()), port);
+    assert!(
+        tcp_tunnel_reaches(&client, localhost(allowed_tcp_port), &allowed_tcp).await,
+        "{scheme:?}: a domain resolving inside the CIDR must be allowed"
+    );
+    assert!(
+        !tcp_tunnel_reaches(&client, localhost(decoy_tcp_port), &decoy_tcp).await,
+        "{scheme:?}: a domain resolving outside the CIDR must not bypass it"
+    );
+    assert!(
+        !tcp_tunnel_reaches(&client, (Host::Ipv4(Ipv4Addr::LOCALHOST), decoy_tcp_port), &decoy_tcp).await,
+        "{scheme:?}: an address outside the CIDR stays denied"
+    );
+    assert!(
+        !tcp_tunnel_reaches(
+            &client,
+            (Host::Ipv6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()), mapped_decoy_port),
+            &mapped_decoy
+        )
+        .await,
+        "{scheme:?}: an IPv4-mapped address must follow IPv4 rules, not ::/0"
+    );
+    assert!(
+        udp_tunnel_reaches(&client, localhost(allowed_udp_port), &allowed_udp).await,
+        "{scheme:?}: UDP to a domain resolving inside the CIDR must be allowed"
+    );
+    assert!(
+        !udp_tunnel_reaches(&client, localhost(decoy_udp_port), &decoy_udp).await,
+        "{scheme:?}: UDP to a domain resolving outside the CIDR must not bypass it"
+    );
+}
+
+/// Minimal loopback DNS responder. The n-th A query is answered with `answers[n]` (the last one
+/// repeats) and a zero TTL; other query types get an empty NOERROR answer.
+async fn rebinding_dns(answers: Vec<Ipv4Addr>) -> (u16, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let a_queries = Arc::new(AtomicUsize::new(0));
+    let counter = a_queries.clone();
+    let task = tokio::spawn(async move {
+        let mut buf = [0u8; 512];
+        while let Ok((len, peer)) = socket.recv_from(&mut buf).await {
+            let query = &buf[..len];
+            // Skip the QNAME labels to the QTYPE and QCLASS of the single question.
+            let mut end = 12;
+            while end < len && query[end] != 0 {
+                end += 1 + query[end] as usize;
+            }
+            if end + 5 > len {
+                continue;
+            }
+            let qtype = u16::from_be_bytes([query[end + 1], query[end + 2]]);
+            let answer = (qtype == 1).then(|| answers[counter.fetch_add(1, Ordering::SeqCst).min(answers.len() - 1)]);
+            let mut response = Vec::with_capacity(64);
+            response.extend_from_slice(&query[..2]);
+            response.extend_from_slice(&[0x81, 0x80, 0, 1, 0, u8::from(answer.is_some()), 0, 0, 0, 0]);
+            response.extend_from_slice(&query[12..end + 5]);
+            if let Some(ip) = answer {
+                // Name pointer to the question, type A, class IN, TTL 0, four bytes of address.
+                response.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 0, 0, 4]);
+                response.extend_from_slice(&ip.octets());
+            }
+            let _ = socket.send_to(&response, peer).await;
+        }
+    });
+    (port, a_queries, task)
+}
+
+/// A domain admitted by its CIDR is dialed at the address that was checked. Resolving it again for
+/// the connection would let a DNS answer that changed in between (rebinding) reach another address.
+#[cfg(target_os = "linux")]
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[tokio::test]
+#[serial]
+async fn test_domain_destination_is_pinned_against_dns_rebinding(dns_resolver: DnsResolver) {
+    let allowed = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let port = allowed.local_addr().unwrap().port();
+    // Linux routes all of 127.0.0.0/8 to loopback, so this second address is reachable too.
+    let forbidden = TcpListener::bind((Ipv4Addr::new(127, 0, 0, 2), port)).await.unwrap();
+
+    let (dns_port, a_queries, dns_h) = rebinding_dns(vec![Ipv4Addr::LOCALHOST, Ipv4Addr::new(127, 0, 0, 2)]).await;
+    defer! { dns_h.abort(); };
+    let server_resolver = DnsResolver::new_from_urls(
+        &[url::Url::parse(&format!("dns://127.0.0.1:{dns_port}")).unwrap()],
+        None,
+        SoMark::new(None),
+        false,
+    )
+    .unwrap();
+    let server = Server::new(server_config(server_resolver.clone()), DefaultTokioExecutor::default());
+    let server_port = server.config.bind.port();
+    let server_h = tokio::spawn(server.serve(cidr_by_port(&[(port, "127.0.0.1/32")])));
+    defer! { server_h.abort(); };
+    let client = client_ws(server_port, dns_resolver).await;
+
+    let rebinding = (Host::Domain("rebind.tunward.test".to_string()), port);
+    assert!(tcp_tunnel_reaches(&client, rebinding.clone(), &allowed).await);
+    assert_eq!(
+        a_queries.load(Ordering::SeqCst),
+        1,
+        "the connection must reuse the checked answer instead of resolving again"
+    );
+
+    // Self-check that the resolver does not cache this zero-TTL answer: had the server resolved
+    // again, it would have been handed the forbidden address.
+    let next = server_resolver.lookup_host("rebind.tunward.test", port).await.unwrap();
+    assert_eq!(next, vec![SocketAddr::from((Ipv4Addr::new(127, 0, 0, 2), port))]);
+
+    // Once the name only resolves outside the CIDR, the tunnel is rejected.
+    assert!(!tcp_tunnel_reaches(&client, rebinding, &forbidden).await);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), forbidden.accept())
+            .await
+            .is_err(),
+        "the forbidden address must never be dialed"
+    );
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[tokio::test]
+#[serial]
+async fn test_pending_tls_handshakes_are_bounded_without_affecting_sessions(
+    no_restrictions: RestrictionsRules,
+    dns_resolver: DnsResolver,
+) {
+    const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(1500);
+    let server = Server::new(
+        ServerConfig {
+            tls: Some(embedded_tls()),
+            tls_handshake_timeout: HANDSHAKE_TIMEOUT,
+            max_pending_tls_handshakes: std::num::NonZeroU32::new(2).unwrap(),
+            ..server_config(dns_resolver.clone())
+        },
+        DefaultTokioExecutor::default(),
+    );
+    let server_addr = server.config.bind;
+    let server_h = tokio::spawn(server.serve(no_restrictions));
+    defer! { server_h.abort(); };
+    let client = client_wss(server_addr.port(), dns_resolver).await;
+
+    let endpoint = TcpListener::bind(free_addr().0).await.unwrap();
+    let endpoint_port = endpoint.local_addr().unwrap().port();
+    let destination = (Host::Ipv4(Ipv4Addr::LOCALHOST), endpoint_port);
+
+    // An authenticated session established before the flood.
+    let (tunnel_listen, _) = free_addr();
+    let listener = TcpDownstreamListener::new(tunnel_listen, destination.clone(), false)
+        .await
+        .unwrap();
+    let tunnel_client = client.clone();
+    let tunnel_h = tokio::spawn(async move {
+        let _ = tunnel_client.run_tunnel(listener).await;
+    });
+    defer! { tunnel_h.abort(); };
+    let mut session = TcpStream::connect(tunnel_listen).await.unwrap();
+    session.write_all(b"before").await.unwrap();
+    let (mut session_endpoint, _) = endpoint.accept().await.unwrap();
+    let mut buf = [0; 6];
+    session_endpoint.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"before");
+
+    // Peers that connect but never send a ClientHello fill every handshake slot...
+    let mut idle = Vec::new();
+    for _ in 0..2 {
+        idle.push(TcpStream::connect(server_addr).await.unwrap());
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // ...so the next connection is closed as soon as it is accepted, instead of holding a descriptor.
+    let started = tokio::time::Instant::now();
+    let mut shed = TcpStream::connect(server_addr).await.unwrap();
+    let mut probe = [0; 1];
+    let read = tokio::time::timeout(Duration::from_secs(1), shed.read(&mut probe))
+        .await
+        .expect("an excess handshake must be closed right away");
+    assert_eq!(read.unwrap_or(0), 0);
+    assert!(started.elapsed() < HANDSHAKE_TIMEOUT, "closed by the limit, not the timeout");
+
+    // The established session keeps forwarding during the flood.
+    session_endpoint.write_all(b"during").await.unwrap();
+    session.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"during");
+
+    // Pending handshakes are closed once the timeout elapses, which frees their slots.
+    for mut stream in idle {
+        let read = tokio::time::timeout(HANDSHAKE_TIMEOUT * 3, stream.read(&mut probe))
+            .await
+            .expect("an idle handshake must be closed by --tls-handshake-timeout");
+        assert_eq!(read.unwrap_or(0), 0);
+    }
+    assert!(started.elapsed() >= HANDSHAKE_TIMEOUT - Duration::from_millis(400));
+
+    // New authenticated sessions are accepted again.
+    let fresh = TcpListener::bind(free_addr().0).await.unwrap();
+    let fresh_port = fresh.local_addr().unwrap().port();
+    assert!(tcp_tunnel_reaches(&client, (Host::Ipv4(Ipv4Addr::LOCALHOST), fresh_port), &fresh).await);
+}
+
+/// A QUIC connection that completes its handshake, then never sends the HTTP/3 request that would
+/// open a WebTransport session.
+async fn quic_without_connect(server: SocketAddr) -> Result<quinn::Connection, quinn::ConnectionError> {
+    // The embedded certificate is self-signed with no SAN, so verification must be off.
+    let tls = crate::protocols::tls::quic_client_config(false, None, None).unwrap();
+    let quic_tls = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
+    let mut endpoint = quinn::Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic_tls)));
+    endpoint.connect(server, "localhost").unwrap().await
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[tokio::test]
+#[serial]
+async fn test_webtransport_handshakes_are_bounded_without_affecting_sessions(
+    no_restrictions: RestrictionsRules,
+    dns_resolver: DnsResolver,
+) {
+    const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(1500);
+    let server = Server::new(
+        ServerConfig {
+            tls: Some(embedded_tls()),
+            enable_webtransport: true,
+            // No pings means no QUIC idle timeout either, so only the handshake bounds can apply.
+            websocket_ping_frequency: None,
+            tls_handshake_timeout: HANDSHAKE_TIMEOUT,
+            max_pending_tls_handshakes: std::num::NonZeroU32::new(2).unwrap(),
+            ..server_config(dns_resolver.clone())
+        },
+        DefaultTokioExecutor::default(),
+    );
+    let server_addr = server.config.bind;
+    let server_h = tokio::spawn(server.serve(no_restrictions));
+    defer! { server_h.abort(); };
+
+    let reachable = |listener: &TcpListener| (Host::Ipv4(Ipv4Addr::LOCALHOST), listener.local_addr().unwrap().port());
+    let endpoint = TcpListener::bind(free_addr().0).await.unwrap();
+    let client = client_webtransport(server_addr.port(), dns_resolver.clone()).await;
+    assert!(tcp_tunnel_reaches(&client, reachable(&endpoint), &endpoint).await);
+
+    // Peers that complete QUIC but never send their CONNECT fill every handshake slot...
+    let mut idle = Vec::new();
+    for _ in 0..2 {
+        idle.push(
+            quic_without_connect(server_addr)
+                .await
+                .expect("the QUIC handshake itself must succeed"),
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // ...so the next connection is refused instead of being kept pending.
+    let started = tokio::time::Instant::now();
+    assert!(
+        quic_without_connect(server_addr).await.is_err(),
+        "a connection beyond --max-pending-tls-handshakes must be refused"
+    );
+    assert!(started.elapsed() < HANDSHAKE_TIMEOUT, "refused by the limit, not the timeout");
+
+    // The established session keeps opening tunnels during the flood.
+    let during = TcpListener::bind(free_addr().0).await.unwrap();
+    assert!(tcp_tunnel_reaches(&client, reachable(&during), &during).await);
+
+    // Pending connections are closed once the timeout elapses, even without a QUIC idle timeout.
+    for connection in idle {
+        tokio::time::timeout(HANDSHAKE_TIMEOUT * 3, connection.closed())
+            .await
+            .expect("a connection without CONNECT must be closed by --tls-handshake-timeout");
+    }
+    assert!(started.elapsed() >= HANDSHAKE_TIMEOUT - Duration::from_millis(400));
+
+    // New sessions are accepted again.
+    let fresh_client = client_webtransport(server_addr.port(), dns_resolver).await;
+    let fresh = TcpListener::bind(free_addr().0).await.unwrap();
+    assert!(tcp_tunnel_reaches(&fresh_client, reachable(&fresh), &fresh).await);
 }

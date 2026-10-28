@@ -62,6 +62,10 @@ pub(crate) fn load_server_files(args: &ServerCreationRequest) -> anyhow::Result<
         !(args.no_device_quotas && args.device_quota_config.is_some()),
         "--no-device-quotas conflicts with --device-quota-config"
     );
+    ensure!(
+        !args.tls_handshake_timeout.is_zero(),
+        "--tls-handshake-timeout must be greater than zero"
+    );
     DnsResolver::validate_urls(&args.dns_resolver)?;
     let http_proxy = crate::mk_http_proxy(
         args.http_proxy.clone(),
@@ -270,7 +274,22 @@ mod tests {
             allow_insecure_dev: false,
             no_device_quotas: false,
             tls_client_identity_field: ClientIdentityField::Cn,
+            tls_handshake_timeout: Duration::from_secs(10),
+            max_pending_tls_handshakes: std::num::NonZeroU32::new(1024).unwrap(),
         }
+    }
+
+    #[test]
+    fn test_tls_handshake_timeout_must_be_nonzero() {
+        let mut req = sample_server_request("ws://127.0.0.1:8080");
+        req.tls_handshake_timeout = Duration::ZERO;
+        let Err(err) = load_server_files(&req) else {
+            panic!("expected a zero handshake timeout to be rejected");
+        };
+        assert!(
+            err.to_string()
+                .contains("--tls-handshake-timeout must be greater than zero")
+        );
     }
 
     #[test]

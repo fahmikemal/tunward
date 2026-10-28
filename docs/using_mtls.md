@@ -133,6 +133,25 @@ restrictions:
         cidr: [127.0.0.1/32]
 ~~~
 
+A `!Tunnel` rule matches a literal IP destination against `cidr`. A domain
+destination must match `host`, and when `cidr` constrains addresses (anything
+except an empty list or one covering both `0.0.0.0/0` and `::/0`), the server
+also resolves the domain and allows it only at its resolved addresses inside
+`cidr`. It then connects to those checked addresses without resolving again, so
+a DNS answer that changes in between cannot redirect the tunnel. Omitting `host`
+keeps the default `^.*$`: a rule listing only `cidr` admits any name that
+resolves into it, and nothing else. `cidr: []` authorizes names by `host` alone,
+as `--restrict-to HOST:PORT` does. IPv4-mapped IPv6 addresses such as
+`::ffff:10.0.0.1` are matched as their IPv4 address, for forward and reverse
+rules. A domain that cannot be resolved does not match a constraining rule. With
+the server's `--http-proxy`, a checked domain is sent to the proxy as its first
+allowed address.
+
+Earlier builds allowed a domain matching `host` whatever it resolved to, even
+when `cidr` excluded that address. If a rule relied on that, list the
+destination's addresses in `cidr`, or authorize the name explicitly with a
+`host` pattern and `cidr: []`.
+
 Use `--restrict-config /path/to/your-restrictions.yaml` instead of
 `--restrict-to` in the server example. Then a client can use
 `-R tcp://127.0.0.1:0:127.0.0.1:3000` with its existing TLS options.

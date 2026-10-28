@@ -53,6 +53,18 @@ class ServerConfigTests(unittest.TestCase):
                     self.invoke(flag, f"{scheme}://127.0.0.1:8443")
         self.invoke("-t", "--enable-webtransport", "wss://127.0.0.1:8443")
 
+    def test_tls_handshake_bounds(self):
+        self.invoke("-t", *self.tls(), "--tls-handshake-timeout", "3s", "--max-pending-tls-handshakes", "8",
+                    "wss://127.0.0.1:8443")
+        zero = self.invoke("-t", "--tls-handshake-timeout", "0s", "wss://127.0.0.1:8443", valid=False)
+        self.assertEqual(zero.returncode, 1, zero.stderr)
+        self.assertIn("--tls-handshake-timeout must be greater than zero", zero.stderr)
+        from_env = self.invoke("-t", "wss://127.0.0.1:8443", valid=False,
+                               env={**self.env, "TUNWARD_TLS_HANDSHAKE_TIMEOUT": "0"})
+        self.assertIn("--tls-handshake-timeout must be greater than zero", from_env.stderr)
+        no_slots = self.invoke("-t", "--max-pending-tls-handshakes", "0", "wss://127.0.0.1:8443", valid=False)
+        self.assertEqual(no_slots.returncode, 2, no_slots.stderr)
+
     def test_complete_policy_without_inventory_or_keylog_writes(self):
         with tempfile.TemporaryDirectory(dir=self.root) as directory:
             directory = Path(directory)

@@ -591,6 +591,8 @@ async fn run_server_impl(
         fleet_inventory_max_devices: args.fleet_inventory_max_devices,
         tenant_config: args.tenant_config,
         tls_client_identity_field: args.tls_client_identity_field,
+        tls_handshake_timeout: args.tls_handshake_timeout,
+        max_pending_tls_handshakes: args.max_pending_tls_handshakes,
     };
     let mut server = Server::new(server_config, executor);
     if let (Some(state), Some(reload)) = (managed, reload) {

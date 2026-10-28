@@ -41,7 +41,9 @@ With `--tls-client-ca-certs`, a client must authenticate with a certificate
 from a trusted issuer. The application then requires exactly one nonempty,
 readable client CN and binds it to the path prefix on WSS, HTTP/2, and
 WebTransport. A missing/ambiguous CN is rejected. Destination and reverse-bind
-rules still need explicit configuration.
+rules still need explicit configuration. A destination rule whose `cidr`
+constrains addresses confines domain destinations to their resolved addresses
+inside it, and those checked addresses are the ones dialed.
 
 The v2 routing envelope is unsigned routing metadata. It is not an
 authentication token. `--client-id`, `--device-id`, and their headers are
@@ -92,7 +94,16 @@ delivery. CA reload alone is not active-session revocation or a complete PKI
 lifecycle. Bytes already delivered cannot be recalled.
 
 Proxy handler/queue limits, QUIC stream credit, and process resource controls
-have narrower scopes than device quotas. Local tests, successful authentication,
+have narrower scopes than device quotas. TLS handshakes are bounded by
+`--tls-handshake-timeout` and `--max-pending-tls-handshakes`, on the TCP listener
+and separately on the WebTransport listener, where a connection stays pending
+until it sends its session request. Peers that never authenticate therefore
+cannot exhaust descriptors or memory, but while a handshake flood lasts it can
+still delay new sessions. Tunward deliberately has no per-address limit: devices
+behind carrier-grade NAT share addresses and reconnect together after an outage.
+Rate-limit new connections per source in the network instead, for example with
+nftables `ct count`/`meter` rules, a load balancer, or a DDoS-protection service,
+covering both the TCP port and, for WebTransport, the UDP port. Local tests, successful authentication,
 and container execution do not establish production capacity or certification.
 See [qualification](docs/STAGING_QUALIFICATION.md) for coverage and open limits.
 

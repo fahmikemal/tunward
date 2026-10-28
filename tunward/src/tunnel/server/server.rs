@@ -3,6 +3,7 @@ use crate::executor::DefaultTokioExecutor;
 use crate::management::registry::{ConnectionLease, TunnelLease};
 use crate::protocols;
 use crate::protocols::dns::DnsResolver;
+use crate::protocols::tcp::{AcceptBackoff, LogLimiter};
 use crate::protocols::tls;
 use crate::quotas::{DeviceQuotaConfig, QuotaError, QuotaManager, QuotaSession, TunnelPermit};
 use crate::reload::{ReloadState, ServerReload};
@@ -19,8 +20,8 @@ use crate::tunnel::server::handler_websocket::ws_server_upgrade;
 use crate::tunnel::server::handler_webtransport;
 use crate::tunnel::server::reverse_tunnel::{ListenerOwner, ReverseTunnelServer};
 use crate::tunnel::server::utils::{
-    HttpResponse, bad_request, extract_authorization, extract_path_prefix, extract_tunnel_info,
-    extract_x_forwarded_for, find_mapped_port, quota_rejection, validate_tunnel, validate_tunnel_with_scope,
+    DestinationGrant, HttpResponse, bad_request, extract_authorization, extract_path_prefix, extract_tunnel_info,
+    extract_x_forwarded_for, find_mapped_port, needs_resolution, quota_rejection, validate_tunnel_with_scope,
 };
 use crate::tunnel::tls_reloader::TlsReloader;
 use crate::tunnel::upstream_connectors::{TcpUpstreamConnector, UdpUpstreamConnector, UpstreamConnector};
@@ -40,13 +41,14 @@ use socket2::SockRef;
 use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::hash::{Hash, Hasher};
-use std::net::{Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tracing::{Instrument, Level, Span, error, info, span, warn};
@@ -76,7 +78,7 @@ pub struct ServerConfig {
     /// Additionally serve WebTransport over UDP on the same port as the TCP listener.
     /// Requires TLS, since QUIC mandates TLS 1.3.
     pub enable_webtransport: bool,
-    /// [Optional] Enable local REST management API on the specified socket address.
+    /// Optional local REST management API, served on this socket address.
     pub management_api: Option<SocketAddr>,
     pub device_quotas: Option<DeviceQuotaConfig>,
     pub device_revocation_config: Option<PathBuf>,
@@ -84,6 +86,13 @@ pub struct ServerConfig {
     pub fleet_inventory_max_devices: std::num::NonZeroU32,
     pub tenant_config: Option<PathBuf>,
     pub tls_client_identity_field: ClientIdentityField,
+    /// Close a TLS connection whose handshake has not completed within this delay. A WebTransport
+    /// connection is pending until its session request arrives.
+    pub tls_handshake_timeout: Duration,
+    /// TLS handshakes allowed in progress at once, per listener (TCP, and WebTransport when enabled).
+    /// Connections beyond it are closed on arrival, so peers that never authenticate cannot exhaust
+    /// file descriptors or memory. Established sessions do not count.
+    pub max_pending_tls_handshakes: std::num::NonZeroU32,
 }
 
 #[derive(Clone, Default)]
@@ -300,16 +309,31 @@ impl<E: crate::TokioExecutorRef> Server<E> {
         })?;
 
         let authorization = extract_authorization(req);
-        let restriction = match &restrict_path_prefix.tenant {
-            Some(tenant) => validate_tunnel_with_scope(&remote, path_prefix, authorization, &restrictions, |rule| {
-                tenant.allows(&remote.protocol, &rule.name)
-            }),
-            None => validate_tunnel(&remote, path_prefix, authorization, &restrictions),
+        let scope = |rule: &RestrictionConfig| {
+            restrict_path_prefix
+                .tenant
+                .as_ref()
+                .is_none_or(|tenant| tenant.allows(&remote.protocol, &rule.name))
+        };
+        let resolved = if needs_resolution(&remote, path_prefix, authorization, &restrictions, scope) {
+            self.resolve_for_restrictions(&remote).await
+        } else {
+            None
+        };
+        let (restriction, grant) =
+            validate_tunnel_with_scope(&remote, path_prefix, authorization, &restrictions, resolved.as_deref(), scope)
+                .ok_or_else(|| {
+                    match &resolved {
+                        Some(addresses) => warn!(
+                            "Rejecting connection with not allowed destination: {remote:?} resolves to {addresses:?}, outside the allowed CIDRs"
+                        ),
+                        None => warn!("Rejecting connection with not allowed destination: {remote:?}"),
+                    }
+                    bad_request()
+                })?;
+        if let DestinationGrant::Addresses(addresses) = &grant {
+            info!("Destination {} is pinned to its allowed addresses {addresses:?}", remote.host);
         }
-        .ok_or_else(|| {
-            warn!("Rejecting connection with not allowed destination: {remote:?}");
-            bad_request()
-        })?;
         if let Some(tenant) = &restrict_path_prefix.tenant {
             if !remote.protocol.is_reverse_tunnel()
                 && self
@@ -366,7 +390,7 @@ impl<E: crate::TokioExecutorRef> Server<E> {
         let req_protocol = remote.protocol.clone();
         let tunnel = revocation
             .run(self.exec_tunnel(
-                restriction,
+                (restriction, grant),
                 remote,
                 client_addr,
                 (quota.as_ref(), &revocation, fleet.as_ref()),
@@ -395,15 +419,36 @@ impl<E: crate::TokioExecutorRef> Server<E> {
         })
     }
 
+    /// Resolve a forward domain whose candidate restrictions only allow it inside their CIDRs.
+    /// A failed lookup leaves those rules unmatched, rather than allowing the name.
+    async fn resolve_for_restrictions(&self, remote: &RemoteAddr) -> Option<Vec<IpAddr>> {
+        let Host::Domain(domain) = &remote.host else {
+            return None;
+        };
+        let lookup = self.config.dns_resolver.lookup_host(domain, remote.port);
+        match tokio::time::timeout(self.config.timeout_connect, lookup).await {
+            Ok(Ok(addresses)) => Some(addresses.into_iter().map(|address| address.ip()).collect()),
+            Ok(Err(err)) => {
+                warn!("Cannot resolve {domain} to check it against the restriction CIDRs: {err:#}");
+                None
+            }
+            Err(_) => {
+                warn!("Timed out resolving {domain} to check it against the restriction CIDRs");
+                None
+            }
+        }
+    }
+
     async fn exec_tunnel(
         &self,
-        restriction: &RestrictionConfig,
+        allowed: (&RestrictionConfig, DestinationGrant),
         remote: RemoteAddr,
         client_address: SocketAddr,
         resources: (Option<&TunnelPermit>, &RevocationGuard, Option<&TunnelLease>),
         owner: &ListenerOwner,
         tenant: Option<&TenantAccess>,
     ) -> anyhow::Result<(RemoteAddr, Pin<Box<dyn AsyncRead + Send>>, Pin<Box<dyn AsyncWrite + Send>>)> {
+        let (restriction, grant) = allowed;
         let (quota, revocation, fleet) = resources;
         match remote.protocol {
             LocalProtocol::Udp { timeout, .. } => {
@@ -413,7 +458,8 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                     self.config.socket_so_mark,
                     timeout.unwrap_or(Duration::from_secs(10)),
                     self.config.dns_resolver.clone(),
-                );
+                )
+                .with_addresses(grant.into_addresses());
                 let (rx, tx) = match &self.config.http_proxy {
                     None => connector.connect(&None).await?,
                     Some(_) => Err(anyhow!("UDP tunneling is not supported with HTTP proxy"))?,
@@ -428,7 +474,8 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                     self.config.socket_so_mark,
                     Duration::from_secs(10),
                     self.config.dns_resolver.clone(),
-                );
+                )
+                .with_addresses(grant.into_addresses());
                 let (rx, mut tx) = match &self.config.http_proxy {
                     None => connector.connect(&None).await?,
                     Some(proxy_url) => connector.connect_with_http_proxy(proxy_url, &None).await?,
@@ -829,13 +876,41 @@ impl<E: crate::TokioExecutorRef> Server<E> {
             });
         }
 
+        // A peer holds its connection unauthenticated until the TLS handshake completes. Bound both
+        // how long and how many of those may be pending, so they cannot exhaust file descriptors.
+        let pending_handshakes = Arc::new(Semaphore::new(self.config.max_pending_tls_handshakes.get() as usize));
+        let shed_log = LogLimiter::new(Duration::from_secs(10));
+        let timeout_log = Arc::new(LogLimiter::new(Duration::from_secs(10)));
+        let mut accept_backoff = AcceptBackoff::new("Error while accepting connection");
         loop {
             let (stream, peer_addr) = match listener.accept().await {
-                Ok(ret) => ret,
+                Ok(ret) => {
+                    accept_backoff.reset();
+                    ret
+                }
                 Err(err) => {
-                    warn!("Error while accepting connection {:?}", err);
+                    accept_backoff.wait(&err).await;
                     continue;
                 }
+            };
+
+            let handshake_permit = if tls_context.is_some() {
+                match pending_handshakes.clone().try_acquire_owned() {
+                    Ok(permit) => Some(permit),
+                    Err(_) => {
+                        if let Some(suppressed) = shed_log.check() {
+                            warn!(
+                                suppressed,
+                                "Closing connection from {peer_addr}: {} TLS handshakes already pending (--max-pending-tls-handshakes)",
+                                self.config.max_pending_tls_handshakes
+                            );
+                        }
+                        drop(stream);
+                        continue;
+                    }
+                }
+            } else {
+                None
             };
 
             let span = span!(Level::INFO, "cnx", peer = peer_addr.to_string());
@@ -855,15 +930,27 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                         Some(state) => state.snapshot().tcp_tls.clone().expect("TLS mode is fixed at startup"),
                         None => tls.tls_acceptor().clone(),
                     };
+                    let timeout_log = timeout_log.clone();
                     let fut = async move {
                         info!("Doing TLS handshake");
-                        let tls_stream = match tls_acceptor.accept(stream).await {
-                            Ok(tls_stream) => hyper_util::rt::TokioIo::new(tls_stream),
-                            Err(err) => {
+                        let handshake_timeout = server.config.tls_handshake_timeout;
+                        let tls_stream = match tokio::time::timeout(handshake_timeout, tls_acceptor.accept(stream)).await {
+                            Ok(Ok(tls_stream)) => hyper_util::rt::TokioIo::new(tls_stream),
+                            Ok(Err(err)) => {
                                 error!("error while accepting TLS connection {}", err);
                                 return;
                             }
+                            Err(_) => {
+                                if let Some(suppressed) = timeout_log.check() {
+                                    warn!(
+                                        suppressed,
+                                        "Closing connection whose TLS handshake did not complete within {handshake_timeout:?} (--tls-handshake-timeout)"
+                                    );
+                                }
+                                return;
+                            }
                         };
+                        drop(handshake_permit);
 
                         let tls_ctx = tls_stream.inner().get_ref().1;
                         let identity_required = server
@@ -1003,6 +1090,8 @@ impl Debug for ServerConfig {
             .field("enable_webtransport", &self.enable_webtransport)
             .field("device_quotas", &self.device_quotas)
             .field("tls_client_identity_field", &self.tls_client_identity_field)
+            .field("tls_handshake_timeout", &self.tls_handshake_timeout)
+            .field("max_pending_tls_handshakes", &self.max_pending_tls_handshakes)
             .field(
                 "mTLS",
                 &self

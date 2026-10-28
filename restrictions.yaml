@@ -36,6 +36,8 @@ restrictions:
         # if the tunnel wants to connect to a specific host, this regex must match
         host: ^.*$
         # if the tunnel wants to connect to a specific IP, it must be included in one of the network cidr
+        # A host name must also resolve inside them, unless the list is empty or covers all of IPv4 and IPv6;
+        # the server then connects only to the resolved addresses that are inside.
         # Logical OR
         cidr:
           - 0.0.0.0/0

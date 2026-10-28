@@ -57,6 +57,8 @@ impl FromStr for ClientIdentityField {
     }
 }
 
+// Field docs double as the CLI help text, so bracketed examples such as `[::1]` and bare URLs stay as written.
+#[allow(rustdoc::broken_intra_doc_links, rustdoc::bare_urls)]
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "clap", derive(clap::Args))]
 pub struct ClientCreationRequest {
@@ -328,6 +330,8 @@ pub struct ClientCreationRequest {
     pub client_id: Option<String>,
 }
 
+// Field docs double as the CLI help text, so bracketed notes such as `[Optional]` and bare URLs stay as written.
+#[allow(rustdoc::broken_intra_doc_links, rustdoc::bare_urls)]
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "clap", derive(clap::Args))]
 pub struct ServerCreationRequest {
@@ -458,6 +462,36 @@ pub struct ServerCreationRequest {
         )
     )]
     pub tls_client_identity_field: ClientIdentityField,
+
+    /// Close a TLS connection whose handshake has not completed within this delay.
+    /// Until then the peer is unauthenticated, as its client certificate is only verified during
+    /// the handshake. A WebTransport connection must also send its session request in that time.
+    /// Must be greater than zero.
+    #[cfg_attr(feature = "clap", arg(
+        long,
+        value_name = "DURATION(s|m|h)",
+        default_value = "10s",
+        value_parser = parsers::parse_duration_sec,
+        env = "TUNWARD_TLS_HANDSHAKE_TIMEOUT",
+        verbatim_doc_comment
+    ))]
+    pub tls_handshake_timeout: Duration,
+
+    /// Maximum TLS handshakes in progress at once, for the TCP listener and separately for the
+    /// WebTransport listener. Further connections are closed (WebTransport: refused) as soon as they
+    /// arrive, until a pending handshake completes or times out, so peers that never authenticate
+    /// cannot exhaust file descriptors or memory. Established sessions do not count.
+    #[cfg_attr(
+        feature = "clap",
+        arg(
+            long,
+            value_name = "N",
+            default_value = "1024",
+            env = "TUNWARD_MAX_PENDING_TLS_HANDSHAKES",
+            verbatim_doc_comment
+        )
+    )]
+    pub max_pending_tls_handshakes: std::num::NonZeroU32,
 
     /// If set, will use this http proxy to connect to the client
     #[cfg_attr(
