@@ -3,6 +3,12 @@ name: Native runtime qualification
 on:
   workflow_call:
 
+permissions:
+  contents: read
+
+env:
+  RUST_VERSION: "1.97"
+
 jobs:
   native:
     strategy:
@@ -12,14 +18,14 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
-          toolchain: "1.97"
-      - uses: actions/setup-python@v5
+          toolchain: "${{ env.RUST_VERSION }}"
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Remove legacy qualification fixtures restored with the build cache
         run: python -c "from pathlib import Path; import shutil; p = Path('target/qualification'); shutil.rmtree(p) if p.exists() else None"
       - name: Use Git OpenSSL on Windows
@@ -39,7 +45,7 @@ jobs:
         run: python scripts/qualify_reload.py --output "${{ runner.temp }}/tunward-native-${{ github.run_id }}-${{ github.run_attempt }}/reload"
       - name: Preserve native evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: native-runtime-${{ matrix.os }}
           path: |

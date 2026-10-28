@@ -711,7 +711,8 @@ class Suite:
                             await w.drain()
                             assert b" 200 " in (await r.readuntil(b"\r\n\r\n")).split(b"\r\n")[0]
                             assert await r.readexactly(9) == b"origin-ok"
-                            w.write(request.replace(f"Proxy-Authorization: Basic {token}\r\n".encode(), b""))
+                            # Raw request to a loopback test origin through the proxy under test, not a Django response.
+                            w.write(request.replace(f"Proxy-Authorization: Basic {token}\r\n".encode(), b""))  # nosemgrep: python.django.security.injection.request-data-write.request-data-write
                             await w.drain()
                             assert b" 407 " in (await r.readuntil(b"\r\n\r\n")).split(b"\r\n")[0]
                             return {"second_unauthenticated_request_rejected": True}

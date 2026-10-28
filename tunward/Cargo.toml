@@ -5,6 +5,8 @@ edition = "2024"
 authors = ["Fahmi Kemal <fahmi@kemal.id>"]
 repository = "https://github.com/fahmikemal/tunward.git"
 license = "Apache-2.0"
+# Shipped as binaries and container images, never to crates.io.
+publish = false
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
@@ -67,7 +69,7 @@ rcgen = { version = "0.14.10", default-features = false, features = [] }
 # declared directly so embedded_certificate can read the current year.
 time = { version = "0.3.55", default-features = false, features = ["std"] }
 hickory-resolver = { version = "0.26.3", default-features = false, features = ["system-config", "tokio"] }
-aws-lc-rs = { version = "*", optional = true }
+aws-lc-rs = { version = "1.18.1", optional = true }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 [target.'cfg(not(target_family = "unix"))'.dependencies]

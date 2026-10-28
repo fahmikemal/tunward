@@ -2,7 +2,7 @@ ARG BUILDER_IMAGE=builder_cache
 
 ############################################################
 # Cache image with all the deps
-FROM rust:1.97-trixie AS builder_cache
+FROM rust:1.97-trixie@sha256:b1b3c9c0d921d7fa0a6d1f9ec7e4eab87f8c8ec97644c3d791450f131dec813f AS builder_cache
 
 RUN rustup component add rustfmt clippy && apt-get update && apt-get install cmake libclang-dev -y
 
@@ -37,7 +37,7 @@ RUN cargo build --features=jemalloc --profile=${PROFILE} ${BIN_TARGET}
 
 ############################################################
 # Final image
-FROM debian:trixie-slim AS final-image
+FROM debian:trixie-slim@sha256:89c1ea91e897f0fe0a3731595330bc45b8bdef4047464a07116f891a94054b31 AS final-image
 
 RUN useradd -ms /bin/bash app && \
         apt-get update && \

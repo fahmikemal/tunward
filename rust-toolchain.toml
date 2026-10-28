@@ -1,0 +1,6 @@
+# The single Rust version for local builds, CI, releases and the Dockerfile builder image.
+# scripts/check_toolchain_pins.py fails CI when any other pin disagrees with this channel.
+[toolchain]
+channel = "1.97"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

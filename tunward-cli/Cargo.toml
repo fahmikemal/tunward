@@ -5,6 +5,8 @@ edition = "2024"
 authors = ["Fahmi Kemal <fahmi@kemal.id>"]
 repository = "https://github.com/fahmikemal/tunward.git"
 license = "Apache-2.0"
+# Shipped as binaries and container images, never to crates.io.
+publish = false
 
 [dependencies]
 anyhow = "1.0.104"

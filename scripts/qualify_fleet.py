@@ -58,7 +58,8 @@ class FleetChecks(QuotaChecks):
         def fetch():
             request = urllib.request.Request(f'http://127.0.0.1:{stack["management"]}{path}', method=method)
             try:
-                response = urllib.request.urlopen(request, timeout=5)
+                # The URL is always the loopback management API started by this suite.
+                response = urllib.request.urlopen(request, timeout=5)  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
             except urllib.error.HTTPError as error:
                 response = error
             with response:
@@ -90,7 +91,8 @@ class FleetChecks(QuotaChecks):
             assert {d["id"] for d in devices} == {"device-a", "device-b"}, devices
             assert sum(d["active_tunnels"] for d in devices) == 4
             def fetch_metrics():
-                with urllib.request.urlopen(f'http://127.0.0.1:{stack["management"]}/metrics') as r:
+                # The URL is always the loopback management API started by this suite.
+                with urllib.request.urlopen(f'http://127.0.0.1:{stack["management"]}/metrics') as r:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
                     return r.read().decode()
             metrics = await asyncio.to_thread(fetch_metrics)
             assert "tunward_health_status 1" in metrics
