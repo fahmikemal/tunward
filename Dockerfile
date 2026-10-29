@@ -60,4 +60,9 @@ EXPOSE 8080
 USER app
 
 ENTRYPOINT ["/usr/bin/dumb-init", "-v", "--"]
-CMD ["/bin/sh", "-c", "exec /home/app/tunward server ${SERVER_PROTOCOL}://${SERVER_LISTEN}:${SERVER_PORT}"]
+# The default server is complete and secure. It expects these files mounted read-only, and
+# refuses to start without them:
+#   /etc/tunward/tls/server.pem, /etc/tunward/tls/server.key, /etc/tunward/tls/client-ca.pem
+#   /etc/tunward/restrictions.yaml
+# Override the command to run a client or other options.
+CMD ["/bin/sh", "-c", "exec /home/app/tunward server --tls-certificate /etc/tunward/tls/server.pem --tls-private-key /etc/tunward/tls/server.key --tls-client-ca-certs /etc/tunward/tls/client-ca.pem --restrict-config /etc/tunward/restrictions.yaml ${SERVER_PROTOCOL}://${SERVER_LISTEN}:${SERVER_PORT}"]
