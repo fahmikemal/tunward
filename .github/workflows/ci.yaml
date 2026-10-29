@@ -183,6 +183,8 @@ jobs:
           test "$(docker image inspect tunward-container:ci --format '{{.Config.User}}')" = '10001:10001'
           docker run --rm --network none --read-only --cap-drop ALL tunward-container:ci /home/app/tunward --version
           docker run --rm --network none --read-only --cap-drop ALL tunward-container:ci /home/app/tunward --help > /dev/null
+          # The image's own default command serves with the documented files mounted and refuses without them.
+          python3 scripts/qualify_container_defaults.py --image tunward-container:ci --output "$QUALIFICATION_ROOT/container"
       - name: Qualify transports and security
         timeout-minutes: 15
         run: python3 scripts/qualify.py --sections protocols,fleet,security,extended,isolation,soak,lifecycle,rotation --devices 32 --idle 128 --hold 5 --output "$QUALIFICATION_ROOT/main"

@@ -7,6 +7,8 @@ pub mod quotas;
 pub mod reload;
 #[cfg(unix)]
 pub mod reload_socket;
+#[cfg(test)]
+mod repository_examples;
 mod restrictions;
 mod revocation;
 mod server_config;

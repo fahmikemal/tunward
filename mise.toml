@@ -41,27 +41,68 @@ run = """
  docker buildx rm builder
 """
 
-[tasks.publish-release]
-description = "Push a new release of tunward"
-usage = '''
-arg "version" "version of tunward to release"
-flag "-f --force" default=""
-'''
-run = """
-if [ '$usage_force' = 'true' ]; then
-  export FORCE="-f"
+[tasks.release-prepare]
+description = "Open a pull request that bumps both packages to VERSION; main accepts changes only through pull requests"
+usage = 'arg "<version>" help="the version without the v prefix, such as 0.1.0-beta.3"'
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+version="${usage_version:?}"
+tag="v$version"
+branch="release/$tag"
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  echo "Commit or stash local changes first" >&2
+  exit 1
 fi
+git fetch --quiet origin
+git switch --quiet --create "$branch" origin/main
+python3 - "$version" <<'PY'
+import re, sys
+from pathlib import Path
+for manifest in ("tunward/Cargo.toml", "tunward-cli/Cargo.toml"):
+    path = Path(manifest)
+    text, count = re.subn(r'(?m)^version = ".*"$', f'version = "{sys.argv[1]}"', path.read_text(), count=1)
+    if count != 1:
+        sys.exit(f"{manifest}: no package version line")
+    path.write_text(text)
+PY
+# Refresh the two packages' entries in Cargo.lock, and refuse a version the release workflow would reject.
+cargo metadata --format-version 1 > /dev/null
+python3 scripts/check_release_tag.py --ref "refs/tags/$tag" > /dev/null
+git add tunward/Cargo.toml tunward-cli/Cargo.toml Cargo.lock
+git commit --quiet -m "chore(release): bump version to $version"
+git push --quiet --set-upstream origin "$branch"
+gh pr create --base main --head "$branch" --title "chore(release): bump version to $version" \
+  --body "Bumps tunward and tunward-cli to $version. Once this is merged and CI on main passes, run \`mise run release-tag $version\`."
+'''
 
-sed -i 's/^version = .*/version = "$usage_version"/g' tunward-cli/Cargo.toml tunward/Cargo.toml
-cargo fmt --all -- --check --color=always || (echo "Use cargo fmt to format your code"; exit 1)
-#cargo clippy --all -- -D warnings || (echo "Solve your clippy warnings to succeed"; exit 1)
-
-git add tunward/Cargo.* tunward-cli/Cargo.* Cargo.*
-git commit -m 'Bump version v'$usage_version
-git tag $FORCE v$usage_version -m 'version v'$usage_version
-git push $FORCE
-git push $FORCE origin v$usage_version
-"""
+[tasks.release-tag]
+description = "Tag main as vVERSION once the version bump is merged and CI on main passed; pushes only the tag"
+usage = 'arg "<version>" help="the version without the v prefix, such as 0.1.0-beta.3"'
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+version="${usage_version:?}"
+tag="v$version"
+git fetch --quiet --tags origin
+git switch --quiet main
+git merge --ff-only --quiet origin/main
+# Published release tags are never moved or reused.
+if git rev-parse --quiet --verify "refs/tags/$tag" > /dev/null; then
+  echo "$tag already exists" >&2
+  exit 1
+fi
+python3 scripts/check_release_tag.py --ref "refs/tags/$tag" > /dev/null
+head=$(git rev-parse HEAD)
+conclusion=$(gh run list --workflow ci.yaml --branch main --commit "$head" --json conclusion --jq '.[0].conclusion // ""')
+if [ "$conclusion" != success ]; then
+  echo "CI on main $head is '${conclusion:-not run}', not success; wait for it before tagging" >&2
+  exit 1
+fi
+git tag --annotate "$tag" --message "version $tag" "$head"
+git push origin "refs/tags/$tag"
+echo "Pushed $tag; the release workflow now builds, attests and publishes it"
+'''
 
 [tasks.bench]
 description = "End-to-end benchmark with iperf3 (throughput, cpu, memory). See docs/BENCHMARKING.md"

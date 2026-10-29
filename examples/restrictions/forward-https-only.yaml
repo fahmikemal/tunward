@@ -1,0 +1,9 @@
+# Only allow forward tunnels to port 443, and no reverse tunnels.
+restrictions:
+  - name: "Forward HTTPS only"
+    match:
+      - !PathPrefix "^.*$"
+    allow:
+      - !Tunnel
+        port:
+          - 443

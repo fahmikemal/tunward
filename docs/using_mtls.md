@@ -165,9 +165,11 @@ records certificate observations; it does not enroll devices, authorize access,
 or store their private keys. Keep CNs unique within the server's trusted-issuer
 scope and stable during routine certificate/key renewal.
 
-The repository's [restrictions.yaml](../restrictions.yaml) demonstrates the
-schema and contains broad examples. Review each rule before adapting it; do not
-assume it is a restrictive deployment policy. Forward rule fields include
+The repository's [restrictions.yaml](../restrictions.yaml) demonstrates every
+field in one deliberately broad rule, and
+[examples/restrictions](../examples/restrictions) holds smaller single-purpose
+policies. Review each rule before adapting it; do not assume either is a
+restrictive deployment policy. A test loads every example, so they stay valid. Forward rule fields include
 protocol, port, host regex, and CIDR; reverse rules include protocol, bind CIDR,
 ports/mappings, and Unix path regex. Device quotas use a separate
 [quota configuration](DEVICE_QUOTAS.md), enabled with `--device-quota-config`;

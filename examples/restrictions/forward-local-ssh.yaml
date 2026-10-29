@@ -1,0 +1,14 @@
+# Only allow forward tunnels to the local SSH server, and no reverse tunnels.
+restrictions:
+  - name: "Forward to local SSH"
+    match:
+      - !PathPrefix "^.*$"
+    allow:
+      - !Tunnel
+        protocol:
+          - Tcp
+        port:
+          - 22
+        host: ^localhost$
+        cidr:
+          - 127.0.0.1/32

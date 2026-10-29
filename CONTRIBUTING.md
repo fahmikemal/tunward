@@ -102,8 +102,8 @@ and release tasks. For example:
 mise run test
 ~~~
 
-Read maintenance/release tasks before using them: some update dependencies or
-commit, tag, and push. This checkout does not contain a `justfile`; the direct
+Read maintenance/release tasks before using them: some update dependencies,
+open pull requests, or push tags. This checkout does not contain a `justfile`; the direct
 commands above are the reference.
 
 `scripts/bench.sh` is a separate iperf3/perf helper, not the qualification
@@ -143,6 +143,21 @@ and private keys out of release artifacts.
 requests targeting `main`, and manual dispatch. Its jobs include Gitleaks,
 Semgrep, formatting, Clippy, a RustSec audit, provider-specific Rust tests, and
 local qualification.
+
+`main` accepts changes only through pull requests with passing CI, so a release
+takes two steps:
+
+~~~sh
+mise run release-prepare 0.1.0-beta.3   # branch, bump both manifests and Cargo.lock, open the PR
+# review and merge the pull request, and wait for CI on main to pass
+mise run release-tag 0.1.0-beta.3       # tag main and push only the tag
+~~~
+
+`release-prepare` refuses a dirty working tree and a version the release
+workflow would reject. `release-tag` refuses an existing tag, since release tags
+are never moved or reused. It also refuses a version that is not the one on
+`main`, and a `main` commit whose CI has not passed. It creates an annotated tag
+and pushes nothing but that tag.
 
 The [release workflow](.github/workflows/release.yaml) runs only on pushed `v*`
 tags. `scripts/check_release_tag.py` requires `vMAJOR.MINOR.PATCH[-prerelease]`

@@ -182,8 +182,28 @@ docker build -t tunward:local .
 docker run --rm tunward:local /home/app/tunward --help
 ~~~
 
-The image uses `dumb-init` as its entrypoint. When overriding its default command,
-invoke `/home/app/tunward` followed by the usual client/server arguments.
+The image uses `dumb-init` as its entrypoint. Its default command runs a complete
+mTLS server on `wss://[::]:8080` and expects these read-only mounts:
+
+| Path | Content |
+| --- | --- |
+| `/etc/tunward/tls/server.pem` | Server certificate chain |
+| `/etc/tunward/tls/server.key` | Server private key, readable by the container user |
+| `/etc/tunward/tls/client-ca.pem` | CA certificates trusted for client authentication |
+| `/etc/tunward/restrictions.yaml` | Restriction policy |
+
+~~~sh
+docker run -d --name tunward --read-only --cap-drop ALL -p 127.0.0.1:8443:8080 \
+  -v "$PWD/tls:/etc/tunward/tls:ro" \
+  -v "$PWD/restrictions.yaml:/etc/tunward/restrictions.yaml:ro" \
+  oph1uchus/tunward:v0.1.0-beta.2
+~~~
+
+Without them the container exits and names the first missing file instead of
+starting an unauthenticated listener. `SERVER_PROTOCOL`, `SERVER_LISTEN` and
+`SERVER_PORT` still select the listener. CI starts the release image with its
+default command, with and without these mounts. When overriding the default
+command, invoke `/home/app/tunward` followed by the usual client/server arguments.
 Provision server certificates, the server key, and trusted client CA certificates
 through read-only runtime mounts; exclude the CA signing key from those mounts.
 Ensure the container UID can read its own key without making it world-readable.
