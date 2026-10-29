@@ -1,0 +1,3 @@
+# The maintainer reviews every change; GitHub requests that review on each pull request,
+# Dependabot's included. To give a path an additional owner, list it below this line.
+* @fahmikemal

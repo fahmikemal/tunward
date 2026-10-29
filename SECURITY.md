@@ -38,9 +38,11 @@ domain/IP and configure the client trust store. Cleartext `ws://` and
 `http://` provide no transport confidentiality.
 
 With `--tls-client-ca-certs`, a client must authenticate with a certificate
-from a trusted issuer. The application then requires exactly one nonempty,
-readable client CN and binds it to the path prefix on WSS, HTTP/2, and
-WebTransport. A missing/ambiguous CN is rejected. Destination and reverse-bind
+from a trusted issuer. The application then takes the client identity from
+exactly one nonempty Common Name, or, with `--tls-client-identity-field`, from
+exactly one SAN URI (such as a SPIFFE ID) or SAN DNS name, and binds it to the
+path prefix on WSS, HTTP/2, and WebTransport. A missing or ambiguous identity is
+rejected. Destination and reverse-bind
 rules still need explicit configuration. A destination rule whose `cidr`
 constrains addresses confines domain destinations to their resolved addresses
 inside it, and those checked addresses are the ones dialed.
@@ -70,10 +72,11 @@ policy. A healthy API response does not prove tunnel or device health.
 
 ## Known implementation limits
 
-Optional [device quotas](docs/DEVICE_QUOTAS.md) enforce session/tunnel admission,
-attempt rate, and directional payload shaping against verified mTLS CNs. They
-are disabled by default and scoped to one Server instance, with no persistent
-usage or cross-replica coordination. Caller labels cannot select a quota account.
+[Device quotas](docs/DEVICE_QUOTAS.md) enforce session/tunnel admission,
+attempt rate, and directional payload shaping against verified device
+identities. Under mTLS the default limits apply unless `--device-quota-config`
+replaces them or `--no-device-quotas` disables them. They are scoped to one
+Server instance, with no persistent usage or cross-replica coordination. Caller labels cannot select a quota account.
 Quota-enabled retained reverse resources remain charged and their reuse is
 identity-scoped. Quotas do not perform enrollment or grant tenant roles. Fleet connection/tunnel accounting is shared across all
 transports; caller labels remain unverified and can group unrelated devices.
