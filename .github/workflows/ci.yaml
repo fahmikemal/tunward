@@ -15,7 +15,7 @@ permissions:
   contents: read
 
 env:
-  RUST_VERSION: "1.97"
+  RUST_VERSION: "1.99"
   # Test client only: the runner's OpenSSL 3.0 has no QUIC client to drive WebTransport handshakes.
   # The system library stays untouched; this build lives in its own prefix.
   OPENSSL_QUIC_VERSION: 3.5.9

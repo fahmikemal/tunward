@@ -12,6 +12,9 @@ SOURCES = {
     ".github/workflows/release.yaml": r'^\s*RUST_VERSION:\s*"?([0-9][0-9.]*)"?\s*$',
     ".github/workflows/runtime-qualification.yaml": r'^\s*RUST_VERSION:\s*"?([0-9][0-9.]*)"?\s*$',
     "Dockerfile": r"^FROM rust:([0-9][0-9.]*)-",
+    # The documented version, so the prose cannot fall behind the pins.
+    "README.md": r"CI currently uses Rust ([0-9][0-9.]*[0-9])\.",
+    "CONTRIBUTING.md": r"CI pins Rust ([0-9][0-9.]*[0-9]) ",
 }
 
 
