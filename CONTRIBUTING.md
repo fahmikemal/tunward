@@ -6,7 +6,7 @@ Keep documentation, client/server behavior, and migration instructions together.
 
 ## Environment
 
-CI pins Rust 1.97 and uses edition 2024. No separate minimum supported Rust
+CI pins Rust 1.99 and uses edition 2024. No separate minimum supported Rust
 version is declared in the manifests. Install the native toolchain/build
 dependencies required by your target and TLS provider; the Linux container build
 installs CMake and libclang.

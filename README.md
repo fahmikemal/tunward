@@ -51,7 +51,7 @@ with the qualification gates above still open.
 
 ## Build and release artifacts
 
-CI currently uses Rust 1.97. The manifests use edition 2024 and do not declare a
+CI currently uses Rust 1.99. The manifests use edition 2024 and do not declare a
 separate minimum supported Rust version.
 
 ~~~sh
