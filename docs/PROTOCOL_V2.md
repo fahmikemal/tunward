@@ -118,7 +118,10 @@ WebTransport writes routing metadata before awaiting the server reply, making a
 new QUIC stream visible to the peer. The reply is a length-prefixed routing
 envelope sent after the destination is connected or a reverse visitor accepted.
 It also carries the destination for dynamic reverse proxies. A rejected stream
-is reset while other session streams can remain usable.
+is reset while other session streams can remain usable. The client honors a
+reply's destination only for dynamic reverse proxies (SOCKS5, HTTP proxy); a
+fixed reverse tunnel ignores it, logs a warning, and connects to its configured
+target.
 
 Normal acknowledgement and idle reverse-request waiting use distinct deadlines.
 A WebTransport acknowledgement timeout invalidates the cached session so later

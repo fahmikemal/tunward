@@ -9,7 +9,7 @@ use crate::somark::SoMark;
 use crate::tunnel::client::{Client, ClientConfig, TlsClientConfig};
 use crate::tunnel::downstream_listeners::{Socks5DownstreamListener, TcpDownstreamListener, UdpDownstreamListener};
 use crate::tunnel::server::{Server, ServerConfig, TlsServerConfig};
-use crate::tunnel::transport::{TransportAddr, TransportScheme};
+use crate::tunnel::transport::{TransportAddr, TransportScheme, tunnel_to_jwt_token};
 use crate::tunnel::upstream_connectors::TcpUpstreamConnector;
 use crate::tunnel::{LocalProtocol, RemoteAddr};
 use bytes::BytesMut;
@@ -31,6 +31,7 @@ use tokio::pin;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use url::Host;
+use uuid::Uuid;
 use web_transport_quinn::quinn;
 
 /// Ports already handed out by [`free_port`] in this process. A port becomes free again as soon
@@ -358,6 +359,106 @@ async fn test_tcp_tunnel(server_no_tls: Server, no_restrictions: RestrictionsRul
     dd.write_all(b"world!").await.unwrap();
     client.read_buf(&mut buf).await.unwrap();
     assert_eq!(&buf[..6], b"world!");
+}
+
+/// A fixed reverse tunnel connects only to its configured target, even when the server's response
+/// names another destination, as a hostile or compromised server could.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[tokio::test]
+#[serial]
+async fn test_fixed_reverse_tunnel_ignores_a_destination_named_by_the_server(
+    server_no_tls: Server,
+    no_restrictions: RestrictionsRules,
+    dns_resolver: DnsResolver,
+) {
+    let server_addr = server_no_tls.config.bind;
+    let server_h = tokio::spawn(server_no_tls.serve(no_restrictions));
+    defer! { server_h.abort(); };
+
+    // A service on the client's network that the hostile server tries to reach through the client.
+    let decoy = TcpListener::bind(free_addr().0).await.unwrap();
+    let cookie = tunnel_to_jwt_token(
+        Uuid::from_u128(0),
+        &RemoteAddr {
+            protocol: LocalProtocol::Tcp { proxy_protocol: false },
+            host: Host::Ipv4(Ipv4Addr::LOCALHOST),
+            port: decoy.local_addr().unwrap().port(),
+        },
+    );
+
+    // Plays the hostile server: relays to the real one and names the decoy in each response.
+    let relay = TcpListener::bind(free_addr().0).await.unwrap();
+    let relay_port = relay.local_addr().unwrap().port();
+    let relay_h = tokio::spawn(async move {
+        loop {
+            let (downstream, _) = relay.accept().await.unwrap();
+            let cookie = cookie.clone();
+            tokio::spawn(async move {
+                let upstream = TcpStream::connect(server_addr).await.unwrap();
+                let (mut down_r, mut down_w) = downstream.into_split();
+                let (mut up_r, mut up_w) = upstream.into_split();
+                tokio::spawn(async move { tokio::io::copy(&mut down_r, &mut up_w).await });
+                let mut head = Vec::new();
+                let mut byte = [0; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if up_r.read(&mut byte).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    head.push(byte[0]);
+                }
+                let head = String::from_utf8(head).unwrap();
+                let head = head.replacen("\r\n", &format!("\r\ncookie: {cookie}\r\n"), 1);
+                down_w.write_all(head.as_bytes()).await.unwrap();
+                let _ = tokio::io::copy(&mut up_r, &mut down_w).await;
+            });
+        }
+    });
+    defer! { relay_h.abort(); };
+
+    let client = client_ws(relay_port, dns_resolver.clone()).await;
+    let target = TcpListener::bind(free_addr().0).await.unwrap();
+    let (reverse_addr, reverse_host) = free_addr();
+    let connector = TcpUpstreamConnector::new(
+        Host::Ipv4(Ipv4Addr::LOCALHOST),
+        target.local_addr().unwrap().port(),
+        SoMark::new(None),
+        Duration::from_secs(1),
+        dns_resolver,
+    );
+    let client_h = tokio::spawn(client.run_reverse_tunnel(
+        RemoteAddr {
+            protocol: LocalProtocol::ReverseTcp,
+            host: reverse_host,
+            port: reverse_addr.port(),
+        },
+        connector,
+    ));
+    defer! { client_h.abort(); };
+
+    let mut application = loop {
+        match TcpStream::connect(reverse_addr).await {
+            Ok(stream) => break stream,
+            Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(err) => panic!("Cannot connect to reverse listener: {err}"),
+        }
+    };
+    application.write_all(b"to the target").await.unwrap();
+    let (mut accepted, _) = tokio::time::timeout(Duration::from_secs(3), target.accept())
+        .await
+        .expect("the configured target was not reached")
+        .unwrap();
+    let mut buf = [0; 13];
+    accepted.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"to the target");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), decoy.accept())
+            .await
+            .is_err(),
+        "the client connected to the destination the server named"
+    );
 }
 
 #[rstest]
