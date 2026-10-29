@@ -50,7 +50,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, oneshot};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tracing::{Instrument, Level, Span, debug, error, info, span, warn};
@@ -693,6 +693,18 @@ impl<E: crate::TokioExecutorRef> Server<E> {
         }
     }
 
+    /// Runs a listener beside the TCP accept loop, reporting how it ends.
+    fn spawn_sibling(
+        &self,
+        listener: impl Future<Output = anyhow::Result<()>> + Send + 'static,
+    ) -> oneshot::Receiver<anyhow::Result<()>> {
+        let (ended, outcome) = oneshot::channel();
+        self.executor.spawn(async move {
+            let _ = ended.send(listener.await);
+        });
+        outcome
+    }
+
     pub async fn serve(mut self, restrictions: RestrictionsRules) -> anyhow::Result<()> {
         if let Some(path) = &self.config.tenant_config {
             anyhow::ensure!(
@@ -871,29 +883,27 @@ impl<E: crate::TokioExecutorRef> Server<E> {
 
         // WebTransport needs its own UDP socket, so it runs as a sibling of the TCP accept loop
         // below. One server process then answers websocket, http2 and webtransport clients.
+        // Each sibling listener is bound before any connection is accepted, so one that cannot
+        // bind stops startup, and one that stops later stops the server: neither may leave it
+        // running without part of the service it was configured for.
+        let mut webtransport = None;
         if self.config.enable_webtransport {
             if self.config.tls.is_none() {
                 return Err(anyhow!(
                     "--enable-webtransport requires TLS: QUIC mandates TLS 1.3, so it cannot be served on a cleartext ws:// or http:// endpoint. Use wss:// or wts://."
                 ));
             }
-
+            let listener = handler_webtransport::bind_webtransport(&self)?;
             let server = self.clone();
             let restrictions = restrictions.restrictions_rules().clone();
-            self.executor.spawn(async move {
-                if let Err(err) = handler_webtransport::run_webtransport_server(server, restrictions).await {
-                    error!("Webtransport server stopped: {err:?}");
-                }
-            });
+            webtransport =
+                Some(self.spawn_sibling(handler_webtransport::run_webtransport_server(server, restrictions, listener)));
         }
 
+        let mut management = None;
         if let (Some(mgmt_addr), Some(reg)) = (self.config.management_api, &self.fleet_registry) {
-            let reg = reg.clone();
-            self.executor.spawn(async move {
-                if let Err(err) = crate::management::run_management_server(mgmt_addr, reg).await {
-                    error!("Management REST API stopped: {err:?}");
-                }
-            });
+            let listener = crate::management::api::bind_management_api(mgmt_addr).await?;
+            management = Some(self.spawn_sibling(crate::management::api::serve_management_api(listener, reg.clone())));
         }
 
         // A peer holds its connection unauthenticated until the TLS handshake completes. Bound both
@@ -903,15 +913,19 @@ impl<E: crate::TokioExecutorRef> Server<E> {
         let timeout_log = Arc::new(LogLimiter::new(Duration::from_secs(10)));
         let mut accept_backoff = AcceptBackoff::new("Error while accepting connection");
         loop {
-            let (stream, peer_addr) = match listener.accept().await {
-                Ok(ret) => {
-                    accept_backoff.reset();
-                    ret
-                }
-                Err(err) => {
-                    accept_backoff.wait(&err).await;
-                    continue;
-                }
+            let (stream, peer_addr) = tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok(ret) => {
+                        accept_backoff.reset();
+                        ret
+                    }
+                    Err(err) => {
+                        accept_backoff.wait(&err).await;
+                        continue;
+                    }
+                },
+                err = sibling_stopped("the WebTransport listener", &mut webtransport) => return Err(err),
+                err = sibling_stopped("the management API", &mut management) => return Err(err),
             };
 
             let handshake_permit = if tls_context.is_some() {
@@ -1125,6 +1139,19 @@ impl Debug for ServerConfig {
     }
 }
 
+/// Resolves once a listener from [`Server::spawn_sibling`] ends, with the error that stops the
+/// server; never resolves when there is no such listener.
+async fn sibling_stopped(name: &str, sibling: &mut Option<oneshot::Receiver<anyhow::Result<()>>>) -> anyhow::Error {
+    let Some(outcome) = sibling else {
+        return std::future::pending().await;
+    };
+    match outcome.await {
+        Ok(Err(err)) => err.context(format!("{name} stopped")),
+        Ok(Ok(())) => anyhow!("{name} stopped"),
+        Err(_) => anyhow!("{name} stopped unexpectedly"),
+    }
+}
+
 async fn bind_reverse<T, F, Fut>(
     bind: SocketAddr,
     tenant: Option<&TenantAccess>,
@@ -1176,5 +1203,36 @@ impl TlsContext<'_> {
         }
 
         &self.tls_acceptor
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_stopped_sibling_listener_stops_the_server() {
+        let (ended, outcome) = oneshot::channel();
+        ended.send(Err(anyhow!("socket closed"))).unwrap();
+        let err = sibling_stopped("the WebTransport listener", &mut Some(outcome)).await;
+        assert_eq!(format!("{err:#}"), "the WebTransport listener stopped: socket closed");
+
+        let (ended, outcome) = oneshot::channel();
+        ended.send(Ok(())).unwrap();
+        let err = sibling_stopped("the management API", &mut Some(outcome)).await;
+        assert_eq!(err.to_string(), "the management API stopped");
+
+        // A task that ended without reporting, as an aborted or panicked one does.
+        let (ended, outcome) = oneshot::channel::<anyhow::Result<()>>();
+        drop(ended);
+        let err = sibling_stopped("the management API", &mut Some(outcome)).await;
+        assert_eq!(err.to_string(), "the management API stopped unexpectedly");
+    }
+
+    #[tokio::test]
+    async fn an_absent_sibling_listener_never_stops_the_server() {
+        let mut absent = None;
+        let never = sibling_stopped("the WebTransport listener", &mut absent);
+        assert!(tokio::time::timeout(Duration::from_millis(50), never).await.is_err());
     }
 }

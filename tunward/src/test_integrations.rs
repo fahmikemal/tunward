@@ -317,6 +317,47 @@ async fn test_proxy_protocol_source_trusts_x_forwarded_for_only_from_trusted_pro
     assert_eq!(addresses.source_address, expected_source);
 }
 
+/// A server asked for WebTransport must not start without it: a taken UDP port fails startup.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[tokio::test]
+#[serial]
+async fn test_serve_fails_when_the_webtransport_port_is_taken(
+    server_webtransport: Server,
+    no_restrictions: RestrictionsRules,
+) {
+    let _taken = std::net::UdpSocket::bind(server_webtransport.config.bind).unwrap();
+    let err = tokio::time::timeout(Duration::from_secs(5), server_webtransport.serve(no_restrictions))
+        .await
+        .expect("the server kept running without WebTransport")
+        .expect_err("the server started without WebTransport");
+    assert!(format!("{err:#}").contains("Failed to bind to udp socket"), "{err:#}");
+}
+
+/// A server asked for the management API must not start without it: a taken port fails startup.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[tokio::test]
+#[serial]
+async fn test_serve_fails_when_the_management_port_is_taken(
+    no_restrictions: RestrictionsRules,
+    dns_resolver: DnsResolver,
+) {
+    let taken = TcpListener::bind(free_addr().0).await.unwrap();
+    let server = Server::new(
+        ServerConfig {
+            management_api: Some(taken.local_addr().unwrap()),
+            ..server_config(dns_resolver)
+        },
+        DefaultTokioExecutor::default(),
+    );
+    let err = tokio::time::timeout(Duration::from_secs(5), server.serve(no_restrictions))
+        .await
+        .expect("the server kept running without its management API")
+        .expect_err("the server started without its management API");
+    assert!(format!("{err:#}").contains("Failed to bind the management API"), "{err:#}");
+}
+
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[tokio::test]

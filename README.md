@@ -296,6 +296,10 @@ The inner HTTP request is application traffic carried by the mTLS tunnel.
 The server detects WebSocket and HTTP/2 on its TCP listener. A `wts://` server
 also opens UDP on the same port and retains its TLS TCP listener. Publish both
 TCP and UDP through firewalls/container mappings when using all TLS transports.
+The UDP socket, like the management API, is bound before any connection is
+accepted: if it cannot be bound the server does not start, and if it stops
+later the server exits with an error, so it never runs without a configured
+listener.
 
 For the local mTLS recipe, change only the client URL scheme to `https://` to
 try HTTP/2. To try WebTransport, change the server URL to
@@ -423,7 +427,7 @@ tunward server --help
 | `--tenant-config FILE` | Startup-loaded device membership, tunnel roles, and reserved reverse scope; requires mTLS and named `--restrict-config` rules |
 | `--fleet-inventory FILE` | Persistent SQLite observations of verified mTLS devices; needs the default `fleet-inventory` build feature |
 | `--fleet-inventory-max-devices N` | Maximum stored device identities; default 10000 |
-| `--management-api IP:PORT` | Loopback REST management API exposing `/healthz`, Prometheus `/metrics`, and client/session registry |
+| `--management-api IP:PORT` | Loopback REST management API exposing `/healthz`, Prometheus `/metrics`, and client/session registry; an address that cannot be bound stops startup |
 | `-P, --http-upgrade-path-prefix VALUE` | Client path prefix; mTLS auto-derives from the verified identity field by default |
 | `-r, --restrict-http-upgrade-path-prefix VALUE` | Server path allowlist; not a substitute for TLS and target rules |
 | `--restrict-to HOST:PORT` | Server forward-destination allowlist; repeat as needed |
