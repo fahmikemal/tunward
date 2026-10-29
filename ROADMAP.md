@@ -51,10 +51,13 @@ OWASP certification or a requirement that every deployment use the same limits.
 
 These gates remain separate from feature count:
 
-- Investigate the historical WSS WAN timeout and the intermittent tenant
-  ephemeral reverse-UDP-over-HTTP2 CI timeout. The latter passed an unchanged
-  rerun and 180 targeted local repetitions, but its cause is not established.
-  A successful rerun is not a demonstrated fix.
+- Investigate the historical WSS WAN timeout.
+- The intermittent tenant ephemeral reverse-UDP CI timeout is **resolved**. An
+  ephemeral UDP reverse listener closed at its first idle check after its request
+  took the connection, so the peer it served received no further datagrams
+  ([#16](https://github.com/fahmikemal/tunward/pull/16)). The tenant
+  qualification now pauses that peer past the idle check, which fails on the
+  earlier binary.
 - Complete and review continuous 24–72 hour WAN evidence for the exact candidate
   binary and representative workloads. Test real MDM devices, sleep/reconnect,
   and network transitions separately from synthetic identities.
@@ -63,8 +66,13 @@ These gates remain separate from feature count:
 - Validate the actual deployment's certificate issuer/domain, renewal,
   permissions, reload, monitoring, backup, rollout, and rollback. Define and
   measure latency, availability, capacity, and recovery objectives.
-- Review dependency maintenance warnings and remaining publication/key-rotation
-  follow-ups. Validate tagged artifacts and image digests before promotion.
+- Dependency maintenance warnings are **reviewed and resolved**
+  ([#7](https://github.com/fahmikemal/tunward/pull/7),
+  [#9](https://github.com/fahmikemal/tunward/pull/9)). cargo-deny now fails CI on
+  unmaintained or yanked crates without exceptions, and Dependabot proposes
+  updates weekly.
+- Complete the remaining publication/key-rotation follow-ups. Validate tagged
+  artifacts and image digests before promotion.
 
 Complete the relevant gates with retained evidence before changing stability
 claims. They do not become complete merely by assigning a version number.
