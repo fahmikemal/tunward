@@ -1,0 +1,6 @@
+# Match every request and allow nothing.
+restrictions:
+  - name: "Deny everything"
+    match:
+      - !Any
+    allow: []

@@ -1,0 +1,8 @@
+# Only allow reverse tunnels on Unix sockets under /tmp/.
+restrictions:
+  - name: "Reverse Unix sockets under /tmp"
+    match:
+      - !Any
+    allow:
+      - !ReverseTunnel
+        unix_path: "^/tmp/"

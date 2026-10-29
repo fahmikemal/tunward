@@ -1,0 +1,13 @@
+# Only allow SOCKS5 reverse tunnels listening on ports 1080 to 1443 on the LAN.
+restrictions:
+  - name: "Reverse SOCKS5 on the LAN"
+    match:
+      - !PathPrefix "^.*$"
+    allow:
+      - !ReverseTunnel
+        protocol:
+          - Socks5
+        port:
+          - 1080..1443
+        cidr:
+          - 192.168.0.0/16
