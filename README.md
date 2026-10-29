@@ -4,6 +4,8 @@
 
 # Tunward
 
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/fahmikemal/tunward/badge)](https://scorecard.dev/viewer/?uri=github.com/fahmikemal/tunward)
+
 Tunward forwards TCP and UDP traffic over WebSocket, HTTP/2, or WebTransport.
 It supports forward and reverse tunnels, SOCKS5 and HTTP proxies, Unix sockets,
 stdio, and a local fleet observation API.
