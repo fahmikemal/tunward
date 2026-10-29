@@ -1,7 +1,6 @@
 use crate::executor::{DefaultTokioExecutor, TokioExecutorRef};
 use crate::protocols::tcp::AcceptBackoff;
 use crate::tunnel;
-use crate::tunnel::RemoteAddr;
 use crate::tunnel::client::ClientConfig;
 use crate::tunnel::client::connection_pool::L4StreamManager;
 use crate::tunnel::downstream_listeners::{DownstreamListener, DownstreamRead, DownstreamWrite};
@@ -9,9 +8,10 @@ use crate::tunnel::tls_reloader::TlsReloader;
 use crate::tunnel::transport::io::{TransportReader, TransportWriter};
 use crate::tunnel::transport::{TransportScheme, jwt_token_to_tunnel};
 use crate::tunnel::upstream_connectors::UpstreamConnector;
+use crate::tunnel::{LocalProtocol, RemoteAddr};
 use anyhow::Context;
 use futures_util::pin_mut;
-use hyper::header::COOKIE;
+use hyper::header::{COOKIE, HeaderValue};
 use log::debug;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +19,23 @@ use tokio_stream::StreamExt;
 use tracing::{Instrument, Level, error, event, span};
 use url::Host;
 use uuid::Uuid;
+
+/// The destination a reverse connection opens on this client's side.
+///
+/// Only a dynamic reverse tunnel (SOCKS5, HTTP proxy) takes it from the server, whose peers choose
+/// their targets by design. A fixed reverse tunnel always uses the target configured here, so a
+/// hostile or compromised server cannot point it anywhere else on this client's network.
+fn reverse_destination(requested: &LocalProtocol, cookie: Option<&HeaderValue>) -> Option<RemoteAddr> {
+    if !requested.is_dynamic_reverse_tunnel() {
+        return None;
+    }
+    let jwt = jwt_token_to_tunnel(cookie?.to_str().ok()?).ok()?;
+    Some(RemoteAddr {
+        protocol: jwt.claims.p,
+        host: Host::parse(&jwt.claims.r).unwrap_or_else(|_| Host::Domain(String::new())),
+        port: jwt.claims.rp,
+    })
+}
 
 #[derive(Clone)]
 pub struct Client<E: TokioExecutorRef = DefaultTokioExecutor> {
@@ -250,20 +267,18 @@ impl<E: TokioExecutorRef> Client<E> {
             if let Some(port_hdr) = response.headers.get("x-assigned-port").and_then(|v| v.to_str().ok()) {
                 tracing::info!("Reverse tunnel active on assigned remote port: {port_hdr}");
             }
+            let cookie = response.headers.get(COOKIE);
+            if cookie.is_some() && !remote_addr.protocol.is_dynamic_reverse_tunnel() {
+                event!(
+                    parent: &span,
+                    Level::WARN,
+                    "Ignoring a destination named by the server for a fixed reverse tunnel: it connects only to its configured target"
+                );
+            }
+            let remote = reverse_destination(&remote_addr.protocol, cookie);
             let task = {
                 let connector = connector.clone();
                 async move {
-                    let remote = response
-                        .headers
-                        .get(COOKIE)
-                        .and_then(|h| h.to_str().ok())
-                        .and_then(|h| jwt_token_to_tunnel(h).ok())
-                        .map(|jwt| RemoteAddr {
-                            protocol: jwt.claims.p,
-                            host: Host::parse(&jwt.claims.r).unwrap_or_else(|_| Host::Domain(String::new())),
-                            port: jwt.claims.rp,
-                        });
-
                     let (local_rx, local_tx) = match connector.connect(&remote).instrument(span.clone()).await {
                         Ok(s) => s,
                         Err(err) => {
@@ -285,6 +300,59 @@ impl<E: TokioExecutorRef> Client<E> {
             };
 
             self.executor.spawn(task);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tunnel::transport::tunnel_to_jwt_token;
+    use std::net::Ipv4Addr;
+
+    fn cookie_for(port: u16) -> HeaderValue {
+        let destination = RemoteAddr {
+            protocol: LocalProtocol::Tcp { proxy_protocol: false },
+            host: Host::Ipv4(Ipv4Addr::new(192, 0, 2, 10)),
+            port,
+        };
+        HeaderValue::from_str(&tunnel_to_jwt_token(Uuid::from_u128(0), &destination)).unwrap()
+    }
+
+    #[test]
+    fn a_fixed_reverse_tunnel_ignores_a_destination_named_by_the_server() {
+        let cookie = cookie_for(22);
+        for fixed in [
+            LocalProtocol::ReverseTcp,
+            LocalProtocol::ReverseUdp { timeout: None },
+            LocalProtocol::ReverseUnix {
+                path: "/tmp/tunward.sock".into(),
+            },
+        ] {
+            assert!(reverse_destination(&fixed, Some(&cookie)).is_none(), "{fixed:?}");
+        }
+    }
+
+    #[test]
+    fn a_dynamic_reverse_tunnel_follows_the_destination_named_by_the_server() {
+        let cookie = cookie_for(443);
+        for dynamic in [
+            LocalProtocol::ReverseSocks5 {
+                timeout: None,
+                credentials: None,
+            },
+            LocalProtocol::ReverseHttpProxy {
+                timeout: None,
+                credentials: None,
+            },
+        ] {
+            let destination = reverse_destination(&dynamic, Some(&cookie)).expect("the server's destination");
+            assert_eq!(
+                (destination.host, destination.port),
+                (Host::Ipv4(Ipv4Addr::new(192, 0, 2, 10)), 443)
+            );
+            assert!(reverse_destination(&dynamic, None).is_none());
+            assert!(reverse_destination(&dynamic, Some(&HeaderValue::from_static("garbage"))).is_none());
         }
     }
 }

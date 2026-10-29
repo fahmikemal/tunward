@@ -1,5 +1,6 @@
 use crate::management::registry::FleetRegistry;
 use crate::protocols::tcp::AcceptBackoff;
+use anyhow::Context;
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::body::Incoming;
@@ -13,11 +14,24 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 
 pub async fn run_management_server(bind_addr: SocketAddr, registry: FleetRegistry) -> anyhow::Result<()> {
+    serve_management_api(bind_management_api(bind_addr).await?, registry).await
+}
+
+/// Binds the management API on a loopback address. The server does this before accepting any
+/// connection, so an address that cannot be bound stops startup instead of leaving the API off.
+pub async fn bind_management_api(bind_addr: SocketAddr) -> anyhow::Result<TcpListener> {
     anyhow::ensure!(
         bind_addr.ip().is_loopback(),
         "management API must bind to loopback; expose it through an authenticated TLS proxy"
     );
-    let listener = TcpListener::bind(bind_addr).await?;
+    TcpListener::bind(bind_addr)
+        .await
+        .with_context(|| format!("Failed to bind the management API on {bind_addr}"))
+}
+
+/// Serves the management API on a listener from [`bind_management_api`].
+pub async fn serve_management_api(listener: TcpListener, registry: FleetRegistry) -> anyhow::Result<()> {
+    let bind_addr = listener.local_addr()?;
     info!("Tunward Management REST API listening on http://{bind_addr}");
 
     let auto_server = auto::Builder::new(TokioExecutor::new());

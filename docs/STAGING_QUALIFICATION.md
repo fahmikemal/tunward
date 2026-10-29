@@ -31,6 +31,7 @@ dependencies in `scripts/requirements-qualification.txt`. Standalone generation 
 | `scripts/qualify_revocation.py` | Live fingerprint/CN denial, active and idle session termination, TLS resumption, reverse and quota cleanup |
 | `scripts/qualify_fleet.py` | Shared transport records, verified inventory, abrupt restart/key rotation, capacity, pagination, and database failures |
 | `scripts/qualify_tenants.py` | Tenant roles/rule scope, reverse ownership and reserved binds, header spoofing, Unix paths, and combined quotas/revocation |
+| `scripts/qualify_trust_boundaries.py` | Spoofed `X-Forwarded-For` against the PROXY v2 source on WSS, HTTP/2 and WebTransport; a hostile server naming another reverse destination; taken WebTransport and management ports; default quotas under `--allow-insecure-dev` |
 | `scripts/qualify_pool_timeout.py` | Delayed TLS establishment versus pool acquisition deadline |
 | `scripts/qualify_hardening.py` | Domain confinement to restriction CIDRs, DNS rebinding, refused UDP retries, TCP and WebTransport handshake bounds, and descriptor exhaustion |
 | `scripts/qualify_wan.py` | Expiring staging agent, native WAN clients, direct mTLS control, per-stream traces and client/server TCP diagnostics |
@@ -76,6 +77,7 @@ python3 scripts/qualify_quotas.py --output target/qualification/quota-review
 python3 scripts/qualify_revocation.py --output target/qualification/revocation-review
 python3 scripts/qualify_fleet.py --output target/qualification/fleet-review
 python3 scripts/qualify_tenants.py --output target/qualification/tenant-review
+python3 scripts/qualify_trust_boundaries.py --output target/qualification/trust-review
 python3 scripts/qualify_hardening.py --output target/qualification/hardening-review
 ~~~
 

@@ -12,10 +12,10 @@ use derive_more::{Display, Error};
 use http_body_util::Either;
 use http_body_util::combinators::BoxBody;
 use hyper::body::Body;
-use hyper::header::{AUTHORIZATION, COOKIE, HeaderValue, SEC_WEBSOCKET_PROTOCOL};
+use hyper::header::{AUTHORIZATION, COOKIE, HeaderMap, HeaderName, HeaderValue, SEC_WEBSOCKET_PROTOCOL};
 use hyper::{Request, Response, StatusCode, http};
 use ipnet::IpNet;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use tracing::{error, info};
 use url::Host;
 use uuid::Uuid;
@@ -75,15 +75,78 @@ pub(super) fn extract_authorization<B>(req: &Request<B>) -> Option<&str> {
     req.headers().get(AUTHORIZATION)?.to_str().ok()
 }
 
-#[inline]
-pub(super) fn extract_x_forwarded_for<B>(req: &Request<B>) -> Option<(IpAddr, &str)> {
-    let x_forward_for = req.headers().get("X-Forwarded-For")?;
+const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 
-    // X-Forwarded-For: <client>, <proxy1>, <proxy2>
-    let x_forward_for = x_forward_for.to_str().unwrap_or_default();
-    let x_forward_for = x_forward_for.split_once(',').map(|x| x.0).unwrap_or(x_forward_for);
-    let ip: Option<IpAddr> = x_forward_for.parse().ok();
-    ip.map(|ip| (ip, x_forward_for))
+/// Most hops read from one X-Forwarded-For list; a longer list is treated as malformed.
+const MAX_FORWARDED_HOPS: usize = 32;
+
+/// What a request's X-Forwarded-For header establishes about its client.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ForwardedFor {
+    /// The request has no X-Forwarded-For header.
+    Absent,
+    /// The connection's peer is not a trusted proxy, so the header proves nothing about the client.
+    Untrusted,
+    /// A trusted proxy relayed a list that holds something other than an address, or too many hops.
+    Malformed,
+    /// The rightmost address in the list that is not a trusted proxy.
+    Client(IpAddr),
+}
+
+/// Resolves the client of a request that the connection's `peer` relayed.
+///
+/// Only a trusted proxy can vouch for the address before it, so the header counts only when `peer`
+/// is one. The list, joined across every X-Forwarded-For header in order, is then read from the
+/// right past each trusted proxy, and the first other address is the client. Entries to its left
+/// were written by the client itself and are never used.
+pub(super) fn forwarded_client(peer: IpAddr, headers: &HeaderMap, trusted: &[IpNet]) -> ForwardedFor {
+    let mut values = headers.get_all(X_FORWARDED_FOR).iter().peekable();
+    if values.peek().is_none() {
+        return ForwardedFor::Absent;
+    }
+    if !cidr_contains(trusted, peer) {
+        return ForwardedFor::Untrusted;
+    }
+    let mut hops = Vec::new();
+    for value in values {
+        let Ok(value) = value.to_str() else {
+            return ForwardedFor::Malformed;
+        };
+        hops.extend(value.split(','));
+    }
+    if hops.len() > MAX_FORWARDED_HOPS {
+        return ForwardedFor::Malformed;
+    }
+    let mut earliest = None;
+    for hop in hops.iter().rev() {
+        let Some(ip) = parse_forwarded_hop(hop) else {
+            return ForwardedFor::Malformed;
+        };
+        if !cidr_contains(trusted, ip) {
+            return ForwardedFor::Client(ip);
+        }
+        earliest = Some(ip);
+    }
+    // Every hop is a trusted proxy, so the leftmost one is the earliest address on record.
+    earliest.map_or(ForwardedFor::Malformed, ForwardedFor::Client)
+}
+
+/// One X-Forwarded-For entry: an IP address, bare, bracketed (`[::1]`), or with the port some
+/// proxies append (`192.0.2.1:443`, `[2001:db8::1]:443`).
+fn parse_forwarded_hop(hop: &str) -> Option<IpAddr> {
+    let hop = hop.trim();
+    let ip = hop
+        .parse::<IpAddr>()
+        .ok()
+        .or_else(|| hop.parse::<SocketAddr>().ok().map(|addr| addr.ip()))
+        .or_else(|| {
+            hop.strip_prefix('[')?
+                .strip_suffix(']')?
+                .parse::<Ipv6Addr>()
+                .ok()
+                .map(IpAddr::V6)
+        })?;
+    Some(canonical_ip(ip))
 }
 
 #[inline]
@@ -390,6 +453,100 @@ mod tests {
 
     fn allows(config: impl Into<AllowConfig>, remote: &RemoteAddr) -> bool {
         config.into().grant(remote, None).is_some()
+    }
+
+    fn forwarded(peer: &str, values: &[&str], trusted: &[&str]) -> ForwardedFor {
+        let mut headers = HeaderMap::new();
+        for value in values {
+            headers.append(X_FORWARDED_FOR, HeaderValue::from_str(value).unwrap());
+        }
+        let trusted: Vec<IpNet> = trusted.iter().map(|net| net.parse().unwrap()).collect();
+        forwarded_client(peer.parse().unwrap(), &headers, &trusted)
+    }
+
+    fn client(ip: &str) -> ForwardedFor {
+        ForwardedFor::Client(ip.parse().unwrap())
+    }
+
+    #[test]
+    fn x_forwarded_for_is_ignored_unless_the_peer_is_a_trusted_proxy() {
+        assert_eq!(forwarded("198.51.100.7", &[], &[]), ForwardedFor::Absent);
+        // The default: no proxy is trusted, so any client could otherwise pick its own address.
+        assert_eq!(forwarded("198.51.100.7", &["203.0.113.9"], &[]), ForwardedFor::Untrusted);
+        assert_eq!(
+            forwarded("198.51.100.7", &["203.0.113.9"], &["10.0.0.0/8"]),
+            ForwardedFor::Untrusted
+        );
+    }
+
+    #[test]
+    fn the_client_is_the_rightmost_address_that_is_not_a_trusted_proxy() {
+        let trusted = ["10.0.0.0/8"];
+        assert_eq!(forwarded("10.0.0.1", &["203.0.113.9"], &trusted), client("203.0.113.9"));
+        // The client prepended a spoofed address; the trusted proxy appended the real one.
+        assert_eq!(
+            forwarded("10.0.0.1", &["192.0.2.66, 203.0.113.9"], &trusted),
+            client("203.0.113.9")
+        );
+        // Two trusted hops are skipped.
+        assert_eq!(
+            forwarded("10.0.0.1", &["192.0.2.66, 203.0.113.9, 10.0.0.2"], &trusted),
+            client("203.0.113.9")
+        );
+        // Only trusted hops: the earliest one is the best address on record.
+        assert_eq!(forwarded("10.0.0.1", &["10.0.0.3, 10.0.0.2"], &trusted), client("10.0.0.3"));
+    }
+
+    #[test]
+    fn every_x_forwarded_for_header_forms_one_list() {
+        let trusted = ["10.0.0.0/8"];
+        assert_eq!(
+            forwarded("10.0.0.1", &["192.0.2.66", "203.0.113.9"], &trusted),
+            client("203.0.113.9")
+        );
+        assert_eq!(
+            forwarded("10.0.0.1", &["203.0.113.9", "10.0.0.2"], &trusted),
+            client("203.0.113.9")
+        );
+    }
+
+    #[test]
+    fn hops_are_read_with_ports_brackets_and_ipv4_mapped_forms() {
+        let trusted = ["10.0.0.0/8", "2001:db8:ffff::/48"];
+        assert_eq!(forwarded("10.0.0.1", &["203.0.113.9:4711"], &trusted), client("203.0.113.9"));
+        assert_eq!(forwarded("10.0.0.1", &["[2001:db8::7]"], &trusted), client("2001:db8::7"));
+        assert_eq!(forwarded("10.0.0.1", &["[2001:db8::7]:443"], &trusted), client("2001:db8::7"));
+        // A dual-stack listener reports IPv4 peers as IPv4-mapped IPv6; they still match IPv4 ranges.
+        assert_eq!(
+            forwarded("::ffff:10.0.0.1", &["::ffff:203.0.113.9"], &trusted),
+            client("203.0.113.9")
+        );
+        assert_eq!(
+            forwarded("::ffff:10.0.0.1", &["::ffff:10.0.0.2, 2001:db8::7"], &trusted),
+            client("2001:db8::7")
+        );
+    }
+
+    #[test]
+    fn a_malformed_or_oversized_list_from_a_trusted_proxy_is_not_used() {
+        let trusted = ["10.0.0.0/8"];
+        for value in [
+            "unknown",
+            "",
+            "203.0.113.9,",
+            "_hidden",
+            "fe80::1%eth0",
+            "203.0.113.9 10.0.0.2",
+        ] {
+            assert_eq!(forwarded("10.0.0.1", &[value], &trusted), ForwardedFor::Malformed, "{value}");
+        }
+        let long = vec!["10.0.0.2"; MAX_FORWARDED_HOPS + 1].join(",");
+        assert_eq!(forwarded("10.0.0.1", &[long.as_str()], &trusted), ForwardedFor::Malformed);
+        // Garbage left of the client is never read.
+        assert_eq!(
+            forwarded("10.0.0.1", &["unknown, 203.0.113.9"], &trusted),
+            client("203.0.113.9")
+        );
     }
 
     fn net(value: &str) -> IpNet {

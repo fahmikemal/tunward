@@ -9,12 +9,12 @@ use crate::somark::SoMark;
 use crate::tunnel::client::{Client, ClientConfig, TlsClientConfig};
 use crate::tunnel::downstream_listeners::{Socks5DownstreamListener, TcpDownstreamListener, UdpDownstreamListener};
 use crate::tunnel::server::{Server, ServerConfig, TlsServerConfig};
-use crate::tunnel::transport::{TransportAddr, TransportScheme};
+use crate::tunnel::transport::{TransportAddr, TransportScheme, tunnel_to_jwt_token};
 use crate::tunnel::upstream_connectors::TcpUpstreamConnector;
 use crate::tunnel::{LocalProtocol, RemoteAddr};
 use bytes::BytesMut;
 use futures_util::{Stream, StreamExt};
-use hyper::http::HeaderValue;
+use hyper::http::{HeaderName, HeaderValue};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use regex::Regex;
 use rstest::{fixture, rstest};
@@ -31,6 +31,7 @@ use tokio::pin;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use url::Host;
+use uuid::Uuid;
 use web_transport_quinn::quinn;
 
 /// Ports already handed out by [`free_port`] in this process. A port becomes free again as soon
@@ -99,6 +100,7 @@ fn server_config(dns_resolver: DnsResolver) -> ServerConfig {
         tls_client_identity_field: ClientIdentityField::default(),
         tls_handshake_timeout: Duration::from_secs(10),
         max_pending_tls_handshakes: std::num::NonZeroU32::new(1024).unwrap(),
+        trusted_proxies: vec![],
     }
 }
 
@@ -246,6 +248,117 @@ fn no_restrictions() -> RestrictionsRules {
 }
 
 #[rstest]
+#[case::untrusted_peer(vec![], Ipv4Addr::LOCALHOST)]
+#[case::trusted_peer(vec!["127.0.0.1/32".parse().unwrap()], Ipv4Addr::new(203, 0, 113, 9))]
+#[timeout(Duration::from_secs(10))]
+#[tokio::test]
+#[serial]
+async fn test_proxy_protocol_source_trusts_x_forwarded_for_only_from_trusted_proxies(
+    no_restrictions: RestrictionsRules,
+    dns_resolver: DnsResolver,
+    #[case] trusted_proxies: Vec<IpNet>,
+    #[case] expected_source: Ipv4Addr,
+) {
+    let server = Server::new(
+        ServerConfig {
+            trusted_proxies,
+            ..server_config(dns_resolver.clone())
+        },
+        DefaultTokioExecutor::default(),
+    );
+    let server_port = server.config.bind.port();
+    let server_h = tokio::spawn(server.serve(no_restrictions));
+    defer! { server_h.abort(); };
+
+    // The client claims an address it does not have.
+    let mut config = (*client_ws(server_port, dns_resolver.clone()).await.config).clone();
+    config.http_headers.insert(
+        HeaderName::from_static("x-forwarded-for"),
+        HeaderValue::from_static("203.0.113.9"),
+    );
+    let client = Client::new(
+        config,
+        1,
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        DefaultTokioExecutor::default(),
+    )
+    .await
+    .unwrap();
+
+    let (tunnel_listen, tunnel_host) = free_addr();
+    let (endpoint_listen, endpoint_host) = free_addr();
+    let target = TcpListener::bind(endpoint_listen).await.unwrap();
+    // proxy_protocol: the server prefixes the target connection with a PROXY protocol v2 header.
+    let listener = TcpDownstreamListener::new(tunnel_listen, (endpoint_host, endpoint_listen.port()), true)
+        .await
+        .unwrap();
+    let client_h = tokio::spawn(async move { client.run_tunnel(listener).await });
+    defer! { client_h.abort(); };
+
+    let mut application = protocols::tcp::connect(
+        &tunnel_host,
+        tunnel_listen.port(),
+        SoMark::new(None),
+        Duration::from_secs(10),
+        &dns_resolver,
+    )
+    .await
+    .unwrap();
+    application.write_all(b"ping").await.unwrap();
+    let (mut upstream, _) = target.accept().await.unwrap();
+    // A PROXY protocol v2 header with IPv4 addresses is 28 bytes.
+    let mut header = [0; 28];
+    upstream.read_exact(&mut header).await.unwrap();
+    let header = ppp::v2::Header::try_from(&header[..]).unwrap();
+    let ppp::v2::Addresses::IPv4(addresses) = header.addresses else {
+        panic!("expected IPv4 addresses, got {:?}", header.addresses);
+    };
+    assert_eq!(addresses.source_address, expected_source);
+}
+
+/// A server asked for WebTransport must not start without it: a taken UDP port fails startup.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[tokio::test]
+#[serial]
+async fn test_serve_fails_when_the_webtransport_port_is_taken(
+    server_webtransport: Server,
+    no_restrictions: RestrictionsRules,
+) {
+    let _taken = std::net::UdpSocket::bind(server_webtransport.config.bind).unwrap();
+    let err = tokio::time::timeout(Duration::from_secs(5), server_webtransport.serve(no_restrictions))
+        .await
+        .expect("the server kept running without WebTransport")
+        .expect_err("the server started without WebTransport");
+    assert!(format!("{err:#}").contains("Failed to bind to udp socket"), "{err:#}");
+}
+
+/// A server asked for the management API must not start without it: a taken port fails startup.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[tokio::test]
+#[serial]
+async fn test_serve_fails_when_the_management_port_is_taken(
+    no_restrictions: RestrictionsRules,
+    dns_resolver: DnsResolver,
+) {
+    let taken = TcpListener::bind(free_addr().0).await.unwrap();
+    let server = Server::new(
+        ServerConfig {
+            management_api: Some(taken.local_addr().unwrap()),
+            ..server_config(dns_resolver)
+        },
+        DefaultTokioExecutor::default(),
+    );
+    let err = tokio::time::timeout(Duration::from_secs(5), server.serve(no_restrictions))
+        .await
+        .expect("the server kept running without its management API")
+        .expect_err("the server started without its management API");
+    assert!(format!("{err:#}").contains("Failed to bind the management API"), "{err:#}");
+}
+
+#[rstest]
 #[timeout(Duration::from_secs(10))]
 #[tokio::test]
 #[serial]
@@ -287,6 +400,106 @@ async fn test_tcp_tunnel(server_no_tls: Server, no_restrictions: RestrictionsRul
     dd.write_all(b"world!").await.unwrap();
     client.read_buf(&mut buf).await.unwrap();
     assert_eq!(&buf[..6], b"world!");
+}
+
+/// A fixed reverse tunnel connects only to its configured target, even when the server's response
+/// names another destination, as a hostile or compromised server could.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[tokio::test]
+#[serial]
+async fn test_fixed_reverse_tunnel_ignores_a_destination_named_by_the_server(
+    server_no_tls: Server,
+    no_restrictions: RestrictionsRules,
+    dns_resolver: DnsResolver,
+) {
+    let server_addr = server_no_tls.config.bind;
+    let server_h = tokio::spawn(server_no_tls.serve(no_restrictions));
+    defer! { server_h.abort(); };
+
+    // A service on the client's network that the hostile server tries to reach through the client.
+    let decoy = TcpListener::bind(free_addr().0).await.unwrap();
+    let cookie = tunnel_to_jwt_token(
+        Uuid::from_u128(0),
+        &RemoteAddr {
+            protocol: LocalProtocol::Tcp { proxy_protocol: false },
+            host: Host::Ipv4(Ipv4Addr::LOCALHOST),
+            port: decoy.local_addr().unwrap().port(),
+        },
+    );
+
+    // Plays the hostile server: relays to the real one and names the decoy in each response.
+    let relay = TcpListener::bind(free_addr().0).await.unwrap();
+    let relay_port = relay.local_addr().unwrap().port();
+    let relay_h = tokio::spawn(async move {
+        loop {
+            let (downstream, _) = relay.accept().await.unwrap();
+            let cookie = cookie.clone();
+            tokio::spawn(async move {
+                let upstream = TcpStream::connect(server_addr).await.unwrap();
+                let (mut down_r, mut down_w) = downstream.into_split();
+                let (mut up_r, mut up_w) = upstream.into_split();
+                tokio::spawn(async move { tokio::io::copy(&mut down_r, &mut up_w).await });
+                let mut head = Vec::new();
+                let mut byte = [0; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if up_r.read(&mut byte).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    head.push(byte[0]);
+                }
+                let head = String::from_utf8(head).unwrap();
+                let head = head.replacen("\r\n", &format!("\r\ncookie: {cookie}\r\n"), 1);
+                down_w.write_all(head.as_bytes()).await.unwrap();
+                let _ = tokio::io::copy(&mut up_r, &mut down_w).await;
+            });
+        }
+    });
+    defer! { relay_h.abort(); };
+
+    let client = client_ws(relay_port, dns_resolver.clone()).await;
+    let target = TcpListener::bind(free_addr().0).await.unwrap();
+    let (reverse_addr, reverse_host) = free_addr();
+    let connector = TcpUpstreamConnector::new(
+        Host::Ipv4(Ipv4Addr::LOCALHOST),
+        target.local_addr().unwrap().port(),
+        SoMark::new(None),
+        Duration::from_secs(1),
+        dns_resolver,
+    );
+    let client_h = tokio::spawn(client.run_reverse_tunnel(
+        RemoteAddr {
+            protocol: LocalProtocol::ReverseTcp,
+            host: reverse_host,
+            port: reverse_addr.port(),
+        },
+        connector,
+    ));
+    defer! { client_h.abort(); };
+
+    let mut application = loop {
+        match TcpStream::connect(reverse_addr).await {
+            Ok(stream) => break stream,
+            Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(err) => panic!("Cannot connect to reverse listener: {err}"),
+        }
+    };
+    application.write_all(b"to the target").await.unwrap();
+    let (mut accepted, _) = tokio::time::timeout(Duration::from_secs(3), target.accept())
+        .await
+        .expect("the configured target was not reached")
+        .unwrap();
+    let mut buf = [0; 13];
+    accepted.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"to the target");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), decoy.accept())
+            .await
+            .is_err(),
+        "the client connected to the destination the server named"
+    );
 }
 
 #[rstest]
@@ -783,6 +996,7 @@ async fn test_fleet_management_and_ephemeral_reverse_tunnel(
         tls_client_identity_field: ClientIdentityField::default(),
         tls_handshake_timeout: Duration::from_secs(10),
         max_pending_tls_handshakes: std::num::NonZeroU32::new(1024).unwrap(),
+        trusted_proxies: vec![],
     };
     let server = Server::new(server_config, DefaultTokioExecutor::default());
     let server_port = server.config.bind.port();

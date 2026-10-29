@@ -50,6 +50,19 @@ authentication token. `--client-id`, `--device-id`, and their headers are
 caller-controlled observation labels, not verified device identities. A path
 secret alone does not establish a complete authorization policy.
 
+A fixed reverse tunnel (`-R tcp://`, `udp://`, or `unix://`) connects only to
+the target configured on the client and ignores any destination the server names
+for it. A reverse SOCKS5 or HTTP proxy takes each destination from the server
+side by design, so whoever controls the server can reach the client's network
+through it; expose one only to a server you trust that far.
+
+`X-Forwarded-For` is caller-controlled. The server ignores it unless the
+connection's peer is a configured `--trusted-proxy`, and then takes the
+rightmost entry that is not a trusted proxy as the client address recorded in
+logs and fleet records and sent to targets in PROXY protocol headers. Trusting
+`0.0.0.0/0` or `::/0` lets every client choose that address; the server warns
+about it at startup.
+
 The management API accepts loopback binds only and has no built-in API
 authentication. Local processes able to reach it can read its observation data.
 Remote exposure requires an authenticated TLS gateway and appropriate network

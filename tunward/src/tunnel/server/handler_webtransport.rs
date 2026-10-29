@@ -3,8 +3,8 @@ use crate::executor::TokioExecutorRef;
 use crate::protocols::tcp::LogLimiter;
 use crate::protocols::tls;
 use crate::restrictions::types::RestrictionsRules;
-use crate::tunnel::server::Server;
 use crate::tunnel::server::utils::{extract_path_prefix, matches_any_restriction};
+use crate::tunnel::server::{Server, TlsServerConfig};
 use crate::tunnel::tls_reloader::TlsReloader;
 use crate::tunnel::transport;
 use crate::tunnel::transport::tunnel_to_jwt_token;
@@ -26,22 +26,26 @@ use uuid::Uuid;
 use web_transport_quinn::quinn;
 use web_transport_quinn::quinn::crypto::rustls::QuicServerConfig;
 
-/// Serve WebTransport (HTTP/3 over QUIC) on the same port as the TCP listener, over UDP.
-///
-/// This runs alongside [`Server::serve`]'s TCP accept loop rather than replacing it, so one
-/// server process answers websocket, http2 and webtransport clients.
-pub(super) async fn run_webtransport_server(
-    server: Server<impl TokioExecutorRef>,
-    restrictions: Arc<ArcSwap<RestrictionsRules>>,
-) -> anyhow::Result<()> {
-    let Some(tls_config) = server.config.tls.as_ref() else {
-        return Err(anyhow!(
-            "webtransport requires TLS: QUIC mandates TLS 1.3, so it cannot be served on a cleartext ws:// or http:// endpoint"
-        ));
-    };
+/// The WebTransport UDP socket and QUIC endpoint, bound and ready to serve.
+pub(super) struct WebTransportListener {
+    endpoint: quinn::Endpoint,
+    tls_reloader: Option<TlsReloader>,
+}
 
-    let bind = server.config.bind;
-    let endpoint = mk_quic_endpoint(&server, tls_config)?;
+fn webtransport_tls(server: &Server<impl TokioExecutorRef>) -> anyhow::Result<&TlsServerConfig> {
+    server.config.tls.as_ref().ok_or_else(|| {
+        anyhow!(
+            "webtransport requires TLS: QUIC mandates TLS 1.3, so it cannot be served on a cleartext ws:// or http:// endpoint"
+        )
+    })
+}
+
+/// Binds WebTransport (HTTP/3 over QUIC) on the TCP listener's port, over UDP.
+///
+/// [`Server::serve`] calls this before it accepts any connection, so a port that cannot be bound
+/// stops startup instead of leaving the server up without the WebTransport it was asked for.
+pub(super) fn bind_webtransport(server: &Server<impl TokioExecutorRef>) -> anyhow::Result<WebTransportListener> {
+    let endpoint = mk_quic_endpoint(server, webtransport_tls(server)?)?;
     if let Some(state) = &server.managed {
         state.register_endpoint(endpoint.clone());
     }
@@ -53,6 +57,21 @@ pub(super) async fn run_webtransport_server(
                 .with_context(|| "Cannot create the tls reloader for webtransport")?,
         )
     };
+    Ok(WebTransportListener { endpoint, tls_reloader })
+}
+
+/// Serves WebTransport on a listener from [`bind_webtransport`].
+///
+/// This runs alongside [`Server::serve`]'s TCP accept loop rather than replacing it, so one
+/// server process answers websocket, http2 and webtransport clients. It returns only on failure.
+pub(super) async fn run_webtransport_server(
+    server: Server<impl TokioExecutorRef>,
+    restrictions: Arc<ArcSwap<RestrictionsRules>>,
+    listener: WebTransportListener,
+) -> anyhow::Result<()> {
+    let WebTransportListener { endpoint, tls_reloader } = listener;
+    let tls_config = webtransport_tls(&server)?;
+    let bind = server.config.bind;
 
     info!("Starting tunward webtransport server listening on udp://{bind}");
     let mut reload_tick = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -81,8 +100,7 @@ pub(super) async fn run_webtransport_server(
             incoming = endpoint.accept() => incoming,
         };
         let Some(incoming) = incoming else {
-            warn!("webtransport endpoint closed, stopping to accept connections");
-            return Ok(());
+            return Err(anyhow!("the webtransport endpoint on udp://{bind} closed"));
         };
 
         let peer_addr = incoming.remote_address();
