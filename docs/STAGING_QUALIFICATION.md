@@ -581,8 +581,8 @@ objectives; measure on the intended network/hardware with headroom; complete and
 review endurance; and qualify real-device reconnect/sleep behavior. Resolve the
 required identity mapping and revocation semantics. Qualify the optional
 [tenant roles and reserved resources](TENANT_ISOLATION.md) against each group
-and deploy stronger host/network boundaries where needed. Configure
-and qualify the optional device quotas for the intended workload; they do not
+and deploy stronger host/network boundaries where needed. Qualify the device
+quotas, default or configured, for the intended workload; they do not
 coordinate replicas or persist accounting across restart. Registry counters are
 not those verified-identity quota accounts.
 

@@ -17,12 +17,13 @@ Production qualification is incomplete. Completed 24–72 hour WAN evidence,
 representative physical-device tests, and deployment-specific certificate and
 rollback validation are still required before a production sign-off.
 
-The v0.1 beta has a sufficient feature baseline for controlled evaluation. The
-next milestone is secure defaults and qualification: public-listener
-TLS/authentication/access-policy requirements, explicit development exceptions,
-default-deny tunnel access, initial resource limits, and negative startup tests.
-These default-policy changes are **planned, not implemented in `v0.1.0-beta`**.
-See the [roadmap and stable-release gates](ROADMAP.md).
+The v0.1 beta has a sufficient feature baseline for controlled evaluation, and
+its secure defaults are implemented. Non-loopback listeners require TLS, client
+authentication and a restriction policy, and development exceptions are explicit
+(`--allow-insecure-dev`). Tunnel access is denied by default, verified devices
+get default resource limits, and negative startup tests cover each of these.
+The next milestone is qualification; see the
+[roadmap and stable-release gates](ROADMAP.md).
 
 The public `main` history was rewritten on 2026-10-21 to remove the three old
 development private keys. If you cloned earlier, use a fresh clone and reapply
@@ -35,7 +36,7 @@ with the qualification gates above still open.
 
 | Guide | Contents |
 | --- | --- |
-| [Roadmap](ROADMAP.md) | v0.1 beta scope, planned secure defaults, architectural limits, and stable-release gates |
+| [Roadmap](ROADMAP.md) | v0.1 beta scope, implemented secure defaults, architectural limits, and stable-release gates |
 | [mTLS and certificates](docs/using_mtls.md) | Generate local certificates, configure trust, and separate deployment keys |
 | [Protocol v2](docs/PROTOCOL_V2.md) | Framing, readiness, shutdown, migration, and implementation limits |
 | [Device quotas](docs/DEVICE_QUOTAS.md) | Verified identities, session/tunnel admission, request rate, and bandwidth shaping |
@@ -108,7 +109,7 @@ In accordance with enterprise secure defaults:
 - **Deny-by-default access control**: In alignment with OWASP recommendations, Tunward denies all tunnel requests by default unless explicitly matched by `--restrict-to` or `--restrict-config`. Missing policies never synthesize an implicit `Allow All`.
 - **Destination CIDRs also bind domain names**: A restriction rule whose `cidr` constrains addresses allows a domain destination only at its resolved addresses inside that CIDR, and the server connects to those checked addresses without resolving again. See [destination policy](docs/using_mtls.md#destination-and-reverse-listener-policy) for the exact matching rules and migration.
 - **Bounded unauthenticated connections**: A TLS handshake must complete within `--tls-handshake-timeout` (default 10s), and at most `--max-pending-tls-handshakes` (default 1024) may be in progress on the TCP listener, and separately on the WebTransport listener, where a connection stays pending until it sends its session request; further connections are closed or refused on arrival while established sessions keep forwarding. After resource errors such as file-descriptor exhaustion, every accept loop pauses briefly and rate-limits its warnings instead of spinning.
-- **Default resource limits**: When mTLS is enabled, finite baseline limits (32 sessions, 256 tunnels, 100 rps / 200 burst, 10 MB/s bandwidth shaping) are enforced per verified device to protect against unrestricted resource consumption (OWASP API4:2023). Operators can supply custom limits via `--device-quota-config` or opt out via `--no-device-quotas`. Loopback listeners (`127.0.0.1`, `localhost`, `[::1]`) remain unrestricted for rapid local development.
+- **Default resource limits**: When mTLS is enabled, finite baseline limits (32 sessions, 256 tunnels, 100 rps / 200 burst, 10 MB/s bandwidth shaping) are enforced per verified device to protect against unrestricted resource consumption (OWASP API4:2023). Operators can supply custom limits via `--device-quota-config` or opt out via `--no-device-quotas`. The limits are keyed on the verified device, so a listener without mTLS, such as a cleartext loopback development listener, has none; an mTLS listener has them on loopback too.
 - **Client addresses from trusted proxies only**: `X-Forwarded-For` is ignored unless the connection comes from a `--trusted-proxy`. The client address is then the rightmost entry that is not a trusted proxy, following MDN's guidance, since anything before it was written by the client. That address appears in logs and fleet records, and in the PROXY protocol v2 header that `?proxy_protocol` tunnels send to their target.
 - **Modern PKI & SPIFFE/SAN Identity Extraction**: Supports extracting verified client identities from X.509 Common Name (`cn`), Subject Alternative Name URI (`san-uri` / SPIFFE ID), or Subject Alternative Name DNS (`san-dns`), enabling native integration with modern service meshes, MDM platforms, and enterprise PKI standards.
 
@@ -231,11 +232,11 @@ can reuse that tag's successful build artifacts. See
 [recovery prerequisites and limits](CONTRIBUTING.md#recover-a-partial-prerelease).
 
 The image tag equals the Git tag; beta tags do not create a `latest` or stable
-alias. After `v0.1.0-beta` has actually been published, for example:
+alias. For example, with the `v0.1.0-beta.2` prerelease:
 
 ~~~sh
-docker pull oph1uchus/tunward:v0.1.0-beta
-docker run --rm oph1uchus/tunward:v0.1.0-beta /home/app/tunward --version
+docker pull oph1uchus/tunward:v0.1.0-beta.2
+docker run --rm oph1uchus/tunward:v0.1.0-beta.2 /home/app/tunward --version
 ~~~
 
 Maintainers must configure the GitHub Actions variable `DOCKERHUB_USERNAME`
@@ -496,14 +497,16 @@ for candidate validation, rollout, rollback, and issuer migration; use the
 ## Deployment and qualification limits
 
 Use verified TLS, mTLS where required, narrow forward/reverse rules, and an
-isolated management endpoint. Default unrestricted listeners and the embedded
-development server certificate are unsuitable as a complete production setup.
+isolated management endpoint. Cleartext loopback development listeners,
+`--allow-insecure-dev`, and the embedded development server certificate are
+unsuitable as a production setup.
 
-Optional [device quotas](docs/DEVICE_QUOTAS.md) limit sessions, active/pending
-tunnel work, request rate, and upload/download payload by verified mTLS CN across
-the three TLS transports. Enable them with `--device-quota-config` and adapt
-[the example](device-quotas.example.yaml) to a measured workload. They are
-disabled by default, loaded at startup, and local to one Server instance.
+[Device quotas](docs/DEVICE_QUOTAS.md) limit sessions, active/pending tunnel
+work, request rate, and upload/download payload by verified device identity across
+the three TLS transports. Under mTLS the default limits apply. Replace them with
+`--device-quota-config`, adapting [the example](device-quotas.example.yaml) to a
+measured workload, or disable them with `--no-device-quotas`. They are loaded at
+startup and local to one Server instance.
 They do not persist usage across restart or coordinate multiple replicas.
 
 Optional [device revocation](docs/DEVICE_REVOCATION.md) blocks individual leaf

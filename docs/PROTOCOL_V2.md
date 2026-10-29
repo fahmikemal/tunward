@@ -55,19 +55,20 @@ verified client leaf certificate. The server binds that CN to the requested
 path on WSS, HTTP/2, and WebTransport. Missing, multiple, or unusable CN values
 are rejected instead of falling back to unrestricted path choice.
 
-The client normally derives the path from its certificate CN; a manual `-P`
-must agree. SAN-only client authorization is not implemented. Server SAN
-verification and client CN-to-path authorization serve different purposes.
+The client normally derives the path from its certificate identity: the CN by
+default, or the SAN URI or DNS name selected with `--tls-client-identity-field`.
+A manual `-P` must agree. Server SAN verification and client identity-to-path
+authorization serve different purposes.
 
 `--client-id`, `--device-id`, and their header values are caller-controlled
 registry labels. They are not authentication credentials, quota keys, or proof
 that two records belong to distinct physical devices.
 
-Restriction rules authorize destinations. Optional
-[device quotas](DEVICE_QUOTAS.md) separately enforce atomic session/tunnel
-admission, attempt rate, and aggregate directional payload shaping by verified CN.
-They are disabled by default, require mTLS, and share accounting across the
-three TLS transports in one Server instance. Counts/token buckets are not
+Restriction rules authorize destinations. [Device quotas](DEVICE_QUOTAS.md)
+separately enforce atomic session/tunnel admission, attempt rate, and aggregate
+directional payload shaping by verified device identity. They require mTLS,
+apply default limits unless configured otherwise, and share accounting across
+the three TLS transports in one Server instance. Counts/token buckets are not
 persistent and are not coordinated across replicas. This adds no tenant RBAC.
 The optional [live revocation policy](DEVICE_REVOCATION.md) denies verified CNs
 or leaf-certificate SHA-256 fingerprints and terminates their sessions and
