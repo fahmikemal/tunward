@@ -230,6 +230,9 @@ jobs:
       - name: Qualify tenant scope and reverse ownership
         timeout-minutes: 5
         run: python3 scripts/qualify_tenants.py --output "$QUALIFICATION_ROOT/tenants"
+      - name: Qualify forwarded addresses, reverse destinations, listener binds and development quotas
+        timeout-minutes: 5
+        run: python3 scripts/qualify_trust_boundaries.py --output "$QUALIFICATION_ROOT/trust"
       - name: Check publication tree for PEM private keys
         run: python3 scripts/check_publication.py
       - name: Verify endurance evidence and supervisor shutdown
