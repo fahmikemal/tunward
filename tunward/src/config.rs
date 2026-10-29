@@ -610,7 +610,8 @@ pub struct ServerCreationRequest {
     pub tenant_config: Option<PathBuf>,
 
     /// Explicit exception permitting unauthenticated, cleartext, or non-loopback listeners for local development.
-    /// Emits a high-visibility security warning at startup. Does not relax loopback restriction on --management-api.
+    /// Emits a high-visibility security warning at startup. Does not relax loopback restriction on --management-api,
+    /// and keeps the default device quotas under mTLS; use --no-device-quotas to drop them.
     #[cfg_attr(
         feature = "clap",
         arg(

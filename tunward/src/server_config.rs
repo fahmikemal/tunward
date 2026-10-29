@@ -188,7 +188,7 @@ pub(crate) fn load_server_files(args: &ServerCreationRequest) -> anyhow::Result<
             DeviceQuotaConfig::from_path(path)
                 .with_context(|| format!("Cannot load device quota config {}", path.display()))?,
         )
-    } else if mtls_configured && !args.allow_insecure_dev && !args.no_device_quotas {
+    } else if mtls_configured && !args.no_device_quotas {
         Some(DeviceQuotaConfig::default_production_limits())
     } else {
         None
@@ -386,6 +386,19 @@ mod tests {
             Some(DeviceQuotaConfig::default_production_limits()),
             "Default finite production limits should be applied when mTLS is enabled without explicit quota file"
         );
+    }
+
+    #[test]
+    fn test_allow_insecure_dev_keeps_default_limits() {
+        // A development exception relaxes listener prerequisites only; dropping limits takes --no-device-quotas.
+        let ca_path = write_test_ca_pem("insecure-dev-quotas");
+        let mut req = sample_server_request("wss://0.0.0.0:8080");
+        req.tls_client_ca_certs = Some(ca_path.clone());
+        req.allow_insecure_dev = true;
+
+        let files = load_server_files(&req).expect("valid development configuration");
+        let _ = std::fs::remove_file(ca_path);
+        assert_eq!(files.device_quotas, Some(DeviceQuotaConfig::default_production_limits()));
     }
 
     #[test]

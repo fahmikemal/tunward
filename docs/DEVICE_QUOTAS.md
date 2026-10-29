@@ -15,7 +15,8 @@ enforces **finite default baseline limits**:
 - `bandwidth_burst_bytes`: 1,048,576 bytes (1 MB burst)
 
 Operators can override these defaults by supplying `--device-quota-config FILE`, or
-explicitly opt out using `--no-device-quotas` (or `--allow-insecure-dev` during development).
+explicitly opt out using `--no-device-quotas`. `--allow-insecure-dev` only relaxes
+listener prerequisites; it keeps these defaults.
 
 One CLI server shares the same accounting across WSS, HTTP/2, and WebTransport.
 Server clones share state. Separate Server instances, processes, and replicas do
