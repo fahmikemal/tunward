@@ -62,6 +62,11 @@ cargo build --release --locked -p tunward-cli
 ./target/release/tunward --help
 ~~~
 
+The default features include `fleet-inventory`, the SQLite store behind
+`--fleet-inventory`. For a data-plane binary without SQLite, build with
+`--no-default-features --features aws-lc-rs` (or `ring`); it refuses
+`--fleet-inventory`. See [fleet records](docs/FLEET_INVENTORY.md).
+
 The examples below use `tunward` on PATH; substitute
 `./target/release/tunward` when running directly from this checkout.
 
@@ -413,7 +418,7 @@ tunward server --help
 | `--no-device-quotas` | Explicitly disable default finite device resource limits under mTLS |
 | `--device-revocation-config FILE` | Live mTLS device identity denial; closes active sessions and reverse resources |
 | `--tenant-config FILE` | Startup-loaded device membership, tunnel roles, and reserved reverse scope; requires mTLS and named `--restrict-config` rules |
-| `--fleet-inventory FILE` | Persistent SQLite observations of verified mTLS devices |
+| `--fleet-inventory FILE` | Persistent SQLite observations of verified mTLS devices; needs the default `fleet-inventory` build feature |
 | `--fleet-inventory-max-devices N` | Maximum stored device identities; default 10000 |
 | `--management-api IP:PORT` | Loopback REST management API exposing `/healthz`, Prometheus `/metrics`, and client/session registry |
 | `-P, --http-upgrade-path-prefix VALUE` | Client path prefix; mTLS auto-derives from the verified identity field by default |

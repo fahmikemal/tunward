@@ -70,7 +70,7 @@ rcgen = { version = "0.14.10", default-features = false, features = [] }
 time = { version = "0.3.55", default-features = false, features = ["std"] }
 hickory-resolver = { version = "0.26.3", default-features = false, features = ["system-config", "tokio"] }
 aws-lc-rs = { version = "1.18.1", optional = true }
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["bundled"], optional = true }
 
 [target.'cfg(not(target_family = "unix"))'.dependencies]
 crossterm = { version = "0.29.0" }
@@ -88,7 +88,10 @@ derive_more = { version = "2.1.1", features = ["from"] }
 if-addrs = "0.15.0"
 
 [features]
-default = ["aws-lc-rs"]
+default = ["aws-lc-rs", "fleet-inventory"]
+# Persistent SQLite observations for --fleet-inventory. Without it the build compiles no SQLite
+# and refuses that flag; the in-memory registry and management API stay available.
+fleet-inventory = ["dep:rusqlite"]
 clap = ["dep:clap"]
 aws-lc-rs = [
   "tokio-rustls/aws-lc-rs",
