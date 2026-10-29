@@ -14,7 +14,7 @@ use crate::tunnel::upstream_connectors::TcpUpstreamConnector;
 use crate::tunnel::{LocalProtocol, RemoteAddr};
 use bytes::BytesMut;
 use futures_util::{Stream, StreamExt};
-use hyper::http::HeaderValue;
+use hyper::http::{HeaderName, HeaderValue};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use regex::Regex;
 use rstest::{fixture, rstest};
@@ -99,6 +99,7 @@ fn server_config(dns_resolver: DnsResolver) -> ServerConfig {
         tls_client_identity_field: ClientIdentityField::default(),
         tls_handshake_timeout: Duration::from_secs(10),
         max_pending_tls_handshakes: std::num::NonZeroU32::new(1024).unwrap(),
+        trusted_proxies: vec![],
     }
 }
 
@@ -243,6 +244,76 @@ fn no_restrictions() -> RestrictionsRules {
             allow: vec![tunnels, reverse_tunnel],
         }],
     }
+}
+
+#[rstest]
+#[case::untrusted_peer(vec![], Ipv4Addr::LOCALHOST)]
+#[case::trusted_peer(vec!["127.0.0.1/32".parse().unwrap()], Ipv4Addr::new(203, 0, 113, 9))]
+#[timeout(Duration::from_secs(10))]
+#[tokio::test]
+#[serial]
+async fn test_proxy_protocol_source_trusts_x_forwarded_for_only_from_trusted_proxies(
+    no_restrictions: RestrictionsRules,
+    dns_resolver: DnsResolver,
+    #[case] trusted_proxies: Vec<IpNet>,
+    #[case] expected_source: Ipv4Addr,
+) {
+    let server = Server::new(
+        ServerConfig {
+            trusted_proxies,
+            ..server_config(dns_resolver.clone())
+        },
+        DefaultTokioExecutor::default(),
+    );
+    let server_port = server.config.bind.port();
+    let server_h = tokio::spawn(server.serve(no_restrictions));
+    defer! { server_h.abort(); };
+
+    // The client claims an address it does not have.
+    let mut config = (*client_ws(server_port, dns_resolver.clone()).await.config).clone();
+    config.http_headers.insert(
+        HeaderName::from_static("x-forwarded-for"),
+        HeaderValue::from_static("203.0.113.9"),
+    );
+    let client = Client::new(
+        config,
+        1,
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+        DefaultTokioExecutor::default(),
+    )
+    .await
+    .unwrap();
+
+    let (tunnel_listen, tunnel_host) = free_addr();
+    let (endpoint_listen, endpoint_host) = free_addr();
+    let target = TcpListener::bind(endpoint_listen).await.unwrap();
+    // proxy_protocol: the server prefixes the target connection with a PROXY protocol v2 header.
+    let listener = TcpDownstreamListener::new(tunnel_listen, (endpoint_host, endpoint_listen.port()), true)
+        .await
+        .unwrap();
+    let client_h = tokio::spawn(async move { client.run_tunnel(listener).await });
+    defer! { client_h.abort(); };
+
+    let mut application = protocols::tcp::connect(
+        &tunnel_host,
+        tunnel_listen.port(),
+        SoMark::new(None),
+        Duration::from_secs(10),
+        &dns_resolver,
+    )
+    .await
+    .unwrap();
+    application.write_all(b"ping").await.unwrap();
+    let (mut upstream, _) = target.accept().await.unwrap();
+    // A PROXY protocol v2 header with IPv4 addresses is 28 bytes.
+    let mut header = [0; 28];
+    upstream.read_exact(&mut header).await.unwrap();
+    let header = ppp::v2::Header::try_from(&header[..]).unwrap();
+    let ppp::v2::Addresses::IPv4(addresses) = header.addresses else {
+        panic!("expected IPv4 addresses, got {:?}", header.addresses);
+    };
+    assert_eq!(addresses.source_address, expected_source);
 }
 
 #[rstest]
@@ -783,6 +854,7 @@ async fn test_fleet_management_and_ephemeral_reverse_tunnel(
         tls_client_identity_field: ClientIdentityField::default(),
         tls_handshake_timeout: Duration::from_secs(10),
         max_pending_tls_handshakes: std::num::NonZeroU32::new(1024).unwrap(),
+        trusted_proxies: vec![],
     };
     let server = Server::new(server_config, DefaultTokioExecutor::default());
     let server_port = server.config.bind.port();

@@ -543,6 +543,11 @@ async fn run_server_impl(
             args.remote_addr
         );
     }
+    for net in args.trusted_proxies.iter().filter(|net| net.prefix_len() == 0) {
+        tracing::warn!(
+            "--trusted-proxy {net} trusts X-Forwarded-For from every address: any client can then choose the address recorded for it and sent to targets in PROXY protocol headers"
+        );
+    }
     let managed = reload
         .as_ref()
         .map(|_| {
@@ -594,6 +599,7 @@ async fn run_server_impl(
         tls_client_identity_field: args.tls_client_identity_field,
         tls_handshake_timeout: args.tls_handshake_timeout,
         max_pending_tls_handshakes: args.max_pending_tls_handshakes,
+        trusted_proxies: args.trusted_proxies,
     };
     let mut server = Server::new(server_config, executor);
     if let (Some(state), Some(reload)) = (managed, reload) {

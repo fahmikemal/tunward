@@ -280,6 +280,7 @@ mod tests {
             tls_client_identity_field: ClientIdentityField::Cn,
             tls_handshake_timeout: Duration::from_secs(10),
             max_pending_tls_handshakes: std::num::NonZeroU32::new(1024).unwrap(),
+            trusted_proxies: vec![],
         }
     }
 

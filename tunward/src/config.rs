@@ -493,6 +493,24 @@ pub struct ServerCreationRequest {
     )]
     pub max_pending_tls_handshakes: std::num::NonZeroU32,
 
+    /// Address or CIDR range of a reverse proxy in front of this server whose X-Forwarded-For header
+    /// is trusted. Repeat it, or separate several with commas. The client address recorded in logs,
+    /// fleet records and the PROXY protocol header sent to targets is then the rightmost
+    /// X-Forwarded-For entry that is not a trusted proxy.
+    /// Without it, X-Forwarded-For is ignored and the connection's peer address is used.
+    #[cfg_attr(
+        feature = "clap",
+        arg(
+            long = "trusted-proxy",
+            value_name = "IP[/PREFIX]",
+            value_parser = parsers::parse_trusted_proxy,
+            value_delimiter = ',',
+            env = "TUNWARD_TRUSTED_PROXIES",
+            verbatim_doc_comment
+        )
+    )]
+    pub trusted_proxies: Vec<ipnet::IpNet>,
+
     /// If set, will use this http proxy to connect to the client
     #[cfg_attr(
         feature = "clap",
@@ -911,6 +929,30 @@ mod parsers {
         })
     }
 
+    /// A trusted proxy as an IP address or a CIDR range. An IPv4-mapped IPv6 range is read as the
+    /// IPv4 range it covers, as peer addresses are compared in that form.
+    pub fn parse_trusted_proxy(arg: &str) -> Result<ipnet::IpNet, io::Error> {
+        use ipnet::{IpNet, Ipv4Net};
+
+        let net = arg
+            .parse::<IpNet>()
+            .or_else(|_| arg.parse::<IpAddr>().map(IpNet::from))
+            .map_err(|_| {
+                io::Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("Invalid trusted proxy {arg}: expected an IP address or a CIDR range such as 10.0.0.0/8"),
+                )
+            })?
+            .trunc();
+        Ok(match net {
+            IpNet::V6(v6) if v6.prefix_len() >= 96 => match v6.network().to_ipv4_mapped() {
+                Some(v4) => IpNet::V4(Ipv4Net::new(v4, v6.prefix_len() - 96).expect("prefix of at most 32")),
+                None => net,
+            },
+            net => net,
+        })
+    }
+
     pub fn parse_sni_override(arg: &str) -> Result<DnsName<'static>, io::Error> {
         match DnsName::try_from(arg.to_string()) {
             Ok(val) => Ok(val),
@@ -1057,6 +1099,23 @@ mod parsers {
             assert_eq!(json, "\"san-uri\"");
             let decoded: ClientIdentityField = serde_json::from_str(&json).unwrap();
             assert_eq!(decoded, ClientIdentityField::SanUri);
+        }
+
+        #[test]
+        fn trusted_proxies_are_addresses_or_ranges() {
+            use super::parse_trusted_proxy;
+            let net = |value: &str| value.parse::<ipnet::IpNet>().unwrap();
+
+            assert_eq!(parse_trusted_proxy("10.0.0.0/8").unwrap(), net("10.0.0.0/8"));
+            // Host bits are dropped, so the range reads as configured.
+            assert_eq!(parse_trusted_proxy("10.1.2.3/8").unwrap(), net("10.0.0.0/8"));
+            assert_eq!(parse_trusted_proxy("192.0.2.1").unwrap(), net("192.0.2.1/32"));
+            assert_eq!(parse_trusted_proxy("2001:db8::1").unwrap(), net("2001:db8::1/128"));
+            // Peers are compared as IPv4, so an IPv4-mapped range becomes its IPv4 range.
+            assert_eq!(parse_trusted_proxy("::ffff:10.0.0.0/104").unwrap(), net("10.0.0.0/8"));
+            for invalid in ["", "proxy.example", "10.0.0.0/33", "10.0.0.0/8/1", "10.0.0.1:80"] {
+                assert!(parse_trusted_proxy(invalid).is_err(), "{invalid}");
+            }
         }
     }
 }

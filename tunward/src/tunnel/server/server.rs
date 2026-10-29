@@ -20,8 +20,9 @@ use crate::tunnel::server::handler_websocket::ws_server_upgrade;
 use crate::tunnel::server::handler_webtransport;
 use crate::tunnel::server::reverse_tunnel::{ListenerOwner, ReverseTunnelServer};
 use crate::tunnel::server::utils::{
-    DestinationGrant, HttpResponse, bad_request, extract_authorization, extract_path_prefix, extract_tunnel_info,
-    extract_x_forwarded_for, find_mapped_port, needs_resolution, quota_rejection, validate_tunnel_with_scope,
+    DestinationGrant, ForwardedFor, HttpResponse, bad_request, extract_authorization, extract_path_prefix,
+    extract_tunnel_info, find_mapped_port, forwarded_client, needs_resolution, quota_rejection,
+    validate_tunnel_with_scope,
 };
 use crate::tunnel::tls_reloader::TlsReloader;
 use crate::tunnel::upstream_connectors::{TcpUpstreamConnector, UdpUpstreamConnector, UpstreamConnector};
@@ -36,6 +37,7 @@ use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
 use hyper::{Request, StatusCode, Version, http};
 use hyper_util::rt::{TokioExecutor, TokioTimer};
+use ipnet::IpNet;
 use parking_lot::Mutex;
 use socket2::SockRef;
 use std::fmt;
@@ -51,7 +53,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tracing::{Instrument, Level, Span, error, info, span, warn};
+use tracing::{Instrument, Level, Span, debug, error, info, span, warn};
 use url::{Host, Url};
 
 #[derive(Debug)]
@@ -93,6 +95,8 @@ pub struct ServerConfig {
     /// Connections beyond it are closed on arrival, so peers that never authenticate cannot exhaust
     /// file descriptors or memory. Established sessions do not count.
     pub max_pending_tls_handshakes: std::num::NonZeroU32,
+    /// Reverse proxies whose X-Forwarded-For header names the client; empty trusts none.
+    pub trusted_proxies: Vec<IpNet>,
 }
 
 #[derive(Clone, Default)]
@@ -276,11 +280,22 @@ impl<E: crate::TokioExecutorRef> Server<E> {
             Some(permit) => Some(permit),
             None => restrict_path_prefix.admit_tunnel().map_err(quota_rejection)?,
         };
-        if let Some((x_forward_for, x_forward_for_str)) = extract_x_forwarded_for(req) {
-            info!("Request X-Forwarded-For: {x_forward_for:?}");
-            Span::current().record("forwarded_for", x_forward_for_str);
-            client_addr.set_ip(x_forward_for);
-        };
+        // The client address reaches logs, fleet records and PROXY protocol headers sent to targets,
+        // so X-Forwarded-For only counts when a trusted proxy relayed the request.
+        match forwarded_client(client_addr.ip(), req.headers(), &self.config.trusted_proxies) {
+            ForwardedFor::Client(ip) => {
+                info!("Client {ip} relayed by trusted proxy {client_addr}");
+                Span::current().record("forwarded_for", tracing::field::display(ip));
+                client_addr.set_ip(ip);
+            }
+            ForwardedFor::Untrusted => {
+                debug!("Ignoring X-Forwarded-For from {client_addr}, which is not a --trusted-proxy");
+            }
+            ForwardedFor::Malformed => {
+                warn!("Ignoring a malformed or oversized X-Forwarded-For relayed by trusted proxy {client_addr}");
+            }
+            ForwardedFor::Absent => {}
+        }
 
         let path_prefix = extract_path_prefix(req.uri().path()).map_err(|err| {
             warn!("Rejecting connection with {err}: {}", req.uri());
@@ -1097,6 +1112,7 @@ impl Debug for ServerConfig {
             .field("tls_client_identity_field", &self.tls_client_identity_field)
             .field("tls_handshake_timeout", &self.tls_handshake_timeout)
             .field("max_pending_tls_handshakes", &self.max_pending_tls_handshakes)
+            .field("trusted_proxies", &self.trusted_proxies)
             .field(
                 "mTLS",
                 &self

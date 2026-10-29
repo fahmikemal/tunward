@@ -109,6 +109,7 @@ In accordance with enterprise secure defaults:
 - **Destination CIDRs also bind domain names**: A restriction rule whose `cidr` constrains addresses allows a domain destination only at its resolved addresses inside that CIDR, and the server connects to those checked addresses without resolving again. See [destination policy](docs/using_mtls.md#destination-and-reverse-listener-policy) for the exact matching rules and migration.
 - **Bounded unauthenticated connections**: A TLS handshake must complete within `--tls-handshake-timeout` (default 10s), and at most `--max-pending-tls-handshakes` (default 1024) may be in progress on the TCP listener, and separately on the WebTransport listener, where a connection stays pending until it sends its session request; further connections are closed or refused on arrival while established sessions keep forwarding. After resource errors such as file-descriptor exhaustion, every accept loop pauses briefly and rate-limits its warnings instead of spinning.
 - **Default resource limits**: When mTLS is enabled, finite baseline limits (32 sessions, 256 tunnels, 100 rps / 200 burst, 10 MB/s bandwidth shaping) are enforced per verified device to protect against unrestricted resource consumption (OWASP API4:2023). Operators can supply custom limits via `--device-quota-config` or opt out via `--no-device-quotas`. Loopback listeners (`127.0.0.1`, `localhost`, `[::1]`) remain unrestricted for rapid local development.
+- **Client addresses from trusted proxies only**: `X-Forwarded-For` is ignored unless the connection comes from a `--trusted-proxy`. The client address is then the rightmost entry that is not a trusted proxy, following MDN's guidance, since anything before it was written by the client. That address appears in logs and fleet records, and in the PROXY protocol v2 header that `?proxy_protocol` tunnels send to their target.
 - **Modern PKI & SPIFFE/SAN Identity Extraction**: Supports extracting verified client identities from X.509 Common Name (`cn`), Subject Alternative Name URI (`san-uri` / SPIFFE ID), or Subject Alternative Name DNS (`san-dns`), enabling native integration with modern service meshes, MDM platforms, and enterprise PKI standards.
 
 Run it as the service user, with the intended arguments, environment and file
@@ -302,7 +303,9 @@ try HTTP/2. To try WebTransport, change the server URL to
 certificate and restriction options.
 
 A reverse proxy must preserve the selected protocol and bidirectional streaming;
-buffering or an HTTP/2-to-HTTP/1 downgrade can break the tunnel. WebTransport
+buffering or an HTTP/2-to-HTTP/1 downgrade can break the tunnel. Pass its address
+with `--trusted-proxy` so the server takes the client address from its
+`X-Forwarded-For`; without that option the header is ignored. WebTransport
 needs QUIC/UDP reachability. Its client races resolved addresses with a 250 ms
 stagger and at most four attempts in flight, within the connection timeout, so
 a stalled IPv6 route does not postpone every IPv4 attempt. Its current client rejects `--http-proxy`,
@@ -428,6 +431,7 @@ tunward server --help
 | `--allow-insecure-dev` | Explicit exception permitting cleartext or unauthenticated non-loopback listeners for local testing; emits security warnings |
 | `--tls-handshake-timeout DURATION` | Close a TLS connection whose handshake (for WebTransport, also its session request) has not completed in time; default 10s, must be nonzero |
 | `--max-pending-tls-handshakes N` | TLS handshakes allowed in progress at once, per TCP and WebTransport listener; excess connections are closed or refused; default 1024 |
+| `--trusted-proxy IP[/PREFIX]` | Reverse proxy whose `X-Forwarded-For` names the client; repeat or separate with commas; default none, so the header is ignored |
 | `-c, --connection-min-idle N` | Idle pool setting, default 0; accepted range 0..1000; WebTransport clamps to one session |
 | `--connection-retry-max-backoff DURATION` | Pool acquisition deadline, default 5m, must be nonzero |
 | `--reverse-tunnel-connection-retry-max-backoff DURATION` | Reverse reconnect backoff ceiling, default 1s |
