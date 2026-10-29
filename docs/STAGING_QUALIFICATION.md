@@ -37,7 +37,7 @@ dependencies in `scripts/requirements-qualification.txt`. Standalone generation 
 | `scripts/qualify_wan_endurance.py` | Periodic native WAN probes over a declared 24–72 hour window; separate cycle reports |
 | `scripts/verify_endurance.py` | Completion receipt/service-exit verification, actual duration, and resource observations |
 | `scripts/verify_wan_endurance.py` | Periodic WAN receipt, binary/result hashes, complete native matrix, cycle exits, and duration verification |
-| `scripts/qualify_tproxy.py` | Privileged IPv4 TCP/UDP interception inside three disposable Linux network namespaces |
+| `scripts/qualify_tproxy.py` | Privileged IPv4 and IPv6 TCP/UDP interception inside three disposable Linux network namespaces |
 | `scripts/qualify_dns.py` | Controlled UDP DNS/DoT/DoH, address fallback, resolver-name denial and ECH edge cases |
 | `scripts/qualify_runtime.py` | Native cross-platform TCP/reverse TCP/UDP smoke checks with verified mTLS |
 | `scripts/qualify_reload.py` | Unix acknowledged/SIGHUP reload, live streams, atomic rejection, preserved quotas, tenant cleanup, and TCP/QUIC trust rotation |
@@ -447,9 +447,10 @@ entirely inside them, applies nftables and policy routes only inside the proxy
 namespace, keeps IP forwarding disabled, and removes its namespaces/processes
 on ordinary completion or handled termination. It requires Linux root and the
 kernel TProxy facilities. Preserve its metadata and check cleanup after an
-unhandled kill. It exercises IPv4 original-destination routing and reply-source
-integrity over all three TLS transports; it does not qualify IPv6 interception,
-your host's firewall/routing, or every capability-restricted container layout.
+unhandled kill. It exercises IPv4 and IPv6 original-destination routing and
+reply-source integrity over all three TLS transports, with the tunnel itself over
+IPv4; it does not qualify your host's firewall/routing, or every
+capability-restricted container layout.
 Root-owned output directories need an explicit operator-controlled ownership
 handoff before non-root artifact collection; never broaden key readability.
 
@@ -478,8 +479,8 @@ features and stream capacity. Keep those workloads and counts separate.
 
 Native Linux smoke results are available locally. CI/release now require the
 portable runner on Linux, macOS and Windows; configuration alone is not a
-successful remote run. Android, FreeBSD, architecture-specific runtimes, IPv6
-TProxy, and deployment-specific CDN/ECH remain separate gates.
+successful remote run. Android, FreeBSD, architecture-specific runtimes, and
+deployment-specific CDN/ECH remain separate gates.
 
 The first beta CI run passed native Linux and Windows but failed on macOS while
 loading the test client CA (`ExtensionValueInvalid`). The fixture combined

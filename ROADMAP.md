@@ -61,7 +61,9 @@ These gates remain separate from feature count:
 - Complete and review continuous 24–72 hour WAN evidence for the exact candidate
   binary and representative workloads. Test real MDM devices, sleep/reconnect,
   and network transitions separately from synthetic identities.
-- Qualify required privileged/IPv6 TProxy, DNS/ECH/CDN behavior, and target OS
+- Privileged IPv4 and IPv6 TProxy interception (TCP/UDP over WSS, HTTP/2 and
+  WebTransport) is qualified in CI inside disposable network namespaces; host
+  firewall integration is not. Still qualify DNS/ECH/CDN behavior and target OS
   runtimes. Do not treat a release build target as a runtime qualification.
 - Validate the actual deployment's certificate issuer/domain, renewal,
   permissions, reload, monitoring, backup, rollout, and rollback. Define and

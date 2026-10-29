@@ -244,7 +244,7 @@ jobs:
       - name: Qualify DNS and ECH edge cases
         timeout-minutes: 5
         run: python3 scripts/qualify_dns.py --output "$QUALIFICATION_ROOT/dns"
-      - name: Qualify isolated privileged IPv4 TProxy
+      - name: Qualify isolated privileged IPv4 and IPv6 TProxy
         timeout-minutes: 5
         run: |
           status=0
