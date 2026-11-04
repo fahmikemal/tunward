@@ -32,6 +32,14 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 #[allow(clippy::type_complexity)]
 pub struct Socks5Listener {
     socks_server: Pin<Box<dyn Stream<Item = anyhow::Result<(Socks5Stream, (Host, u16))>> + Send>>,
+    local_addr: SocketAddr,
+}
+
+impl Socks5Listener {
+    /// The address the server is bound to, with the port the OS picked for a port-0 bind.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
 }
 
 pub enum Socks5ReadHalf {
@@ -154,9 +162,10 @@ pub async fn run_server(
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("Cannot create socks5 server {bind:?}"))?;
+    let local_addr = listener.local_addr()?;
     info!(
         "Starting SOCKS5 server on {} (authentication: {})",
-        listener.local_addr()?,
+        local_addr,
         credentials.is_some()
     );
     let (tx, rx) = tokio::sync::mpsc::channel(64);
@@ -187,6 +196,7 @@ pub async fn run_server(
     );
     Ok(Socks5Listener {
         socks_server: Box::pin(stream),
+        local_addr,
     })
 }
 

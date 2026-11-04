@@ -54,6 +54,13 @@ type ProxyBody = BoxBody<Bytes, hyper::Error>;
 
 pub struct HttpProxyListener {
     listener: Pin<Box<dyn Stream<Item = Accepted> + Send>>,
+    local_addr: SocketAddr,
+}
+impl HttpProxyListener {
+    /// The address the proxy is bound to, with the port the OS picked for a port-0 bind.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
 }
 impl Stream for HttpProxyListener {
     type Item = Accepted;
@@ -197,9 +204,10 @@ pub async fn run_server(
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("Cannot create HTTP proxy {bind}"))?;
+    let local_addr = listener.local_addr()?;
     info!(
         "Starting HTTP proxy on {} (authentication: {})",
-        listener.local_addr()?,
+        local_addr,
         credentials.is_some()
     );
     let auth = credentials.map(|(user, pass)| {
@@ -240,6 +248,7 @@ pub async fn run_server(
     );
     Ok(HttpProxyListener {
         listener: Box::pin(stream),
+        local_addr,
     })
 }
 

@@ -563,7 +563,8 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                     let destination = (local_srv.0.clone(), candidate.port());
                     async move {
                         let listener = UdpDownstreamListener::new(candidate, destination, timeout).await?;
-                        Ok((listener, candidate))
+                        let bound = listener.bound_addr();
+                        Ok((listener, bound))
                     }
                 });
                 let ((local_rx, local_tx), remote) = SERVERS
@@ -590,7 +591,8 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                     let credentials = credentials.clone();
                     async move {
                         let listener = Socks5DownstreamListener::new(candidate, timeout, credentials).await?;
-                        Ok((listener, candidate))
+                        let bound = listener.bound_addr();
+                        Ok((listener, bound))
                     }
                 });
                 let ((local_rx, mut local_tx), remote) = SERVERS
@@ -626,7 +628,8 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                     let credentials = credentials.clone();
                     async move {
                         let listener = HttpProxyDownstreamListener::new(candidate, timeout, credentials, false).await?;
-                        Ok((listener, candidate))
+                        let bound = listener.bound_addr();
+                        Ok((listener, bound))
                     }
                 });
                 let ((local_rx, local_tx), remote) = SERVERS

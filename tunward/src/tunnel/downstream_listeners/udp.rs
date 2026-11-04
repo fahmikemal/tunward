@@ -19,6 +19,7 @@ pub struct UdpDownstreamListener {
     timeout: Option<Duration>,
     /// Cloned into every reader handed out, so its count tells whether a peer is still served.
     readers: Arc<()>,
+    bound_addr: SocketAddr,
 }
 
 impl UdpDownstreamListener {
@@ -27,7 +28,7 @@ impl UdpDownstreamListener {
         dest: (Host, u16),
         timeout: Option<Duration>,
     ) -> anyhow::Result<UdpDownstreamListener> {
-        let listener = udp::run_server(bind_addr, timeout, |_| Ok(()), |s| Ok(s.clone()))
+        let (listener, bound_addr) = udp::run_server_with_addr(bind_addr, timeout, |_| Ok(()), |s| Ok(s.clone()))
             .await
             .with_context(|| anyhow!("Cannot start UDP server on {bind_addr}"))?;
 
@@ -36,7 +37,12 @@ impl UdpDownstreamListener {
             dest,
             timeout,
             readers: Arc::new(()),
+            bound_addr,
         })
+    }
+
+    pub fn bound_addr(&self) -> SocketAddr {
+        self.bound_addr
     }
 
     /// Whether a reader handed out by this listener is still in use.
@@ -70,7 +76,10 @@ impl Stream for UdpDownstreamListener {
         let ret = ready!(unsafe { Pin::new_unchecked(&mut this.listener) }.poll_next(cx));
         let ret = match ret {
             Some(Ok(stream)) => {
-                let (host, port) = this.dest.clone();
+                let (host, mut port) = this.dest.clone();
+                if port == 0 {
+                    port = this.bound_addr.port();
+                }
                 let stream_writer = stream.writer();
                 let reader = UdpPeerReader {
                     stream,

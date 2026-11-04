@@ -29,6 +29,10 @@ impl HttpProxyDownstreamListener {
             proxy_protocol,
         })
     }
+
+    pub fn bound_addr(&self) -> SocketAddr {
+        self.listener.local_addr()
+    }
 }
 
 impl Stream for HttpProxyDownstreamListener {
