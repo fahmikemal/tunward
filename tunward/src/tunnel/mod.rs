@@ -1,3 +1,4 @@
+pub mod allowlist;
 pub mod ca_reloader;
 pub mod client;
 pub mod downstream_listeners;

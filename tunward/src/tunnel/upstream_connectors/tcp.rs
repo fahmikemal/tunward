@@ -1,4 +1,5 @@
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -8,6 +9,7 @@ use crate::protocols;
 use crate::protocols::dns::DnsResolver;
 use crate::somark::SoMark;
 use crate::tunnel::RemoteAddr;
+use crate::tunnel::allowlist::DestinationAllowlist;
 use crate::tunnel::upstream_connectors::UpstreamConnector;
 
 pub struct TcpUpstreamConnector {
@@ -17,6 +19,7 @@ pub struct TcpUpstreamConnector {
     connect_timeout: Duration,
     dns_resolver: DnsResolver,
     addresses: Option<Vec<IpAddr>>,
+    allow: Option<Arc<DestinationAllowlist>>,
 }
 
 impl TcpUpstreamConnector {
@@ -34,6 +37,21 @@ impl TcpUpstreamConnector {
             connect_timeout,
             dns_resolver,
             addresses: None,
+            allow: None,
+        }
+    }
+
+    /// Connect only to destinations this list allows, at their allowed addresses.
+    pub fn with_allowlist(mut self, allow: Option<Arc<DestinationAllowlist>>) -> Self {
+        self.allow = allow;
+        self
+    }
+
+    /// The destination to dial: the one the server named for a dynamic tunnel, or the configured one.
+    fn destination<'a>(&'a self, remote: &'a Option<RemoteAddr>) -> (&'a Host, u16) {
+        match remote {
+            Some(remote) => (&remote.host, remote.port),
+            None => (&self.host, self.port),
         }
     }
 
@@ -50,24 +68,18 @@ impl UpstreamConnector for TcpUpstreamConnector {
     type Writer = OwnedWriteHalf;
 
     async fn connect(&self, remote: &Option<RemoteAddr>) -> anyhow::Result<(Self::Reader, Self::Writer)> {
-        let stream = match (remote, &self.addresses) {
-            (None, Some(addresses)) => {
-                protocols::tcp::connect_to_addresses(
-                    &self.host,
-                    self.port,
-                    addresses,
-                    self.so_mark,
-                    self.connect_timeout,
-                )
-                .await?
+        let (host, port) = self.destination(remote);
+        let stream = match (remote, &self.addresses, &self.allow) {
+            (None, Some(addresses), _) => {
+                protocols::tcp::connect_to_addresses(host, port, addresses, self.so_mark, self.connect_timeout).await?
             }
-            _ => {
-                let (host, port) = match remote {
-                    Some(remote) => (&remote.host, remote.port),
-                    None => (&self.host, self.port),
-                };
-                protocols::tcp::connect(host, port, self.so_mark, self.connect_timeout, &self.dns_resolver).await?
+            (_, _, Some(allow)) => {
+                let addresses = allow
+                    .permitted(host, port, &self.dns_resolver, self.connect_timeout)
+                    .await?;
+                protocols::tcp::connect_to_addresses(host, port, &addresses, self.so_mark, self.connect_timeout).await?
             }
+            _ => protocols::tcp::connect(host, port, self.so_mark, self.connect_timeout, &self.dns_resolver).await?,
         };
         Ok(stream.into_split())
     }
@@ -78,18 +90,21 @@ impl UpstreamConnector for TcpUpstreamConnector {
         remote: &Option<RemoteAddr>,
     ) -> anyhow::Result<(Self::Reader, Self::Writer)> {
         // The proxy only takes one target, so a pinned destination is sent as its preferred address.
-        let pinned = match (remote, self.addresses.as_deref()) {
-            (None, Some([address, ..])) => Some(match address {
-                IpAddr::V4(ip) => Host::Ipv4(*ip),
-                IpAddr::V6(ip) => Host::Ipv6(*ip),
-            }),
+        let (destination, port) = self.destination(remote);
+        let pinned = match (remote, self.addresses.as_deref(), &self.allow) {
+            (None, Some([address, ..]), _) => Some(*address),
+            (_, _, Some(allow)) => Some(
+                allow
+                    .permitted(destination, port, &self.dns_resolver, self.connect_timeout)
+                    .await?[0],
+            ),
             _ => None,
         };
-        let (host, port) = match (remote, &pinned) {
-            (Some(remote), _) => (&remote.host, remote.port),
-            (None, Some(pinned)) => (pinned, self.port),
-            (None, None) => (&self.host, self.port),
-        };
+        let pinned = pinned.map(|address| match address {
+            IpAddr::V4(ip) => Host::Ipv4(ip),
+            IpAddr::V6(ip) => Host::Ipv6(ip),
+        });
+        let host = pinned.as_ref().unwrap_or(destination);
 
         let stream = protocols::tcp::connect_with_http_proxy(
             proxy,
