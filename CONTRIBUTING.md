@@ -142,7 +142,9 @@ and private keys out of release artifacts.
 [CI](.github/workflows/ci.yaml) runs for pushes to `main`/`draft`, pull
 requests targeting `main`, and manual dispatch. Its jobs include Gitleaks,
 Semgrep, formatting, Clippy, a RustSec audit, provider-specific Rust tests, and
-local qualification.
+local qualification. [CodeQL](.github/workflows/codeql.yaml) analyzes the Rust,
+Python and workflow code for pushes to `main`, pull requests targeting `main`,
+and weekly, and reports to code scanning.
 
 `main` accepts changes only through pull requests with passing CI, so a release
 takes two steps:
