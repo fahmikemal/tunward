@@ -9,7 +9,7 @@ use fastwebsockets::Role;
 use http_body_util::Either;
 use http_body_util::combinators::BoxBody;
 use hyper::body::Incoming;
-use hyper::header::{HeaderName, HeaderValue, SEC_WEBSOCKET_PROTOCOL};
+use hyper::header::{HeaderValue, SEC_WEBSOCKET_PROTOCOL};
 use hyper::{Request, Response};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -35,6 +35,7 @@ pub(super) async fn ws_server_upgrade(
     let mask_frame = server.config.websocket_mask_frame;
     let EstablishedTunnel {
         remote_addr,
+        listener_port,
         local_rx,
         local_tx,
         need_cookie,
@@ -97,10 +98,10 @@ pub(super) async fn ws_server_upgrade(
         return bad_request();
     }
 
-    if remote_addr.port != 0 {
+    if let Some(port) = listener_port {
         response
             .headers_mut()
-            .insert(HeaderName::from_static("x-assigned-port"), HeaderValue::from(remote_addr.port));
+            .insert(transport::ASSIGNED_PORT_HEADER, HeaderValue::from(port));
     }
 
     response

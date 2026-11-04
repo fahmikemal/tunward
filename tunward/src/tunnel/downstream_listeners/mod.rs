@@ -74,3 +74,40 @@ where
     type Reader = R;
     type Writer = W;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::time::Duration;
+    use tokio_stream::StreamExt;
+    use url::Host;
+
+    #[tokio::test]
+    async fn a_port_zero_listener_reports_the_port_it_is_bound_to() {
+        let any = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let mut udp = UdpDownstreamListener::new(any, (Host::Ipv4(Ipv4Addr::LOCALHOST), 0), None)
+            .await
+            .unwrap();
+        let socks = Socks5DownstreamListener::new(any, None, None).await.unwrap();
+        let http = HttpProxyDownstreamListener::new(any, None, None, false).await.unwrap();
+
+        let udp_bound = udp.bound_addr();
+        assert_ne!(udp_bound.port(), 0, "UDP reported the requested port");
+        assert!(std::net::UdpSocket::bind(udp_bound).is_err(), "UDP is not bound to {udp_bound}");
+        for bound in [socks.bound_addr(), http.bound_addr()] {
+            assert_ne!(bound.port(), 0, "a proxy reported the requested port");
+            assert!(std::net::TcpListener::bind(bound).is_err(), "no proxy is bound to {bound}");
+        }
+
+        // A peer's destination port 0 stands for the listener's own port, as for TCP.
+        let peer = tokio::net::UdpSocket::bind(any).await.unwrap();
+        peer.send_to(b"ping", udp_bound).await.unwrap();
+        let (_, remote) = tokio::time::timeout(Duration::from_secs(5), udp.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(remote.port, udp_bound.port());
+    }
+}

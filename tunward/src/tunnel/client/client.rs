@@ -6,7 +6,7 @@ use crate::tunnel::client::connection_pool::L4StreamManager;
 use crate::tunnel::downstream_listeners::{DownstreamListener, DownstreamRead, DownstreamWrite};
 use crate::tunnel::tls_reloader::TlsReloader;
 use crate::tunnel::transport::io::{TransportReader, TransportWriter};
-use crate::tunnel::transport::{TransportScheme, jwt_token_to_tunnel};
+use crate::tunnel::transport::{ASSIGNED_PORT_HEADER, TransportScheme, TunnelRequest, jwt_token_to_tunnel};
 use crate::tunnel::upstream_connectors::UpstreamConnector;
 use crate::tunnel::{LocalProtocol, RemoteAddr};
 use anyhow::Context;
@@ -16,7 +16,7 @@ use log::debug;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_stream::StreamExt;
-use tracing::{Instrument, Level, error, event, span};
+use tracing::{Instrument, Level, error, event, info, span, warn};
 use url::Host;
 use uuid::Uuid;
 
@@ -35,6 +35,17 @@ fn reverse_destination(requested: &LocalProtocol, cookie: Option<&HeaderValue>) 
         host: Host::parse(&jwt.claims.r).unwrap_or_else(|_| Host::Domain(String::new())),
         port: jwt.claims.rp,
     })
+}
+
+/// The identity a reverse tunnel names in its requests when the server allocates its port (port 0).
+///
+/// The server keeps the listener it allocated for that identity, so the tunnel stays on one port,
+/// as an SSH remote forward to port 0 does, instead of being given a new one with every request.
+/// It is random, so only this tunnel can reach that listener.
+fn allocated_listener(remote: &RemoteAddr) -> Option<Uuid> {
+    let socket_listener =
+        remote.protocol.is_reverse_tunnel() && !matches!(remote.protocol, LocalProtocol::ReverseUnix { .. });
+    (socket_listener && remote.port == 0).then(Uuid::new_v4)
 }
 
 #[derive(Clone)]
@@ -103,16 +114,16 @@ impl<E: TokioExecutorRef> Client<E> {
         // before bubbling the error up.
         let connect_result = match self.config.remote_addr.scheme() {
             TransportScheme::Ws | TransportScheme::Wss => {
-                tunnel::transport::websocket::connect(request_id, self, remote_cfg)
+                tunnel::transport::websocket::connect(request_id.into(), self, remote_cfg)
                     .await
                     .map(|(r, w, response)| (TransportReader::Websocket(r), TransportWriter::Websocket(w), response))
             }
             TransportScheme::Http | TransportScheme::Https => {
-                tunnel::transport::http2::connect(request_id, self, remote_cfg)
+                tunnel::transport::http2::connect(request_id.into(), self, remote_cfg)
                     .await
                     .map(|(r, w, response)| (TransportReader::Http2(r), TransportWriter::Http2(w), response))
             }
-            TransportScheme::Wts => tunnel::transport::webtransport::connect(request_id, self, remote_cfg)
+            TransportScheme::Wts => tunnel::transport::webtransport::connect(request_id.into(), self, remote_cfg)
                 .await
                 .map(|(r, w, response)| {
                     (
@@ -209,9 +220,15 @@ impl<E: TokioExecutorRef> Client<E> {
 
         let connector = Arc::new(connector);
         let mut reconnect_delay = new_reconnect_delay(self.reverse_tunnel_connection_retry_max_backoff);
+        let listener = allocated_listener(&remote_addr);
+        let mut served_port = None;
         loop {
             let client = self.clone();
             let request_id = Uuid::now_v7();
+            let request = TunnelRequest {
+                id: request_id,
+                listener,
+            };
             let span = span!(
                 Level::INFO,
                 "tunnel",
@@ -223,18 +240,18 @@ impl<E: TokioExecutorRef> Client<E> {
             let connect = async {
                 match client.config.remote_addr.scheme() {
                     TransportScheme::Ws | TransportScheme::Wss => {
-                        tunnel::transport::websocket::connect(request_id, &client, &remote_addr)
+                        tunnel::transport::websocket::connect(request, &client, &remote_addr)
                             .await
                             .map(|(r, w, response)| {
                                 (TransportReader::Websocket(r), TransportWriter::Websocket(w), response)
                             })
                     }
                     TransportScheme::Http | TransportScheme::Https => {
-                        tunnel::transport::http2::connect(request_id, &client, &remote_addr)
+                        tunnel::transport::http2::connect(request, &client, &remote_addr)
                             .await
                             .map(|(r, w, response)| (TransportReader::Http2(r), TransportWriter::Http2(w), response))
                     }
-                    TransportScheme::Wts => tunnel::transport::webtransport::connect(request_id, &client, &remote_addr)
+                    TransportScheme::Wts => tunnel::transport::webtransport::connect(request, &client, &remote_addr)
                         .await
                         .map(|(r, w, response)| {
                             (
@@ -264,9 +281,20 @@ impl<E: TokioExecutorRef> Client<E> {
 
             // Connect to endpoint
             event!(parent: &span, Level::DEBUG, "Server response: {:?}", response);
-            if let Some(port_hdr) = response.headers.get("x-assigned-port").and_then(|v| v.to_str().ok()) {
-                tracing::info!("Reverse tunnel active on assigned remote port: {port_hdr}");
+            let port = response
+                .headers
+                .get(ASSIGNED_PORT_HEADER)
+                .and_then(|port| port.to_str().ok()?.parse::<u16>().ok());
+            match (served_port, port) {
+                (_, None) => {}
+                (None, Some(port)) => info!(parent: &span, "Reverse tunnel served on server port {port}"),
+                (Some(previous), Some(port)) if previous != port => warn!(
+                    parent: &span,
+                    "Reverse tunnel moved from server port {previous} to {port}: the server allocated a new listener"
+                ),
+                (Some(_), Some(_)) => {}
             }
+            served_port = port.or(served_port);
             let cookie = response.headers.get(COOKIE);
             if cookie.is_some() && !remote_addr.protocol.is_dynamic_reverse_tunnel() {
                 event!(
@@ -331,6 +359,42 @@ mod tests {
         ] {
             assert!(reverse_destination(&fixed, Some(&cookie)).is_none(), "{fixed:?}");
         }
+    }
+
+    #[test]
+    fn only_a_socket_reverse_tunnel_on_port_zero_names_an_allocated_listener() {
+        let at = |protocol: LocalProtocol, port: u16| RemoteAddr {
+            protocol,
+            host: Host::Ipv4(Ipv4Addr::LOCALHOST),
+            port,
+        };
+        let tcp = || LocalProtocol::ReverseTcp;
+        let first = allocated_listener(&at(tcp(), 0)).expect("a port-0 reverse tunnel names a listener");
+        assert_ne!(
+            Some(first),
+            allocated_listener(&at(tcp(), 0)),
+            "each tunnel has its own identity"
+        );
+        for protocol in [
+            LocalProtocol::ReverseUdp { timeout: None },
+            LocalProtocol::ReverseSocks5 {
+                timeout: None,
+                credentials: None,
+            },
+            LocalProtocol::ReverseHttpProxy {
+                timeout: None,
+                credentials: None,
+            },
+        ] {
+            assert!(allocated_listener(&at(protocol, 0)).is_some());
+        }
+        assert!(allocated_listener(&at(tcp(), 8080)).is_none(), "a fixed port needs no identity");
+        let unix = LocalProtocol::ReverseUnix {
+            path: "/tmp/tunward.sock".into(),
+        };
+        assert!(allocated_listener(&at(unix, 0)).is_none());
+        let forward = LocalProtocol::Tcp { proxy_protocol: false };
+        assert!(allocated_listener(&at(forward, 0)).is_none());
     }
 
     #[test]

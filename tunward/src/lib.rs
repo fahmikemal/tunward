@@ -24,7 +24,7 @@ pub use management::{
     ClientRecord, ConnectionRecord, DevicePage, DeviceRecord, FleetRegistry, HealthStats, SessionRecord,
 };
 
-use crate::config::{ClientCreationRequest, DEFAULT_CLIENT_UPGRADE_PATH_PREFIX, ServerCreationRequest};
+use crate::config::{ClientCreationRequest, DEFAULT_CLIENT_UPGRADE_PATH_PREFIX, LocalToRemote, ServerCreationRequest};
 use crate::executor::{TokioExecutor, TokioExecutorRef};
 use crate::protocols::dns::DnsResolver;
 use crate::protocols::tls;
@@ -52,7 +52,7 @@ use std::time::Duration;
 use tokio::select;
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use url::Url;
 
 pub async fn run_client(args: ClientCreationRequest, executor: impl TokioExecutor) -> anyhow::Result<()> {
@@ -250,6 +250,21 @@ pub async fn create_client(
     Ok(client)
 }
 
+/// The peers of a reverse SOCKS5 or HTTP proxy tunnel, on the server's side, choose where this client
+/// connects; say how far that reaches.
+fn log_reverse_destinations(tunnel: &LocalToRemote) {
+    match &tunnel.allow {
+        Some(allow) => info!(
+            "Reverse {:?} tunnel on server {} connects only to {allow}",
+            tunnel.local_protocol, tunnel.local
+        ),
+        None => warn!(
+            "Reverse {:?} tunnel on server {} has no allow= list: the server's peers can reach anything this client can. Add ?allow=CIDR[:PORTS] to limit them",
+            tunnel.local_protocol, tunnel.local
+        ),
+    }
+}
+
 async fn create_client_tunnels(
     mut args: ClientCreationRequest,
     executor: impl TokioExecutorRef,
@@ -271,6 +286,10 @@ async fn create_client_tunnels(
     // Start tunnels
     for tunnel in remote_to_local.into_iter() {
         let client = client.clone();
+        if tunnel.local_protocol.is_dynamic_reverse_tunnel() {
+            log_reverse_destinations(&tunnel);
+        }
+        let allow = tunnel.allow.clone().map(Arc::new);
         match &tunnel.local_protocol {
             LocalProtocol::ReverseTcp => {
                 spawn_tunnel! {
@@ -328,7 +347,8 @@ async fn create_client_tunnels(
                         port,
                     };
                     let socks_connector =
-                        Socks5UpstreamConnector::new(cfg.socket_so_mark, cfg.timeout_connect, cfg.dns_resolver.clone());
+                        Socks5UpstreamConnector::new(cfg.socket_so_mark, cfg.timeout_connect, cfg.dns_resolver.clone())
+                            .with_allowlist(allow);
 
                     if let Err(err) = client.run_reverse_tunnel(remote, socks_connector).await {
                         error!("{:?}", err);
@@ -352,7 +372,8 @@ async fn create_client_tunnels(
                         cfg.socket_so_mark,
                         cfg.timeout_connect,
                         cfg.dns_resolver.clone(),
-                    );
+                    )
+                    .with_allowlist(allow);
 
                     if let Err(err) = client.run_reverse_tunnel(remote, tcp_connector).await {
                         error!("{:?}", err);

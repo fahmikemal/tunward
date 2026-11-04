@@ -352,17 +352,27 @@ are argument examples to combine with your transport and TLS options.
 | `-L unix:///tmp/tunward.sock:127.0.0.1:3000` | Local Unix socket ingress |
 | `-L stdio://127.0.0.1:22` | Stdin/stdout ingress, useful in SSH ProxyCommand |
 | `-R tcp://127.0.0.1:9000:127.0.0.1:3000` | Listener on the server, destination reached from the client |
-| `-R tcp://127.0.0.1:0:127.0.0.1:3000` | Request a reverse TCP port; tenant mode selects from its reserved pool |
+| `-R tcp://127.0.0.1:0:127.0.0.1:3000` | The server allocates a port, which stays with this tunnel; tenant mode selects from its reserved pool |
 | `-R udp://127.0.0.1:5353:127.0.0.1:53` | Reverse UDP |
 | `-R socks5://127.0.0.1:1081` | SOCKS5 listener on the server, outbound traffic from the client |
+| `-R 'socks5://127.0.0.1:1081?allow=10.0.0.0/8:443,[2001:db8::]/32'` | The same, reaching only the listed destinations |
 | `-R http://127.0.0.1:8083` | HTTP proxy listener on the server |
 | `-R unix:///tmp/tunward-reverse.sock:127.0.0.1:3000` | Reverse Unix socket |
 
 Quote specs containing `&` or shell metacharacters. Proxy listeners can require
 credentials using `?login=NAME&password=VALUE`; protect those values from shell
 history and logs. Keep listeners on loopback unless remote access is explicitly
-intended. The client help has stale text saying reverse mode supports only TCP;
-the parser and handlers also implement the reverse variants listed above.
+intended.
+
+The peers of a reverse SOCKS5 or HTTP proxy choose where the client connects.
+`?allow=` limits them to entries of the form `NET[:PORTS]`: an IPv4 address, an
+IPv6 address in brackets, or either with a `/prefix`, and optionally a port or
+an inclusive `first..last` range. Separate entries with commas or repeat
+`allow=`. The client resolves a domain once and dials only its allowed
+addresses, compares an IPv4-mapped IPv6 address as the IPv4 address it reaches,
+and refuses the rest. It warns at startup about a reverse proxy without
+`?allow=`, and refuses the option on any other tunnel, whose destination is
+fixed or authorized by the server's restrictions instead.
 
 `timeout_sec=0` disables a UDP listener's inactivity timeout. For a WireGuard
 tunnel, keep a route to the tunward server outside the WireGuard tunnel to avoid
@@ -372,9 +382,13 @@ capabilities/routing; the generic examples do not configure those privileges.
 Reverse listener release is asynchronous and depends on transport teardown,
 active waiters, and the server idle timeout. Port zero normally asks the OS for
 a port; tenant mode instead samples up to 32 candidates from its reserved pool.
-Neither is a persistent reservation. Cached reverse listener reuse is always
-scoped to the verified mTLS device and Server instance, independently of quotas
-and revocation. With quotas enabled, retained allocations also remain charged.
+The client logs the port it was given, and every later request of the same `-R`
+spec is served on it while the client keeps a request waiting, as `ssh -R 0:`
+keeps its port. A client absent for a whole idle check (one second under device
+quotas, otherwise the server idle timeout) may be given a new port, and warns
+when it is. The port is not a persistent reservation. Cached reverse listener
+reuse is always scoped to the verified mTLS device and Server instance,
+independently of quotas and revocation. With quotas enabled, retained allocations also remain charged.
 
 ## Fleet observation API
 

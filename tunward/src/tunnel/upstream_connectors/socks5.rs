@@ -1,5 +1,7 @@
 use std::io::{Error, IoSlice};
+use std::net::IpAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -13,6 +15,7 @@ use crate::protocols::dns::DnsResolver;
 use crate::protocols::udp;
 use crate::protocols::udp::WsUdpStream;
 use crate::somark::SoMark;
+use crate::tunnel::allowlist::DestinationAllowlist;
 use crate::tunnel::upstream_connectors::UpstreamConnector;
 use crate::tunnel::{LocalProtocol, RemoteAddr};
 
@@ -20,6 +23,7 @@ pub struct Socks5UpstreamConnector {
     so_mark: SoMark,
     connect_timeout: Duration,
     dns_resolver: DnsResolver,
+    allow: Option<Arc<DestinationAllowlist>>,
 }
 
 impl Socks5UpstreamConnector {
@@ -28,6 +32,25 @@ impl Socks5UpstreamConnector {
             so_mark,
             connect_timeout,
             dns_resolver,
+            allow: None,
+        }
+    }
+
+    /// Connect only to destinations this list allows, at their allowed addresses.
+    pub fn with_allowlist(mut self, allow: Option<Arc<DestinationAllowlist>>) -> Self {
+        self.allow = allow;
+        self
+    }
+
+    /// The addresses `remote` may be dialed at, or `None` to dial it as requested.
+    async fn permitted(&self, remote: &RemoteAddr) -> anyhow::Result<Option<Vec<IpAddr>>> {
+        match &self.allow {
+            Some(allow) => Ok(Some(
+                allow
+                    .permitted(&remote.host, remote.port, &self.dns_resolver, self.connect_timeout)
+                    .await?,
+            )),
+            None => Ok(None),
         }
     }
 }
@@ -41,28 +64,29 @@ impl UpstreamConnector for Socks5UpstreamConnector {
             return Err(anyhow!("Missing remote destination for reverse socks5"));
         };
 
+        let (host, port) = (&remote.host, remote.port);
         match remote.protocol {
             LocalProtocol::Tcp { proxy_protocol: _ } => {
-                let stream = protocols::tcp::connect(
-                    &remote.host,
-                    remote.port,
-                    self.so_mark,
-                    self.connect_timeout,
-                    &self.dns_resolver,
-                )
-                .await?;
+                let stream = match self.permitted(remote).await? {
+                    Some(addresses) => {
+                        protocols::tcp::connect_to_addresses(host, port, &addresses, self.so_mark, self.connect_timeout)
+                            .await?
+                    }
+                    None => {
+                        protocols::tcp::connect(host, port, self.so_mark, self.connect_timeout, &self.dns_resolver)
+                            .await?
+                    }
+                };
                 let (reader, writer) = stream.into_split();
                 Ok((Socks5UpstreamReader::Tcp(reader), Socks5UpstreamWriter::Tcp(writer)))
             }
             LocalProtocol::Udp { .. } => {
-                let stream = udp::connect(
-                    &remote.host,
-                    remote.port,
-                    self.connect_timeout,
-                    self.so_mark,
-                    &self.dns_resolver,
-                )
-                .await?;
+                let stream = match self.permitted(remote).await? {
+                    Some(addresses) => {
+                        udp::connect_to_addresses(host, port, &addresses, self.connect_timeout, self.so_mark).await?
+                    }
+                    None => udp::connect(host, port, self.connect_timeout, self.so_mark, &self.dns_resolver).await?,
+                };
                 Ok((Socks5UpstreamReader::Udp(stream.clone()), Socks5UpstreamWriter::Udp(stream)))
             }
             _ => Err(anyhow!("Invalid protocol for reverse socks5 {:?}", remote.protocol)),
@@ -80,9 +104,14 @@ impl UpstreamConnector for Socks5UpstreamConnector {
 
         match remote.protocol {
             LocalProtocol::Tcp { proxy_protocol: _ } => {
+                // The proxy only takes one target, so an allowed destination goes as its first allowed address.
+                let pinned = self.permitted(remote).await?.map(|addresses| match addresses[0] {
+                    IpAddr::V4(ip) => url::Host::Ipv4(ip),
+                    IpAddr::V6(ip) => url::Host::Ipv6(ip),
+                });
                 let stream = protocols::tcp::connect_with_http_proxy(
                     proxy,
-                    &remote.host,
+                    pinned.as_ref().unwrap_or(&remote.host),
                     remote.port,
                     self.so_mark,
                     self.connect_timeout,

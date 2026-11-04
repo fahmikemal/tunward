@@ -16,12 +16,15 @@ pub mod webtransport;
 pub use jwt::JWT_HEADER_PREFIX;
 pub use jwt::jwt_token_to_tunnel;
 pub use jwt::tunnel_to_jwt_token;
-pub use jwt::{JwtTunnelConfig, TunnelMetadata};
+pub use jwt::{JwtTunnelConfig, TunnelMetadata, TunnelRequest, reply_to_jwt_token};
 pub use types::TransportAddr;
 pub use types::TransportScheme;
 
 pub(crate) const VERSION_HEADER: &str = "x-tunward-version";
 pub(crate) const PROTOCOL_VERSION: &str = "2";
+/// Response header with the server port a reverse tunnel's listener is bound to. WebTransport has no
+/// per-stream headers, so its reply envelope carries the port instead.
+pub(crate) const ASSIGNED_PORT_HEADER: &str = "x-assigned-port";
 
 pub(crate) fn insert_client_label(headers: &mut hyper::HeaderMap, client_id: Option<&str>) {
     if let Some(value) = client_id.and_then(|id| HeaderValue::from_str(id).ok()) {

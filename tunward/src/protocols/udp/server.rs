@@ -248,14 +248,28 @@ pub async fn run_server(
     configure_listener: impl Fn(&UdpSocket) -> anyhow::Result<()>,
     mk_send_socket: impl Fn(&Arc<UdpSocket>) -> anyhow::Result<Arc<UdpSocket>>,
 ) -> Result<impl Stream<Item = io::Result<UdpStream>>, anyhow::Error> {
+    run_server_with_addr(bind, timeout, configure_listener, mk_send_socket)
+        .await
+        .map(|(s, _)| s)
+}
+
+/// [`run_server`], also returning the address the socket is bound to, as the OS picks the port of
+/// a port-0 bind.
+pub async fn run_server_with_addr(
+    bind: SocketAddr,
+    timeout: Option<Duration>,
+    configure_listener: impl Fn(&UdpSocket) -> anyhow::Result<()>,
+    mk_send_socket: impl Fn(&Arc<UdpSocket>) -> anyhow::Result<Arc<UdpSocket>>,
+) -> Result<(impl Stream<Item = io::Result<UdpStream>>, SocketAddr), anyhow::Error> {
     let listener = UdpSocket::bind(bind)
         .await
         .with_context(|| format!("Cannot create UDP server {bind:?}"))?;
     configure_listener(&listener)?;
 
+    let local_addr = listener.local_addr().unwrap_or(bind);
     info!(
         "Starting UDP server listening cnx on {} with cnx timeout of {}s",
-        listener.local_addr().unwrap_or(bind),
+        local_addr,
         timeout.unwrap_or(Duration::from_secs(0)).as_secs()
     );
 
@@ -312,7 +326,7 @@ pub async fn run_server(
         },
     );
 
-    Ok(stream)
+    Ok((stream, local_addr))
 }
 
 #[derive(Clone)]

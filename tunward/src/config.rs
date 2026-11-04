@@ -87,12 +87,15 @@ pub struct ClientCreationRequest {
     #[cfg_attr(feature = "clap", arg(short='L', long, value_name = "{tcp,udp,socks5,stdio,unix}://[BIND:]PORT:HOST:PORT", value_parser = parsers::parse_tunnel_arg, verbatim_doc_comment))]
     pub local_to_remote: Vec<LocalToRemote>,
 
-    /// Listen on remote and forwards traffic from local. Can be specified multiple times. Only tcp is supported
+    /// Listen on remote and forwards traffic from local. Can be specified multiple times
     /// examples:
     /// 'tcp://1212:google.com:443'      =>     listen on server for incoming tcp cnx on port 1212 and forward to google.com on port 443 from local machine
+    /// 'tcp://0:localhost:22'           =>     listen on server on a port it allocates, logged once known, and keep that port while this client runs
     /// 'udp://1212:1.1.1.1:53'          =>     listen on server for incoming udp on port 1212 and forward to cloudflare dns 1.1.1.1 on port 53 from local machine
     /// 'socks5://[::1]:1212'            =>     listen on server for incoming socks5 request on port 1212 and forward dynamically request from local machine (login/password is supported)
     /// 'http://[::1]:1212'         =>     listen on server for incoming http proxy request on port 1212 and forward dynamically request from local machine (login/password is supported)
+    /// 'socks5://[::1]:1212?allow=10.0.0.0/8:443,[2001:db8::]/32' => the server's peers may only reach these destinations from local machine
+    ///                                         entries are CIDR[:PORT|:FIRST..LAST]; a domain must resolve inside them. Also for http://
     /// 'unix://tunward.sock:g.com:443' =>     listen on server for incoming data from unix socket of path tunward.sock and forward to g.com:443 from local machine
     #[cfg_attr(feature = "clap", arg(short='R', long, value_name = "{tcp,udp,socks5,unix}://[BIND:]PORT:HOST:PORT", value_parser = parsers::parse_reverse_tunnel_arg, verbatim_doc_comment))]
     pub remote_to_local: Vec<LocalToRemote>,
@@ -647,12 +650,16 @@ pub struct LocalToRemote {
     pub local_protocol: LocalProtocol,
     pub local: SocketAddr,
     pub remote: (Host, u16),
+    /// The destinations a reverse SOCKS5 or HTTP proxy tunnel may open, from its `?allow=` option.
+    /// It stays on this client: the server never sees it.
+    pub allow: Option<crate::tunnel::allowlist::DestinationAllowlist>,
 }
 
 #[cfg(feature = "clap")]
 mod parsers {
     use super::LocalToRemote;
     use crate::tunnel::LocalProtocol;
+    use crate::tunnel::allowlist::DestinationAllowlist;
     use crate::tunnel::transport::TransportScheme;
     use base64::Engine;
     use hyper::http::{HeaderName, HeaderValue};
@@ -769,6 +776,44 @@ mod parsers {
     }
 
     pub fn parse_tunnel_arg(arg: &str) -> Result<LocalToRemote, io::Error> {
+        let tunnel = parse_tunnel(arg)?;
+        if tunnel.allow.is_some() {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "allow= only applies to reverse (-R) SOCKS5 and HTTP proxy tunnels; the server's restrictions authorize forward destinations: {arg}"
+                ),
+            ));
+        }
+        Ok(tunnel)
+    }
+
+    /// The `allow=` values of a dynamic reverse tunnel's options. Repeated options add up.
+    fn parse_allow(query: &str) -> Result<Option<DestinationAllowlist>, io::Error> {
+        let values: Vec<String> = url::form_urlencoded::parse(query.as_bytes())
+            .filter(|(key, _)| key == "allow")
+            .map(|(_, value)| value.into_owned())
+            .collect();
+        if values.is_empty() {
+            return Ok(None);
+        }
+        DestinationAllowlist::parse(values.iter().map(String::as_str))
+            .map(Some)
+            .map_err(|err| io::Error::new(ErrorKind::InvalidInput, format!("{err:#}")))
+    }
+
+    /// `allow=` limits destinations the server names, which only dynamic tunnels have.
+    fn refuse_allow(options: &BTreeMap<String, String>, arg: &str) -> Result<(), io::Error> {
+        if options.contains_key("allow") {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("allow= only applies to reverse (-R) SOCKS5 and HTTP proxy tunnels: {arg}"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn parse_tunnel(arg: &str) -> Result<LocalToRemote, io::Error> {
         use std::io::Error;
         let get_timeout = |options: &BTreeMap<String, String>| {
             options
@@ -792,17 +837,20 @@ mod parsers {
             "tcp" => {
                 let (local_bind, remaining) = parse_local_bind(tunnel_info)?;
                 let (dest_host, dest_port, options) = parse_tunnel_dest(remaining)?;
+                refuse_allow(&options, arg)?;
                 Ok(LocalToRemote {
                     local_protocol: LocalProtocol::Tcp {
                         proxy_protocol: get_proxy_protocol(&options),
                     },
                     local: local_bind,
                     remote: (dest_host, dest_port),
+                    allow: None,
                 })
             }
             "udp" => {
                 let (local_bind, remaining) = parse_local_bind(tunnel_info)?;
                 let (dest_host, dest_port, options) = parse_tunnel_dest(remaining)?;
+                refuse_allow(&options, arg)?;
 
                 Ok(LocalToRemote {
                     local_protocol: LocalProtocol::Udp {
@@ -810,6 +858,7 @@ mod parsers {
                     },
                     local: local_bind,
                     remote: (dest_host, dest_port),
+                    allow: None,
                 })
             }
             "unix" => {
@@ -820,6 +869,7 @@ mod parsers {
                     ));
                 };
                 let (dest_host, dest_port, options) = parse_tunnel_dest(remote)?;
+                refuse_allow(&options, arg)?;
                 Ok(LocalToRemote {
                     local_protocol: LocalProtocol::Unix {
                         path: PathBuf::from(path),
@@ -827,6 +877,7 @@ mod parsers {
                     },
                     local: SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)),
                     remote: (dest_host, dest_port),
+                    allow: None,
                 })
             }
             "http" => {
@@ -841,6 +892,7 @@ mod parsers {
                     },
                     local: local_bind,
                     remote: (dest_host, dest_port),
+                    allow: parse_allow(remaining)?,
                 })
             }
             "socks5" => {
@@ -854,38 +906,45 @@ mod parsers {
                     },
                     local: local_bind,
                     remote: (dest_host, dest_port),
+                    allow: parse_allow(remaining)?,
                 })
             }
             "stdio" => {
                 let (dest_host, dest_port, options) = parse_tunnel_dest(tunnel_info)?;
+                refuse_allow(&options, arg)?;
                 Ok(LocalToRemote {
                     local_protocol: LocalProtocol::Stdio {
                         proxy_protocol: get_proxy_protocol(&options),
                     },
                     local: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(0), 0)),
                     remote: (dest_host, dest_port),
+                    allow: None,
                 })
             }
             "tproxy+tcp" => {
                 let (local_bind, remaining) = parse_local_bind(tunnel_info)?;
                 let x = format!("0.0.0.0:0?{remaining}");
-                let (dest_host, dest_port, _options) = parse_tunnel_dest(&x)?;
+                let (dest_host, dest_port, options) = parse_tunnel_dest(&x)?;
+                refuse_allow(&options, arg)?;
                 Ok(LocalToRemote {
                     local_protocol: LocalProtocol::TProxyTcp,
                     local: local_bind,
                     remote: (dest_host, dest_port),
+                    allow: None,
                 })
             }
             "tproxy+udp" => {
                 let (local_bind, remaining) = parse_local_bind(tunnel_info)?;
                 let x = format!("0.0.0.0:0?{remaining}");
                 let (dest_host, dest_port, options) = parse_tunnel_dest(&x)?;
+                refuse_allow(&options, arg)?;
                 Ok(LocalToRemote {
                     local_protocol: LocalProtocol::TProxyUdp {
                         timeout: get_timeout(&options),
                     },
                     local: local_bind,
                     remote: (dest_host, dest_port),
+                    allow: None,
                 })
             }
             _ => Err(Error::new(
@@ -896,7 +955,7 @@ mod parsers {
     }
 
     pub fn parse_reverse_tunnel_arg(arg: &str) -> Result<LocalToRemote, io::Error> {
-        let proto = parse_tunnel_arg(arg)?;
+        let proto = parse_tunnel(arg)?;
         let local_protocol = match proto.local_protocol {
             LocalProtocol::Tcp { .. } => LocalProtocol::ReverseTcp {},
             LocalProtocol::Udp { timeout } => LocalProtocol::ReverseUdp { timeout },
@@ -926,13 +985,14 @@ mod parsers {
             local_protocol,
             local: proto.local,
             remote: proto.remote,
+            allow: proto.allow,
         })
     }
 
     /// A trusted proxy as an IP address or a CIDR range. An IPv4-mapped IPv6 range is read as the
     /// IPv4 range it covers, as peer addresses are compared in that form.
     pub fn parse_trusted_proxy(arg: &str) -> Result<ipnet::IpNet, io::Error> {
-        use ipnet::{IpNet, Ipv4Net};
+        use ipnet::IpNet;
 
         let net = arg
             .parse::<IpNet>()
@@ -944,13 +1004,7 @@ mod parsers {
                 )
             })?
             .trunc();
-        Ok(match net {
-            IpNet::V6(v6) if v6.prefix_len() >= 96 => match v6.network().to_ipv4_mapped() {
-                Some(v4) => IpNet::V4(Ipv4Net::new(v4, v6.prefix_len() - 96).expect("prefix of at most 32")),
-                None => net,
-            },
-            net => net,
-        })
+        Ok(crate::tunnel::allowlist::canonical_net(net))
     }
 
     pub fn parse_sni_override(arg: &str) -> Result<DnsName<'static>, io::Error> {
@@ -1055,6 +1109,7 @@ mod parsers {
                 local_protocol: LocalProtocol::Tcp { proxy_protocol: false },
                 local: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 443)),
                 remote: (Host::Domain("domain.com".to_string()), 4443),
+                allow: None,
             }
         ; "with no local bind")]
         #[test_case("udp://[::1]:443:toto.com:4443?timeout_sec=30" =>
@@ -1062,6 +1117,7 @@ mod parsers {
                 local_protocol: LocalProtocol::Udp { timeout: Some(std::time::Duration::from_secs(30)) },
                 local: SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1), 443, 0, 0)),
                 remote: (Host::Domain("toto.com".to_string()), 4443),
+                allow: None,
             }
         ; "with fully defined tunnel")]
         #[test_case("udp://[::1]:443:[::1]:4443?timeout_sec=30" =>
@@ -1069,6 +1125,7 @@ mod parsers {
                 local_protocol: LocalProtocol::Udp { timeout: Some(std::time::Duration::from_secs(30)) },
                 local: SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1), 443, 0, 0)),
                 remote: (Host::Ipv6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), 4443),
+                allow: None,
             }
         ; "with full ipv6 tunnel")]
         fn test_parse_tunnel_arg(input: &str) -> LocalToRemote {
@@ -1115,6 +1172,66 @@ mod parsers {
             assert_eq!(parse_trusted_proxy("::ffff:10.0.0.0/104").unwrap(), net("10.0.0.0/8"));
             for invalid in ["", "proxy.example", "10.0.0.0/33", "10.0.0.0/8/1", "10.0.0.1:80"] {
                 assert!(parse_trusted_proxy(invalid).is_err(), "{invalid}");
+            }
+        }
+
+        #[test]
+        fn a_dynamic_reverse_tunnel_takes_an_allow_list() {
+            use super::parse_reverse_tunnel_arg;
+            use std::net::{IpAddr, Ipv4Addr};
+            let ip = |a, b, c, d| IpAddr::V4(Ipv4Addr::new(a, b, c, d));
+
+            let socks = parse_reverse_tunnel_arg(
+                "socks5://[::1]:1212?allow=10.0.0.0/8:443,192.168.1.10&allow=[2001:db8::]/32:8000..8100",
+            )
+            .unwrap();
+            assert!(matches!(socks.local_protocol, LocalProtocol::ReverseSocks5 { .. }));
+            let allow = socks.allow.expect("the allow list");
+            assert_eq!(allow.to_string(), "10.0.0.0/8:443,192.168.1.10/32,[2001:db8::]/32:8000..8100");
+            assert!(allow.allows(ip(10, 1, 1, 1), 443) && !allow.allows(ip(10, 1, 1, 1), 80));
+
+            // Other options keep working beside it.
+            let http = parse_reverse_tunnel_arg("http://1212?login=admin&password=secret&allow=127.0.0.1:22").unwrap();
+            match &http.local_protocol {
+                LocalProtocol::ReverseHttpProxy { credentials, .. } => {
+                    assert_eq!(credentials.as_ref().map(|(login, _)| login.as_str()), Some("admin"))
+                }
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(http.allow.unwrap().to_string(), "127.0.0.1/32:22");
+            assert!(parse_reverse_tunnel_arg("socks5://1212").unwrap().allow.is_none());
+        }
+
+        #[test]
+        fn allow_is_refused_where_it_cannot_apply_or_does_not_parse() {
+            use super::parse_reverse_tunnel_arg;
+            // A fixed tunnel connects only to its configured target, and the server authorizes forward ones.
+            for fixed in [
+                "tcp://1212:localhost:22?allow=10.0.0.0/8",
+                "udp://1212:1.1.1.1:53?allow=10.0.0.0/8",
+                "unix:///tmp/t.sock:localhost:22?allow=10.0.0.0/8",
+            ] {
+                let err = parse_reverse_tunnel_arg(fixed).unwrap_err().to_string();
+                assert!(err.contains("only applies to reverse"), "{fixed}: {err}");
+            }
+            for forward in [
+                "socks5://1212?allow=10.0.0.0/8",
+                "http://1212?allow=10.0.0.0/8",
+                "tcp://1212:x:22?allow=10.0.0.0/8",
+            ] {
+                let err = parse_tunnel_arg(forward).unwrap_err().to_string();
+                assert!(err.contains("only applies to reverse"), "{forward}: {err}");
+            }
+            for invalid in [
+                "socks5://1212?allow=",
+                "socks5://1212?allow=10.0.0.0/33",
+                "socks5://1212?allow=2001:db8::1:443",
+            ] {
+                let err = parse_reverse_tunnel_arg(invalid).unwrap_err().to_string();
+                assert!(
+                    err.contains("invalid allow entry") || err.contains("at least one"),
+                    "{invalid}: {err}"
+                );
             }
         }
     }

@@ -10,3 +10,4 @@ pub use server::connect_to_addresses;
 #[cfg(target_os = "linux")]
 pub use server::mk_send_socket_tproxy;
 pub use server::run_server;
+pub use server::run_server_with_addr;

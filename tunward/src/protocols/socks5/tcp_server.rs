@@ -32,6 +32,14 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 #[allow(clippy::type_complexity)]
 pub struct Socks5Listener {
     socks_server: Pin<Box<dyn Stream<Item = anyhow::Result<(Socks5Stream, (Host, u16))>> + Send>>,
+    local_addr: SocketAddr,
+}
+
+impl Socks5Listener {
+    /// The address the server is bound to, with the port the OS picked for a port-0 bind.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
 }
 
 pub enum Socks5ReadHalf {
@@ -154,9 +162,10 @@ pub async fn run_server(
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("Cannot create socks5 server {bind:?}"))?;
+    let local_addr = listener.local_addr()?;
     info!(
         "Starting SOCKS5 server on {} (authentication: {})",
-        listener.local_addr()?,
+        local_addr,
         credentials.is_some()
     );
     let (tx, rx) = tokio::sync::mpsc::channel(64);
@@ -187,6 +196,7 @@ pub async fn run_server(
     );
     Ok(Socks5Listener {
         socks_server: Box::pin(stream),
+        local_addr,
     })
 }
 
@@ -246,7 +256,7 @@ async fn accept_client(
         select! { result = relay => result, result = closed => result }
     } else if cmd == Socks5Command::TCPConnect {
         let dest = match target {
-            TargetAddr::Ip(addr) => (Host::parse(&addr.ip().to_string())?, addr.port()),
+            TargetAddr::Ip(addr) => crate::tunnel::to_host_port(addr),
             TargetAddr::Domain(host, port) => (Host::Domain(host), port),
         };
         tx.send(Ok((
@@ -350,5 +360,50 @@ impl AsyncWrite for Socks5WriteHalf {
             Self::Udp(s) => s.is_write_vectored(),
             Self::TcpPending { .. } => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use tokio::io::AsyncWriteExt;
+
+    /// The destination the server reads from a CONNECT naming `address` (an ATYP and its bytes).
+    async fn requested(address: &[u8]) -> (Host, u16) {
+        let mut listener = run_server(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0), None, None)
+            .await
+            .unwrap();
+        let request = [&[5, 1, 0][..], address, &443u16.to_be_bytes()].concat();
+        let endpoint = listener.local_addr();
+        // The listener negotiates only while it is polled, so the client runs beside it.
+        let client = tokio::spawn(async move {
+            let mut client = TcpStream::connect(endpoint).await.unwrap();
+            client.write_all(&[5, 1, 0]).await.unwrap();
+            let mut method = [0; 2];
+            client.read_exact(&mut method).await.unwrap();
+            assert_eq!(method, [5, 0]);
+            client.write_all(&request).await.unwrap();
+            client
+        });
+        let (_, destination) = tokio::time::timeout(Duration::from_secs(5), listener.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        drop(client.await.unwrap());
+        destination
+    }
+
+    #[tokio::test]
+    async fn a_connect_names_ipv4_ipv6_and_domain_destinations() {
+        assert_eq!(requested(&[1, 127, 0, 0, 1]).await, (Host::Ipv4(Ipv4Addr::LOCALHOST), 443));
+        let ipv6 = [&[4][..], &Ipv6Addr::LOCALHOST.octets()].concat();
+        assert_eq!(requested(&ipv6).await, (Host::Ipv6(Ipv6Addr::LOCALHOST), 443));
+        let mapped = Ipv4Addr::LOCALHOST.to_ipv6_mapped();
+        let ipv4_mapped = [&[4][..], &mapped.octets()].concat();
+        assert_eq!(requested(&ipv4_mapped).await, (Host::Ipv6(mapped), 443));
+        let domain = [&[3, 9][..], b"localhost"].concat();
+        assert_eq!(requested(&domain).await, (Host::Domain("localhost".to_string()), 443));
     }
 }

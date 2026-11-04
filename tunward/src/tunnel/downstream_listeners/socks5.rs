@@ -24,6 +24,10 @@ impl Socks5DownstreamListener {
 
         Ok(Self { listener })
     }
+
+    pub fn bound_addr(&self) -> SocketAddr {
+        self.listener.local_addr()
+    }
 }
 
 impl Stream for Socks5DownstreamListener {
