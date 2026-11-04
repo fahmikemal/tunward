@@ -93,6 +93,28 @@ Use the [qualification guide](docs/STAGING_QUALIFICATION.md) for bounded capacit
 container, WAN, and endurance profiles. Historical results do not qualify a new
 binary automatically.
 
+### Fuzzing
+
+The targets in `fuzz/` feed arbitrary bytes to the parsers of what peers send:
+the routing envelope, `X-Forwarded-For`, HTTP proxy targets, SOCKS5 UDP datagrams
+and tunnel records, plus `allow=` lists. Release builds abort on a panic, so a
+panic any of these can reach would end the whole process. The checks are in
+`tunward/src/fuzz.rs`, and they also assert what must hold beyond not crashing,
+such as a client being unable to change its recorded address.
+
+~~~sh
+cargo install cargo-fuzz --version 0.13.2 --locked
+./scripts/fuzz.sh 60                     # every target for a minute each
+./scripts/fuzz.sh 300 tunnel_envelope
+~~~
+
+`cargo test` replays `fuzz/seeds` through the same checks without a fuzzer. Add a
+crashing input from `fuzz/artifacts` to `fuzz/seeds/<target>` with its fix so it
+stays covered. [The workflow](.github/workflows/fuzz.yaml) fuzzes each target for
+a minute on a pull request that can change them and five minutes every week. Its
+runs and artifacts are public, so report a crash that a peer could trigger
+privately through [SECURITY.md](SECURITY.md) instead of in an issue.
+
 ## Task runners and legacy scripts
 
 `mise.toml` defines `test`, `linter-fix`, dependency maintenance, benchmark,

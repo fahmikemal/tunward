@@ -1,6 +1,8 @@
 pub mod config;
 mod embedded_certificate;
 pub mod executor;
+#[cfg(any(fuzzing, test))]
+pub mod fuzz;
 pub mod management;
 mod protocols;
 pub mod quotas;

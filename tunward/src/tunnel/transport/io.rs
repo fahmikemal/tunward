@@ -236,6 +236,22 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for RecordDecoder<W> {
     }
 }
 
+/// Decodes a record stream written in chunks of `chunk_size`: the payload bytes that came out, and
+/// whether the stream decoded to its end, and to a FIN.
+#[cfg(any(fuzzing, test))]
+pub(crate) async fn decode_records(wire: &[u8], chunk_size: usize) -> (Vec<u8>, bool, bool) {
+    let mut decoder = RecordDecoder::new(Vec::new());
+    let mut valid = true;
+    for chunk in wire.chunks(chunk_size) {
+        if decoder.write_all(chunk).await.is_err() {
+            valid = false;
+            break;
+        }
+    }
+    valid = valid && decoder.flush().await.is_ok();
+    (decoder.writer, valid, decoder.finished)
+}
+
 async fn send_records(
     local_rx: impl AsyncRead,
     tx: &mut impl TransportWrite,

@@ -82,7 +82,7 @@ const MAX_FORWARDED_HOPS: usize = 32;
 
 /// What a request's X-Forwarded-For header establishes about its client.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum ForwardedFor {
+pub(crate) enum ForwardedFor {
     /// The request has no X-Forwarded-For header.
     Absent,
     /// The connection's peer is not a trusted proxy, so the header proves nothing about the client.
@@ -99,7 +99,7 @@ pub(super) enum ForwardedFor {
 /// is one. The list, joined across every X-Forwarded-For header in order, is then read from the
 /// right past each trusted proxy, and the first other address is the client. Entries to its left
 /// were written by the client itself and are never used.
-pub(super) fn forwarded_client(peer: IpAddr, headers: &HeaderMap, trusted: &[IpNet]) -> ForwardedFor {
+pub(crate) fn forwarded_client(peer: IpAddr, headers: &HeaderMap, trusted: &[IpNet]) -> ForwardedFor {
     let mut values = headers.get_all(X_FORWARDED_FOR).iter().peekable();
     if values.peek().is_none() {
         return ForwardedFor::Absent;

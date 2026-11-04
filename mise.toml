@@ -104,6 +104,14 @@ git push origin "refs/tags/$tag"
 echo "Pushed $tag; the release workflow now builds, attests and publishes it"
 '''
 
+[tasks.fuzz]
+description = "Fuzz the parsers of peer input on the pinned toolchain. Requires cargo-fuzz"
+usage = """
+arg "<seconds>" help="how long to fuzz each target"
+arg "[target]" var=#true help="the targets in fuzz/, every one by default"
+"""
+run = "./scripts/fuzz.sh ${usage_seconds?} ${usage_target:-}"
+
 [tasks.bench]
 description = "End-to-end benchmark with iperf3 (throughput, cpu, memory). See docs/BENCHMARKING.md"
 usage = 'flag "--args <args>" help="passed through to scripts/bench.sh"'
