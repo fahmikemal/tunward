@@ -31,8 +31,11 @@ The routing value is `v2.` followed by unpadded base64url JSON, limited to
 | `p` | Serialized destination/reverse protocol |
 | `r` | Host or destination descriptor |
 | `rp` | Port |
+| `l` | Optional client tunnel identifier, a UUID, on reverse requests for port zero |
+| `lp` | Optional listener port, on WebTransport replies to reverse requests |
 
-This is unsigned routing metadata, not a signed identity or an authentication
+`l` and `lp` are omitted when unset, and a peer ignores fields it does not know,
+so envelopes without them decode as before. This is unsigned routing metadata, not a signed identity or an authentication
 credential. Some Rust identifiers still contain `jwt` for source continuity;
 their names do not imply JWT signature verification.
 
@@ -155,6 +158,10 @@ checked for each request. Proxy credentials and hop-by-hop fields are consumed
 before origin forwarding. CONNECT readiness follows tunnel readiness. Header
 handling has a ten-second deadline and a 32 KiB buffer limit.
 
+A client confines the destinations a server may name to a reverse SOCKS5 or HTTP
+proxy with the spec's `?allow=` option, checked on the client before it
+connects. It is client configuration and adds nothing to the wire protocol.
+
 SOCKS5 has at most 256 pending negotiation handlers. UDP ASSOCIATE has a dedicated
 relay bound to its control connection, checks the TCP peer IP, and constrains
 the UDP source port or pins the first valid source. Closing the control
@@ -169,17 +176,40 @@ revocation-enabled listener follows its creator's cancellation guard.
 Unauthenticated legacy operation has no verified device boundary. Port zero
 allocates a new endpoint: the OS selects it by default, while optional
 [tenant policy](TENANT_ISOLATION.md) samples up to 32 distinct ports from its
-reserved address/pool. Tenant role and rule scope also constrain tunnel requests;
-this does not change wire protocol v2.
+reserved address/pool. Tenant role and rule scope also constrain tunnel requests.
+
+A client names each `-R` spec whose server port is zero with a tunnel identifier
+(`l`) generated when it starts, and sends it with every reverse request of that
+spec. The server allocates one listener per owner, bind address, and identifier,
+and later requests carrying the same identifier wait on that listener instead of
+allocating another. Its port therefore stays with the client tunnel between
+visitors, as `ssh -R 0:` keeps one port for the life of its forwarding. A
+request without an identifier, as from an earlier client, still allocates a
+listener of its own. The identifier is unsigned and only selects among the
+requesting owner's own listeners, so it grants no access to another device's
+port. The allocation is not durable. A server restart releases it, and so does a
+client with no request waiting through a whole check interval: one second under
+device quotas, which then stop charging it, and otherwise the server idle
+timeout. A client that reconnects within that time keeps its port; after it, the
+next request receives a new one.
+
+The server reports the port a reverse socket listener is bound to: in the
+`x-assigned-port` response header on WebSocket and HTTP/2, and in the reply
+envelope's `lp` on WebTransport. The client logs that port when it is first
+served and warns if a later request is served on a different one.
 
 Cleanup depends on receiver/waiter lifecycle and an idle timer. Ephemeral
 listeners use checks capped at five seconds by the configured idle timeout;
 fixed listeners use the configured interval. Quota-enabled unused listeners
-instead check at intervals capped at one second by that timeout. A UDP listener
+instead check at intervals capped at one second by that timeout. A listener
+allocated to a client tunnel closes only after a whole check interval with no
+request of that tunnel waiting and none arriving, so the gap between one
+visitor's connection and the client's next request does not release it. A UDP listener
 stays open past these checks while it still serves a peer, because the listener
-sorts that peer's datagrams. An ephemeral listener belongs to the request that
+sorts that peer's datagrams. An ephemeral listener without a tunnel identifier belongs to the request that
 opened it: once that request has its connection, later connections to the same
-endpoint are dropped instead of waiting for a request that never comes. Transport
+endpoint are dropped instead of waiting for a request that never comes. An
+allocated listener instead queues them for the tunnel's next request. Transport
 teardown must be observed before reclaim, so do not promise immediate release
 on every disconnect. Validate cleanup and reconnection for the intended workload.
 An explicit policy revocation cancels its creator's listener independently of
@@ -211,6 +241,7 @@ python3 scripts/qualify.py --sections protocols,security,extended,isolation,life
 python3 scripts/qualify_identity.py --output target/qualification/identity-v2
 python3 scripts/qualify_pool_timeout.py --output target/qualification/pool-v2
 python3 scripts/qualify_revocation.py --output target/qualification/revocation-v2
+python3 scripts/qualify_reverse_tunnels.py --output target/qualification/reverse-v2
 ~~~
 
 Use new output paths. Results cover measured cases; they do not establish

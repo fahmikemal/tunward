@@ -55,8 +55,13 @@ secret alone does not establish a complete authorization policy.
 A fixed reverse tunnel (`-R tcp://`, `udp://`, or `unix://`) connects only to
 the target configured on the client and ignores any destination the server names
 for it. A reverse SOCKS5 or HTTP proxy takes each destination from the server
-side by design, so whoever controls the server can reach the client's network
-through it; expose one only to a server you trust that far.
+side by design, so without `?allow=` whoever controls the server can reach
+everything the client can, and the client warns about it at startup. Give each
+such tunnel an `?allow=` list of the address ranges and ports it should serve:
+the client checks every destination against it, dials only the allowed
+addresses of a domain, and treats an IPv4-mapped IPv6 address as the IPv4
+address it reaches. The list bounds where the server's peers go, not what they
+send there.
 
 `X-Forwarded-For` is caller-controlled. The server ignores it unless the
 connection's peer is a configured `--trusted-proxy`, and then takes the
