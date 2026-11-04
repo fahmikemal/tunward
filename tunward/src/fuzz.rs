@@ -14,6 +14,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hyper::Uri;
 use hyper::header::{HeaderMap, HeaderValue};
 use ipnet::IpNet;
+use serde_json::{Value, json};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::LazyLock;
 use tokio::runtime::{Builder, Runtime};
@@ -33,6 +34,32 @@ pub fn tunnel_envelope(data: &[u8]) {
         check_envelope(token);
     }
     check_envelope(&format!("v2.{}", URL_SAFE_NO_PAD.encode(data)));
+    if let Some(claims) = envelope_fields(data) {
+        check_envelope(&format!("v2.{}", URL_SAFE_NO_PAD.encode(claims.to_string())));
+    }
+}
+
+/// An envelope built field by field from the input. Byte mutations rarely leave JSON valid, so they
+/// hardly reach particular values of a field, and from here every value is one mutation away.
+fn envelope_fields(data: &[u8]) -> Option<Value> {
+    let (&[kind, options, port_low, port_high], rest) = data.split_first_chunk::<4>()?;
+    let (secs, rest) = rest.split_first_chunk::<8>()?;
+    let (nanos, host) = rest.split_first_chunk::<4>()?;
+    let timeout =
+        (options & 1 == 0).then(|| json!({"secs": u64::from_le_bytes(*secs), "nanos": u32::from_le_bytes(*nanos)}));
+    let credentials = (options & 2 == 0).then_some(("user", "secret"));
+    let protocol = match kind % 6 {
+        0 => json!({"Tcp": {"proxy_protocol": options & 4 == 0}}),
+        1 => json!({"Udp": {"timeout": timeout}}),
+        2 => json!("ReverseTcp"),
+        3 => json!({"ReverseUdp": {"timeout": timeout}}),
+        4 => json!({"ReverseSocks5": {"timeout": timeout, "credentials": credentials}}),
+        _ => json!({"ReverseHttpProxy": {"timeout": timeout, "credentials": credentials}}),
+    };
+    let host = String::from_utf8_lossy(host);
+    let port = u16::from_le_bytes([port_low, port_high]);
+    let listener_port = (options & 8 == 0).then_some(port);
+    Some(json!({"v": 2, "id": Uuid::from_u128(0), "p": protocol, "r": host, "rp": port, "lp": listener_port}))
 }
 
 fn check_envelope(token: &str) {
