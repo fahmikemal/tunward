@@ -1,4 +1,5 @@
 use crate::LocalProtocol;
+use crate::config::ClientAddressHeader;
 use crate::restrictions::types::{
     AllowConfig, AllowReverseTunnelConfig, AllowTunnelConfig, MatchConfig, RestrictionConfig, RestrictionsRules,
     ReverseTunnelProtocol, TunnelProtocol,
@@ -12,7 +13,7 @@ use derive_more::{Display, Error};
 use http_body_util::Either;
 use http_body_util::combinators::BoxBody;
 use hyper::body::Body;
-use hyper::header::{AUTHORIZATION, COOKIE, HeaderMap, HeaderName, HeaderValue, SEC_WEBSOCKET_PROTOCOL};
+use hyper::header::{AUTHORIZATION, COOKIE, HeaderMap, HeaderValue, SEC_WEBSOCKET_PROTOCOL};
 use hyper::{Request, Response, StatusCode, http};
 use ipnet::IpNet;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
@@ -75,15 +76,13 @@ pub(super) fn extract_authorization<B>(req: &Request<B>) -> Option<&str> {
     req.headers().get(AUTHORIZATION)?.to_str().ok()
 }
 
-const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
-
-/// Most hops read from one X-Forwarded-For list; a longer list is treated as malformed.
+/// Most hops read from one client address list; a longer list is treated as malformed.
 const MAX_FORWARDED_HOPS: usize = 32;
 
-/// What a request's X-Forwarded-For header establishes about its client.
+/// What a request's client address header establishes about its client.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ForwardedFor {
-    /// The request has no X-Forwarded-For header.
+    /// The request does not have the header.
     Absent,
     /// The connection's peer is not a trusted proxy, so the header proves nothing about the client.
     Untrusted,
@@ -96,11 +95,17 @@ pub(crate) enum ForwardedFor {
 /// Resolves the client of a request that the connection's `peer` relayed.
 ///
 /// Only a trusted proxy can vouch for the address before it, so the header counts only when `peer`
-/// is one. The list, joined across every X-Forwarded-For header in order, is then read from the
-/// right past each trusted proxy, and the first other address is the client. Entries to its left
-/// were written by the client itself and are never used.
-pub(crate) fn forwarded_client(peer: IpAddr, headers: &HeaderMap, trusted: &[IpNet]) -> ForwardedFor {
-    let mut values = headers.get_all(X_FORWARDED_FOR).iter().peekable();
+/// is one. The list, joined across every instance of `header` in order, is then read from the right
+/// past each trusted proxy, and the first other address is the client. Entries to its left were
+/// written by the client itself and are never used. The other client address header is never read,
+/// since a proxy that writes one of them leaves the other to the client.
+pub(crate) fn forwarded_client(
+    peer: IpAddr,
+    headers: &HeaderMap,
+    trusted: &[IpNet],
+    header: ClientAddressHeader,
+) -> ForwardedFor {
+    let mut values = headers.get_all(header.as_str()).iter().peekable();
     if values.peek().is_none() {
         return ForwardedFor::Absent;
     }
@@ -112,14 +117,24 @@ pub(crate) fn forwarded_client(peer: IpAddr, headers: &HeaderMap, trusted: &[IpN
         let Ok(value) = value.to_str() else {
             return ForwardedFor::Malformed;
         };
-        hops.extend(value.split(','));
+        match header {
+            ClientAddressHeader::XForwardedFor => {
+                hops.extend(value.split(',').take(MAX_FORWARDED_HOPS + 1).map(parse_forwarded_hop));
+            }
+            ClientAddressHeader::Forwarded => {
+                let Some(elements) = forwarded_elements(value) else {
+                    return ForwardedFor::Malformed;
+                };
+                hops.extend(elements);
+            }
+        }
     }
     if hops.len() > MAX_FORWARDED_HOPS {
         return ForwardedFor::Malformed;
     }
     let mut earliest = None;
-    for hop in hops.iter().rev() {
-        let Some(ip) = parse_forwarded_hop(hop) else {
+    for hop in hops.into_iter().rev() {
+        let Some(ip) = hop else {
             return ForwardedFor::Malformed;
         };
         if !cidr_contains(trusted, ip) {
@@ -131,8 +146,81 @@ pub(crate) fn forwarded_client(peer: IpAddr, headers: &HeaderMap, trusted: &[IpN
     earliest.map_or(ForwardedFor::Malformed, ForwardedFor::Client)
 }
 
-/// One X-Forwarded-For entry: an IP address, bare, bracketed (`[::1]`), or with the port some
-/// proxies append (`192.0.2.1:443`, `[2001:db8::1]:443`).
+/// The client address of each element of one `Forwarded` header (RFC 7239), or `None` if the header
+/// breaks the grammar. An element gives `None` unless its one `for` parameter is an address: `unknown`
+/// and obfuscated identifiers such as `_hidden` are valid but name no address.
+///
+/// This reads quoted strings instead of splitting on delimiters because a proxy may quote a `host`
+/// the client chose, and a comma in that must not start another element for the client to fill in.
+fn forwarded_elements(mut rest: &str) -> Option<Vec<Option<IpAddr>>> {
+    const OWS: [char; 2] = [' ', '\t'];
+    let mut elements = Vec::new();
+    // The current element: whether it has a parameter yet, and its `for` value.
+    let (mut has_parameter, mut node) = (false, None);
+    loop {
+        rest = rest.trim_start_matches(OWS);
+        if !rest.is_empty() && !rest.starts_with([';', ',']) {
+            let (name, value) = rest.split_once('=')?;
+            if name.is_empty() || !name.chars().all(is_token_char) {
+                return None;
+            }
+            let (value, after) = forwarded_value(value)?;
+            if name.eq_ignore_ascii_case("for") && node.replace(value).is_some() {
+                return None;
+            }
+            has_parameter = true;
+            rest = after.trim_start_matches(OWS);
+        }
+        match rest.as_bytes().first() {
+            Some(b';') => rest = &rest[1..],
+            Some(b',') | None => {
+                // An empty list element is ignored, as RFC 9110 section 5.6.1 asks.
+                if has_parameter {
+                    elements.push(node.take().and_then(|node: String| {
+                        // `:_port` is an obfuscated port, which says nothing about the address.
+                        parse_forwarded_hop(node.rsplit_once(":_").map_or(node.as_str(), |(address, _)| address))
+                    }));
+                }
+                has_parameter = false;
+                if rest.is_empty() {
+                    return Some(elements);
+                }
+                rest = &rest[1..];
+            }
+            Some(_) => return None,
+        }
+    }
+}
+
+/// The parameter value at the start of `input`, with the escapes of a quoted string removed, and what
+/// follows it. An unquoted value may also hold `:`, `[` and `]`: RFC 7239 asks to quote an address
+/// with those, not every proxy does, and they delimit nothing in this grammar.
+fn forwarded_value(input: &str) -> Option<(String, &str)> {
+    let Some(quoted) = input.strip_prefix('"') else {
+        let end = input
+            .find(|c| !is_token_char(c) && !matches!(c, ':' | '[' | ']'))
+            .unwrap_or(input.len());
+        return (end > 0).then(|| (input[..end].to_string(), &input[end..]));
+    };
+    let mut value = String::new();
+    let mut chars = quoted.char_indices();
+    while let Some((index, c)) = chars.next() {
+        match c {
+            '"' => return Some((value, &quoted[index + 1..])),
+            '\\' => value.push(chars.next()?.1),
+            c => value.push(c),
+        }
+    }
+    None
+}
+
+/// A `tchar` of RFC 9110 section 5.6.2.
+fn is_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c)
+}
+
+/// One X-Forwarded-For entry or `Forwarded` node: an IP address, bare, bracketed (`[::1]`), or with
+/// the port some proxies append (`192.0.2.1:443`, `[2001:db8::1]:443`).
 fn parse_forwarded_hop(hop: &str) -> Option<IpAddr> {
     let hop = hop.trim();
     let ip = hop
@@ -455,13 +543,21 @@ mod tests {
         config.into().grant(remote, None).is_some()
     }
 
-    fn forwarded(peer: &str, values: &[&str], trusted: &[&str]) -> ForwardedFor {
+    fn read_header(peer: &str, header: ClientAddressHeader, values: &[&str], trusted: &[&str]) -> ForwardedFor {
         let mut headers = HeaderMap::new();
         for value in values {
-            headers.append(X_FORWARDED_FOR, HeaderValue::from_str(value).unwrap());
+            headers.append(header.as_str(), HeaderValue::from_str(value).unwrap());
         }
         let trusted: Vec<IpNet> = trusted.iter().map(|net| net.parse().unwrap()).collect();
-        forwarded_client(peer.parse().unwrap(), &headers, &trusted)
+        forwarded_client(peer.parse().unwrap(), &headers, &trusted, header)
+    }
+
+    fn forwarded(peer: &str, values: &[&str], trusted: &[&str]) -> ForwardedFor {
+        read_header(peer, ClientAddressHeader::XForwardedFor, values, trusted)
+    }
+
+    fn rfc7239(values: &[&str]) -> ForwardedFor {
+        read_header("10.0.0.1", ClientAddressHeader::Forwarded, values, &["10.0.0.0/8"])
     }
 
     fn client(ip: &str) -> ForwardedFor {
@@ -547,6 +643,157 @@ mod tests {
             forwarded("10.0.0.1", &["unknown, 203.0.113.9"], &trusted),
             client("203.0.113.9")
         );
+    }
+
+    #[test]
+    fn the_forwarded_header_is_ignored_unless_the_peer_is_a_trusted_proxy() {
+        let header = ClientAddressHeader::Forwarded;
+        assert_eq!(read_header("10.0.0.1", header, &[], &["10.0.0.0/8"]), ForwardedFor::Absent);
+        assert_eq!(
+            read_header("198.51.100.7", header, &["for=203.0.113.9"], &["10.0.0.0/8"]),
+            ForwardedFor::Untrusted
+        );
+    }
+
+    #[test]
+    fn only_the_chosen_client_address_header_is_read() {
+        let trusted: Vec<IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
+        let peer = "10.0.0.1".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.9"));
+        headers.insert("forwarded", HeaderValue::from_static("for=198.51.100.7"));
+        assert_eq!(
+            forwarded_client(peer, &headers, &trusted, ClientAddressHeader::XForwardedFor),
+            client("203.0.113.9")
+        );
+        assert_eq!(
+            forwarded_client(peer, &headers, &trusted, ClientAddressHeader::Forwarded),
+            client("198.51.100.7")
+        );
+        headers.remove("forwarded");
+        assert_eq!(
+            forwarded_client(peer, &headers, &trusted, ClientAddressHeader::Forwarded),
+            ForwardedFor::Absent
+        );
+    }
+
+    #[test]
+    fn the_forwarded_client_is_the_rightmost_address_that_is_not_a_trusted_proxy() {
+        assert_eq!(rfc7239(&["for=203.0.113.9"]), client("203.0.113.9"));
+        // A spoofed element from the client, the real one from the proxy, then two trusted hops.
+        assert_eq!(
+            rfc7239(&["for=192.0.2.66, for=203.0.113.9;proto=https, for=10.0.0.2, for=10.0.0.3"]),
+            client("203.0.113.9")
+        );
+        assert_eq!(rfc7239(&["for=192.0.2.66", "for=203.0.113.9"]), client("203.0.113.9"));
+        assert_eq!(rfc7239(&["for=10.0.0.3, for=10.0.0.2"]), client("10.0.0.3"));
+        // A parameter other than `for` names nothing, and may come first.
+        assert_eq!(
+            rfc7239(&["proto=https;by=10.0.0.1;for=203.0.113.9;host=example.com"]),
+            client("203.0.113.9")
+        );
+    }
+
+    #[test]
+    fn forwarded_nodes_are_read_in_the_forms_of_rfc_7239() {
+        for (value, expected) in [
+            // The examples of RFC 7239 section 4, with its capitalized parameter name.
+            ("For=\"[2001:db8:cafe::17]:4711\"", "2001:db8:cafe::17"),
+            ("for=192.0.2.60;proto=http;by=203.0.113.43", "192.0.2.60"),
+            ("for=192.0.2.43, for=198.51.100.17", "198.51.100.17"),
+            // Each form of node, as HAProxy's `option forwarded` writes them.
+            ("for=\"[2001:db8::7]\"", "2001:db8::7"),
+            ("for=\"192.0.2.60:4711\"", "192.0.2.60"),
+            ("for=\"192.0.2.60:_hidden\"", "192.0.2.60"),
+            ("for=\"[2001:db8::7]:_hidden\"", "2001:db8::7"),
+            // Unquoted although the RFC asks for quotes.
+            ("for=[2001:db8::7]:4711", "2001:db8::7"),
+            ("for=192.0.2.60:4711", "192.0.2.60"),
+            // An escape, spaces around delimiters, and empty parameters and list elements.
+            ("for=\"\\[2001:db8::7\\]\"", "2001:db8::7"),
+            ("  proto=https ; for=192.0.2.60\t", "192.0.2.60"),
+            ("for=192.0.2.60;", "192.0.2.60"),
+            (",, for=192.0.2.60 ,", "192.0.2.60"),
+            // An IPv4-mapped address reads as IPv4.
+            ("for=\"[::ffff:192.0.2.60]\"", "192.0.2.60"),
+        ] {
+            assert_eq!(rfc7239(&[value]), client(expected), "{value}");
+        }
+    }
+
+    #[test]
+    fn a_quoted_host_cannot_add_a_forwarded_element() {
+        // The real client, then a Host header the client chose, quoted and escaped by its proxy.
+        for value in [
+            r#"for=203.0.113.9;host="x,for=192.0.2.66""#,
+            r#"for=203.0.113.9;host="x;for=192.0.2.66""#,
+            r#"for=203.0.113.9;host="x\",for=192.0.2.66;y=\"z""#,
+            r#"host="x\",for=192.0.2.66;y=\"z";for=203.0.113.9"#,
+        ] {
+            assert_eq!(rfc7239(&[value]), client("203.0.113.9"), "{value}");
+        }
+    }
+
+    #[test]
+    fn an_opened_quote_cannot_absorb_what_the_proxy_appended() {
+        // Each is what a proxy produces by appending its element to a client's Forwarded value.
+        for value in [
+            r#"for=192.0.2.66;x=", for=203.0.113.9"#,
+            r#"for=192.0.2.66;x=", for="[2001:db8::7]""#,
+            r#"for=192.0.2.66;x=", for="[2001:db8::7]";proto=https"#,
+        ] {
+            assert_eq!(rfc7239(&[value]), ForwardedFor::Malformed, "{value}");
+        }
+    }
+
+    #[test]
+    fn a_forwarded_element_without_an_address_establishes_no_client() {
+        for value in [
+            "for=unknown",
+            "for=_hidden",
+            "for=\"unknown:4711\"",
+            "proto=https",
+            "by=203.0.113.43",
+            "for=203.0.113.9, for=unknown",
+            "for=203.0.113.9, proto=https",
+            "for=",
+            "for=\"\"",
+            "for=not.an.address",
+        ] {
+            assert_eq!(rfc7239(&[value]), ForwardedFor::Malformed, "{value}");
+        }
+        // An element left of the client is not read.
+        assert_eq!(rfc7239(&["for=_hidden, for=203.0.113.9"]), client("203.0.113.9"));
+    }
+
+    #[test]
+    fn a_forwarded_header_that_breaks_the_grammar_or_is_oversized_is_not_used() {
+        for value in [
+            "",
+            " ",
+            ",",
+            ";",
+            "203.0.113.9",
+            "for",
+            "=203.0.113.9",
+            "for = 203.0.113.9",
+            "for=203.0.113.9 for=10.0.0.2",
+            "for=203.0.113.9;for=198.51.100.7",
+            "FOR=203.0.113.9;for=198.51.100.7",
+            "for=\"203.0.113.9",
+            "for=\"203.0.113.9\\",
+            "for=\"203.0.113.9\"x",
+            "for=203.0.113.9\"",
+            "f(r=203.0.113.9",
+        ] {
+            assert_eq!(rfc7239(&[value]), ForwardedFor::Malformed, "{value:?}");
+        }
+        // A malformed header fails the list even left of the client: its quotes cannot be trusted.
+        assert_eq!(rfc7239(&["for=\"192.0.2.66", "for=203.0.113.9"]), ForwardedFor::Malformed);
+        let long = vec!["for=10.0.0.2"; MAX_FORWARDED_HOPS + 1].join(",");
+        assert_eq!(rfc7239(&[long.as_str()]), ForwardedFor::Malformed);
+        let at_limit = vec!["for=10.0.0.2"; MAX_FORWARDED_HOPS].join(",");
+        assert_eq!(rfc7239(&[at_limit.as_str()]), client("10.0.0.2"));
     }
 
     fn net(value: &str) -> IpNet {

@@ -96,8 +96,8 @@ binary automatically.
 ### Fuzzing
 
 The targets in `fuzz/` feed arbitrary bytes to the parsers of what peers send:
-the routing envelope, `X-Forwarded-For`, HTTP proxy targets, SOCKS5 UDP datagrams
-and tunnel records, plus `allow=` lists. Release builds abort on a panic, so a
+the routing envelope, `X-Forwarded-For` and `Forwarded`, HTTP proxy targets,
+SOCKS5 UDP datagrams and tunnel records, plus `allow=` lists. Release builds abort on a panic, so a
 panic any of these can reach would end the whole process. The checks are in
 `tunward/src/fuzz.rs`, and they also assert what must hold beyond not crashing,
 such as a client being unable to change its recorded address.
