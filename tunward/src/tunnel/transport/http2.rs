@@ -1,7 +1,7 @@
 use super::io::{MAX_PACKET_LENGTH, TransportRead, TransportWrite};
 use crate::tunnel::RemoteAddr;
 use crate::tunnel::client::Client;
-use crate::tunnel::transport::jwt::tunnel_to_jwt_token;
+use crate::tunnel::transport::jwt::{TunnelRequest, tunnel_to_jwt_token};
 use crate::tunnel::transport::{TransportScheme, headers_from_file};
 use anyhow::{Context, anyhow};
 use bytes::{Bytes, BytesMut};
@@ -23,7 +23,6 @@ use tokio::sync::{Notify, mpsc};
 use tokio::task::AbortHandle;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
-use uuid::Uuid;
 
 pub struct Http2TransportRead {
     inner: BodyStream<Incoming>,
@@ -142,7 +141,7 @@ impl TransportWrite for Http2TransportWrite {
 }
 
 pub async fn connect(
-    request_id: Uuid,
+    request: TunnelRequest,
     client: &Client<impl crate::TokioExecutorRef>,
     dest_addr: &RemoteAddr,
 ) -> anyhow::Result<(Http2TransportRead, Http2TransportWrite, Parts)> {
@@ -183,7 +182,7 @@ pub async fn connect(
                 .unwrap_or_else(|| client.config.http_header_host.to_str().unwrap_or("")),
             client.config.http_upgrade_path_prefix
         ))
-        .header(COOKIE, tunnel_to_jwt_token(request_id, dest_addr))
+        .header(COOKIE, tunnel_to_jwt_token(request, dest_addr))
         .header(CONTENT_TYPE, "application/json")
         .version(hyper::Version::HTTP_2);
 

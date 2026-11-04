@@ -3,7 +3,7 @@ use crate::tunnel::RemoteAddr;
 use crate::tunnel::client::Client;
 use crate::tunnel::client::connection_pool::{L4ReadHalf, L4Stream, L4WriteHalf};
 use crate::tunnel::transport::headers_from_file;
-use crate::tunnel::transport::jwt::{JWT_HEADER_PREFIX, tunnel_to_jwt_token};
+use crate::tunnel::transport::jwt::{JWT_HEADER_PREFIX, TunnelRequest, tunnel_to_jwt_token};
 use anyhow::{Context, anyhow};
 use bytes::{Bytes, BytesMut};
 use either::Either;
@@ -29,7 +29,6 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_rustls::server::TlsStream;
 use tracing::trace;
-use uuid::Uuid;
 
 pub struct WebsocketTransportWrite {
     inner: WebSocketWrite<L4WriteHalf>,
@@ -252,7 +251,7 @@ impl TransportRead for WebsocketTransportRead {
 }
 
 pub async fn connect(
-    request_id: Uuid,
+    request: TunnelRequest,
     client: &Client<impl crate::TokioExecutorRef>,
     dest_addr: &RemoteAddr,
 ) -> anyhow::Result<(WebsocketTransportRead, WebsocketTransportWrite, Parts)> {
@@ -272,7 +271,7 @@ pub async fn connect(
         .header(SEC_WEBSOCKET_VERSION, "13")
         .header(
             SEC_WEBSOCKET_PROTOCOL,
-            format!("v2, {}{}", JWT_HEADER_PREFIX, tunnel_to_jwt_token(request_id, dest_addr)),
+            format!("v2, {}{}", JWT_HEADER_PREFIX, tunnel_to_jwt_token(request, dest_addr)),
         )
         .version(hyper::Version::HTTP_11);
 

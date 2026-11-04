@@ -28,6 +28,7 @@ pub(super) async fn http_server_upgrade(
     let revocation = restrict_path_prefix.revocation.clone();
     let EstablishedTunnel {
         remote_addr,
+        listener_port,
         local_rx,
         local_tx,
         need_cookie,
@@ -76,6 +77,11 @@ pub(super) async fn http_server_upgrade(
 
     if let Some(content_type) = req_content_type {
         response.headers_mut().insert(CONTENT_TYPE, content_type);
+    }
+    if let Some(port) = listener_port {
+        response
+            .headers_mut()
+            .insert(transport::ASSIGNED_PORT_HEADER, hyper::header::HeaderValue::from(port));
     }
 
     response.headers_mut().insert(

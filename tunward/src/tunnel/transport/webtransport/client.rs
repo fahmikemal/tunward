@@ -6,14 +6,13 @@ use super::{WebTransportRead, WebTransportWrite};
 use crate::tunnel::RemoteAddr;
 use crate::tunnel::client::{Client, ClientConfig};
 use crate::tunnel::transport::headers_from_file;
-use crate::tunnel::transport::jwt::tunnel_to_jwt_token;
+use crate::tunnel::transport::jwt::{TunnelRequest, tunnel_to_jwt_token};
 use anyhow::{Context, anyhow};
 use hyper::Response;
 use hyper::header::{AUTHORIZATION, COOKIE, HeaderValue};
 use hyper::http::response::Parts;
 use log::debug;
 use url::{Host, Url};
-use uuid::Uuid;
 use web_transport_quinn::proto::ConnectRequest;
 
 /// Build the session-level CONNECT request for a `wts://` server.
@@ -74,7 +73,7 @@ pub(crate) fn mk_connect_request(client_cfg: &ClientConfig) -> anyhow::Result<Co
 }
 
 pub async fn connect(
-    request_id: Uuid,
+    request: TunnelRequest,
     client: &Client<impl crate::TokioExecutorRef>,
     dest_addr: &RemoteAddr,
 ) -> anyhow::Result<(WebTransportRead, WebTransportWrite, Parts)> {
@@ -104,7 +103,7 @@ pub async fn connect(
     // The session-level CONNECT is shared by every tunnel on this session, so it cannot carry the
     // destination. Each stream announces its own with a JWT preamble instead, which the server
     // reads before it opens anything upstream.
-    let jwt = tunnel_to_jwt_token(request_id, dest_addr);
+    let jwt = tunnel_to_jwt_token(request, dest_addr);
     write_jwt_preamble(&mut send, &jwt)
         .await
         .with_context(|| format!("failed to send the tunnel jwt to {:?}", client_cfg.remote_addr))?;
@@ -122,10 +121,17 @@ pub async fn connect(
         }
     };
     let remote = crate::tunnel::transport::jwt_token_to_tunnel(&jwt)?;
+    let listener_port = remote.claims.lp;
     RemoteAddr::try_from(remote.claims)?;
     let mut response = Response::new(());
     if dest_addr.protocol.is_dynamic_reverse_tunnel() {
         response.headers_mut().insert(COOKIE, HeaderValue::from_str(&jwt)?);
+    }
+    // Present the listener port as the other transports do, in their response header.
+    if let Some(port) = listener_port {
+        response
+            .headers_mut()
+            .insert(super::super::ASSIGNED_PORT_HEADER, HeaderValue::from(port));
     }
     let response = response.into_parts().0;
 

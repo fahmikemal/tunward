@@ -7,7 +7,7 @@ use crate::tunnel::server::utils::{extract_path_prefix, matches_any_restriction}
 use crate::tunnel::server::{Server, TlsServerConfig};
 use crate::tunnel::tls_reloader::TlsReloader;
 use crate::tunnel::transport;
-use crate::tunnel::transport::tunnel_to_jwt_token;
+use crate::tunnel::transport::reply_to_jwt_token;
 use crate::tunnel::transport::webtransport::{
     WebTransportRead, WebTransportWrite, bind_udp_socket, mk_transport_config, read_jwt_preamble, write_jwt_preamble,
 };
@@ -22,7 +22,6 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio_rustls::rustls::pki_types::CertificateDer;
 use tracing::{Instrument, Level, Span, debug, error, info, span, warn};
-use uuid::Uuid;
 use web_transport_quinn::quinn;
 use web_transport_quinn::quinn::crypto::rustls::QuicServerConfig;
 
@@ -406,6 +405,7 @@ async fn wt_server_connect(
 
     let EstablishedTunnel {
         remote_addr,
+        listener_port,
         local_rx,
         local_tx,
         quota,
@@ -425,8 +425,8 @@ async fn wt_server_connect(
     };
 
     // A stream is ready only after destination validation and the upstream/visitor accept.
-    // The same acknowledgement carries dynamic reverse destinations.
-    let jwt = tunnel_to_jwt_token(Uuid::from_u128(0), &remote_addr);
+    // The same acknowledgement carries dynamic reverse destinations and the reverse listener's port.
+    let jwt = reply_to_jwt_token(&remote_addr, listener_port);
     write_jwt_preamble(&mut send, &jwt).await?;
     server.executor.spawn(
         async move {
