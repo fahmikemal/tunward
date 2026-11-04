@@ -212,9 +212,13 @@ timestamps. It verifies each archived binary against its downloaded artifact
 and emits archive checksums plus a manifest of binary hashes, source commit,
 and run ID. Repeating packaging with identical input bytes and packaging runtime
 is deterministic; this does not prove reproducibility of the Rust compilation.
-The active workflow no longer uses the legacy Go placeholder build/hooks, which
-omitted the Android ARMv7 archive. GitHub prereleases are marked explicitly and
-publication never replaces an existing release or automatically marks it latest.
+The workflow then attests those files, and `scripts/publish_release.py` publishes
+them with the attestation bundle as `tunward_<version>.intoto.jsonl`. It first
+checks that the bundle names exactly the packaged files and passes
+`gh attestation verify`, so a failure there publishes nothing. The bundle cannot
+list itself, so `checksums.txt` does not cover it; its signature does. GitHub
+prereleases are marked explicitly and publication never replaces an existing
+release or automatically marks it latest.
 Docker's [build record guidance](https://github.com/docker/build-push-action#summaries)
 describes the download-all failure.
 
@@ -235,8 +239,12 @@ builds, and Docker publication must have succeeded; only the final Release job
 may have failed. All binary artifacts must remain available and belong to that
 commit. Recovery refuses an existing GitHub release, including drafts, rather
 than silently replacing published assets. It packages the original tag source
-and binaries; it does not rebuild Rust, push an image, or change the tag. The
-`GITHUB_TOKEN` needs actions-read and contents-write only for that job.
+and binaries; it does not rebuild Rust, push an image, or change the tag. It
+attests and publishes as a release does, except that the provenance names
+`release-recovery.yaml` on `main`, the workflow that packaged the files, while
+`release-manifest.json` still names the tag commit and original run. The
+`GITHUB_TOKEN` needs actions-read, contents-write, id-token-write, and
+attestations-write only for that job.
 
 Use the actual failed run ID, not an unrelated successful run. Build artifacts
 currently expire after one day. Expired artifacts, failed prerequisites, or a

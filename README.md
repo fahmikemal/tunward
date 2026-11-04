@@ -226,9 +226,20 @@ GitHub release packaging downloads only `tunward-*` binary artifacts; Docker
 build records (`*.dockerbuild`) and native qualification evidence are excluded.
 The packaging check verifies all fourteen binaries and restores executable file
 modes before archiving, including Android ARMv7. Archives contain the original
-Rust binaries, LICENSE, and the tagged README; packaging needs no Go placeholder
-builds. `checksums.txt` and `release-manifest.json` record archive/binary hashes,
-the source commit, and build run ID. If only GitHub packaging failed after image publication,
+Rust binaries, LICENSE, and the tagged README. `checksums.txt` and
+`release-manifest.json` record archive/binary hashes, the source commit, and build
+run ID. `tunward_<version>.intoto.jsonl` is the signed SLSA build provenance of all
+of those files, the same Sigstore bundle GitHub keeps in its attestation store:
+
+~~~sh
+sha256sum --check --ignore-missing checksums.txt
+gh attestation verify tunward_<version>_linux_amd64.tar.gz --repo fahmikemal/tunward \
+  --bundle tunward_<version>.intoto.jsonl
+~~~
+
+Leave out `--bundle` to fetch the attestation from GitHub instead, the only copy for
+a release without that asset. Releases before `v0.1.0-beta.2` have no attestation.
+If only GitHub packaging failed after image publication,
 the guarded [prerelease recovery workflow](.github/workflows/release-recovery.yaml)
 can reuse that tag's successful build artifacts. See
 [recovery prerequisites and limits](CONTRIBUTING.md#recover-a-partial-prerelease).

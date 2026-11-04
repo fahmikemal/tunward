@@ -27,6 +27,9 @@ jobs:
     permissions:
       actions: read
       contents: write
+      # Sign build provenance attestations, as the Release workflow does.
+      id-token: write
+      attestations: write
     steps:
       - name: Checkout recovery controls
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -61,12 +64,25 @@ jobs:
           github-token: ${{ github.token }}
       - name: Verify downloaded set and restore executable permissions
         run: python3 control/scripts/check_release_artifacts.py --artifacts release-source/artifacts
-      - name: Package and publish the existing prerelease
+      - name: Package the existing prerelease
         env:
-          GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
         run: |
           python3 control/scripts/package_release.py --source release-source \
             --artifacts release-source/artifacts --output release-source/dist \
-            --tag "$RELEASE_TAG" --run-id "$SOURCE_RUN_ID" --publish
+            --tag "$RELEASE_TAG" --run-id "$SOURCE_RUN_ID"
+      # Before publication, as in the Release workflow.
+      - name: Attest build provenance of the release files
+        id: provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release-source/dist/*
+      - name: Publish the attested release files with their provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          PROVENANCE: ${{ steps.provenance.outputs.bundle-path }}
+        run: |
+          python3 control/scripts/publish_release.py --dist release-source/dist \
+            --tag "$RELEASE_TAG" --provenance "$PROVENANCE"
