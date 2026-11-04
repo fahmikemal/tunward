@@ -276,9 +276,9 @@ async fn create_client_tunnels(
     // Keep track of all spawned tunnels
     let mut tunnels: Vec<BoxFuture<()>> = Vec::with_capacity(remote_to_local.len() + local_to_remote.len());
     macro_rules! spawn_tunnel {
-        ( $($s:stmt);* ) => {
+        ( $($body:tt)* ) => {
             tunnels.push(Box::pin(async move {
-                $($s)*
+                $($body)*
             }));
         }
     }
