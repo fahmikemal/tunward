@@ -28,6 +28,7 @@ pub enum LocalProtocol {
     Socks5 {
         timeout: Option<Duration>,
         credentials: Option<(String, String)>,
+        proxy_protocol: bool,
     },
     TProxyTcp,
     TProxyUdp {
@@ -86,10 +87,15 @@ impl Debug for LocalProtocol {
             Self::Tcp { proxy_protocol } => f.debug_struct("Tcp").field("proxy_protocol", proxy_protocol).finish(),
             Self::Udp { timeout } => f.debug_struct("Udp").field("timeout", timeout).finish(),
             Self::Stdio { proxy_protocol } => f.debug_struct("Stdio").field("proxy_protocol", proxy_protocol).finish(),
-            Self::Socks5 { timeout, credentials } => f
+            Self::Socks5 {
+                timeout,
+                credentials,
+                proxy_protocol,
+            } => f
                 .debug_struct("Socks5")
                 .field("timeout", timeout)
                 .field("credentials", &redacted(credentials))
+                .field("proxy_protocol", proxy_protocol)
                 .finish(),
             Self::TProxyTcp => f.write_str("TProxyTcp"),
             Self::TProxyUdp { timeout } => f.debug_struct("TProxyUdp").field("timeout", timeout).finish(),
@@ -174,6 +180,7 @@ mod tests {
         let protocol = LocalProtocol::Socks5 {
             timeout: None,
             credentials: None,
+            proxy_protocol: false,
         };
 
         let rendered = format!("{protocol:?}");

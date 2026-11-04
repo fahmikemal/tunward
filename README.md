@@ -359,6 +359,7 @@ are argument examples to combine with your transport and TLS options.
 | `-L tcp://127.0.0.1:8088:127.0.0.1:3000` | Local TCP listener, destination reached from the server |
 | `-L udp://127.0.0.1:5353:127.0.0.1:53?timeout_sec=30` | Local UDP listener with inactivity timeout |
 | `-L socks5://127.0.0.1:1080` | Local SOCKS5 proxy; destinations remain subject to server restrictions |
+| `-L 'socks5://127.0.0.1:1080?proxy_protocol'` | The same, starting each TCP connection to a destination with a PROXY protocol v2 header |
 | `-L http://127.0.0.1:8082` | Local HTTP forward/CONNECT proxy |
 | `-L unix:///tmp/tunward.sock:127.0.0.1:3000` | Local Unix socket ingress |
 | `-L stdio://127.0.0.1:22` | Stdin/stdout ingress, useful in SSH ProxyCommand |

@@ -477,8 +477,13 @@ async fn create_client_tunnels(
                     }
                 }
             }
-            LocalProtocol::Socks5 { timeout, credentials } => {
-                let server = Socks5DownstreamListener::new(tunnel.local, *timeout, credentials.clone()).await?;
+            LocalProtocol::Socks5 {
+                timeout,
+                credentials,
+                proxy_protocol,
+            } => {
+                let server =
+                    Socks5DownstreamListener::new(tunnel.local, *timeout, credentials.clone(), *proxy_protocol).await?;
                 spawn_tunnel! {
                     if let Err(err) = client.run_tunnel(server).await {
                         error!("{:?}", err);
