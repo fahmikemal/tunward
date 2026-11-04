@@ -127,17 +127,9 @@ async fn handle_request(
     if !is_connect && req.uri().scheme_str() != Some("http") {
         return Ok(response(StatusCode::BAD_REQUEST));
     }
-    let Some(host) = req
-        .uri()
-        .host()
-        .and_then(|h| Host::parse(h.trim_matches(['[', ']'])).ok())
-    else {
+    let Some((host, port)) = destination(req.uri(), is_connect) else {
         return Ok(response(StatusCode::BAD_REQUEST));
     };
-    let port = req.uri().port_u16().unwrap_or(if is_connect { 443 } else { 80 });
-    if port == 0 {
-        return Ok(response(StatusCode::BAD_REQUEST));
-    }
     let authority = req
         .uri()
         .authority()
@@ -194,6 +186,14 @@ async fn handle_request(
     let mut result = sender.send_request(req).await?;
     strip_hop_headers(result.headers_mut());
     Ok(result.map(BodyExt::boxed))
+}
+
+/// The host and port a proxy request names, or `None` when it names no reachable destination.
+fn destination(uri: &Uri, is_connect: bool) -> Option<(Host, u16)> {
+    // `Uri::host` keeps the brackets of an IPv6 literal, which is the form `Host::parse` expects.
+    let host = Host::parse(uri.host()?).ok()?;
+    let port = uri.port_u16().unwrap_or(if is_connect { 443 } else { 80 });
+    (port != 0).then_some((host, port))
 }
 
 pub async fn run_server(
@@ -270,6 +270,33 @@ mod tests {
         assert!(!headers.contains_key("x-private"));
         assert_eq!(headers["content-length"], "100");
         assert_eq!(headers["authorization"], "Bearer origin");
+    }
+
+    #[test]
+    fn requests_name_ip_literals_and_domains() {
+        let named = |uri: &str, is_connect| destination(&uri.parse().unwrap(), is_connect);
+        assert_eq!(
+            named("127.0.0.1:22", true),
+            Some((Host::Ipv4(std::net::Ipv4Addr::LOCALHOST), 22))
+        );
+        assert_eq!(named("[::1]:22", true), Some((Host::Ipv6(std::net::Ipv6Addr::LOCALHOST), 22)));
+        let mapped = std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped();
+        assert_eq!(named("[::ffff:127.0.0.1]:22", true), Some((Host::Ipv6(mapped), 22)));
+        assert_eq!(
+            named("http://[2001:db8::1]/index.html", false),
+            Some((Host::Ipv6("2001:db8::1".parse().unwrap()), 80))
+        );
+        assert_eq!(
+            named("example.com", true),
+            Some((Host::Domain("example.com".to_string()), 443)),
+            "CONNECT defaults to 443"
+        );
+        assert_eq!(named("/index.html", false), None, "a request must name its destination");
+        assert_eq!(
+            named("http://example.com/", false),
+            Some((Host::Domain("example.com".to_string()), 80))
+        );
+        assert_eq!(named("127.0.0.1:0", true), None, "port 0 is no destination");
     }
 
     #[test]
