@@ -5,6 +5,7 @@
 
 use crate::protocols::http_proxy::destination;
 use crate::protocols::socks5::udp_server::reply_header;
+use crate::protocols::udp::idle_watchdog;
 use crate::tunnel::allowlist::DestinationAllowlist;
 use crate::tunnel::server::utils::{ForwardedFor, forwarded_client};
 use crate::tunnel::transport::io::decode_records;
@@ -46,6 +47,11 @@ fn check_envelope(token: &str) {
     let Ok(remote) = RemoteAddr::try_from(claims) else {
         return;
     };
+    // A UDP flow on a reverse tunnel arms a timer from the timeout its client chose.
+    if let LocalProtocol::ReverseUdp { timeout } | LocalProtocol::ReverseSocks5 { timeout, .. } = remote.protocol {
+        let _runtime = RUNTIME.enter();
+        drop(idle_watchdog(timeout));
+    }
     // `exec_tunnel` refuses every other protocol before a reply is built.
     if !matches!(remote.protocol, LocalProtocol::Tcp { .. } | LocalProtocol::Udp { .. })
         && !remote.protocol.is_reverse_tunnel()
