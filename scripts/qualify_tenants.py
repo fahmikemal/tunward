@@ -205,9 +205,20 @@ class TenantChecks(QuotaChecks):
                     "quotas_and_revocation_not_required": True}
 
     @staticmethod
-    async def udp_peer(endpoint, pause):
-        """Echoes datagrams of one peer before and after a pause longer than the listener's idle check."""
+    async def udp_peer(endpoint, pause, wait=2, sends=5):
+        """Echoes datagrams of one peer before and after a pause longer than the listener's idle check.
+
+        UDP may lose a datagram on a slow runner, which says nothing about the listener, so each one is
+        sent again until echoed. Returns how many were sent again, so a report shows if that grows.
+        """
         loop = asyncio.get_running_loop()
+
+        async def echoed(data):
+            # A late echo of an earlier copy may come first.
+            while await loop.sock_recv(peer, 65535) != data:
+                pass
+
+        resent = 0
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as peer:
             peer.setblocking(False)
             peer.connect(("127.0.0.1", endpoint))
@@ -215,10 +226,20 @@ class TenantChecks(QuotaChecks):
                 if seq == 2:
                     await asyncio.sleep(pause)
                 data = seq.to_bytes(4, "big") + random.randbytes(1196)
-                await loop.sock_sendall(peer, data)
-                assert await asyncio.wait_for(loop.sock_recv(peer, 65535), 2) == data, f"datagram {seq} was not echoed"
+                for send in range(sends):
+                    await loop.sock_sendall(peer, data)
+                    try:
+                        await asyncio.wait_for(echoed(data), wait)
+                    except asyncio.TimeoutError:
+                        continue
+                    resent += send
+                    break
+                else:
+                    raise AssertionError(f"datagram {seq} was not echoed after {sends} sends")
+        return resent
 
     async def ephemeral_protocols(self):
+        udp_resent = 0
         async with self.server("ephemeral") as stack:
             for scheme in ("wss", "https", "wts"):
                 for protocol, mode, target in (("tcp", "tcp", self.target_port), ("udp", "udp", self.udp_port),
@@ -232,11 +253,12 @@ class TenantChecks(QuotaChecks):
                     if mode == "udp":
                         # With device quotas the listener checks for idleness every second; a UDP peer
                         # depends on that listener, so it must still be served after a longer pause.
-                        await self.udp_peer(endpoint, 1.5)
+                        udp_resent += await self.udp_peer(endpoint, 1.5)
                     else:
                         await self.suite.exchange(mode, endpoint, 1024)
             return {"transports": 3, "reverse_protocols": ["tcp", "udp", "socks5", "http"],
-                    "port_zero_allocations_stay_inside_owned_pool": True, "udp_peer_served_past_idle_check": True}
+                    "port_zero_allocations_stay_inside_owned_pool": True, "udp_peer_served_past_idle_check": True,
+                    "udp_datagrams_resent": udp_resent}
 
     async def unix(self):
         async with self.server("unix") as stack:

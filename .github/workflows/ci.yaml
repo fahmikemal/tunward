@@ -105,6 +105,9 @@ jobs:
           python3 -m unittest discover -s scripts -p test_check_toolchain_pins.py
           python3 -m unittest discover -s scripts -p test_check_prettyplease_syn.py
 
+      - name: Test the tenant qualification helpers
+        run: python3 -m unittest discover -s scripts -p test_qualify_tenants.py
+
       - name: Verify issue templates pass the auto-close workflow
         run: python3 -m unittest discover -s scripts -p test_issue_templates.py
 
