@@ -355,16 +355,15 @@ jobs:
       # Before publication, so a failed attestation leaves nothing published without provenance.
       # Verify a download with: gh attestation verify <archive> --repo fahmikemal/tunward
       - name: Attest build provenance of the release files
+        id: provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/*
 
-      # The same files and options as package_release.py --publish.
-      - name: Publish the attested release files
+      - name: Publish the attested release files with their provenance
         run: |
-          options=(--verify-tag --latest=false --title "$RELEASE_TAG" --generate-notes)
-          if [[ "$RELEASE_TAG" == *-* ]]; then options+=(--prerelease); fi
-          gh release create "$RELEASE_TAG" dist/* --repo "$GITHUB_REPOSITORY" "${options[@]}"
+          python3 scripts/publish_release.py --dist dist --tag "$RELEASE_TAG" --provenance "$PROVENANCE"
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
+          PROVENANCE: ${{ steps.provenance.outputs.bundle-path }}

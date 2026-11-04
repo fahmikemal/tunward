@@ -101,6 +101,7 @@ jobs:
         run: |
           python3 -m unittest discover -s scripts -p 'test_check_release*.py'
           python3 -m unittest discover -s scripts -p test_package_release.py
+          python3 -m unittest discover -s scripts -p test_publish_release.py
           python3 -m unittest discover -s scripts -p test_check_toolchain_pins.py
           python3 -m unittest discover -s scripts -p test_check_prettyplease_syn.py
 

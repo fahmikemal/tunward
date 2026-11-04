@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Archive the original Rust binaries without a second compiler or placeholder builds."""
+"""Archive the original Rust binaries and record what they are."""
 import argparse
 import gzip
 import hashlib
 import json
-import os
 from pathlib import Path
 import re
 import subprocess
@@ -69,7 +68,6 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--tag", required=True)
     parser.add_argument("--run-id", required=True)
-    parser.add_argument("--publish", action="store_true")
     args = parser.parse_args()
     try:
         validate_tag(f"refs/tags/{args.tag}", args.source)
@@ -78,15 +76,8 @@ def main():
         if tagged != commit:
             raise ValueError("source checkout must match the existing tag commit")
         epoch = int(subprocess.check_output(["git", "-C", str(args.source), "show", "-s", "--format=%ct", "HEAD"], text=True))
-        files = package(args.source, args.artifacts, args.output, args.tag, commit, epoch, args.run_id)
+        package(args.source, args.artifacts, args.output, args.tag, commit, epoch, args.run_id)
         print(f"verified fourteen original binaries in archives; source commit {commit}", flush=True)
-        if args.publish:
-            command = ["gh", "release", "create", args.tag, *map(str, files), "--repo", os.environ["GITHUB_REPOSITORY"],
-                       "--verify-tag", "--latest=false",
-                       "--title", args.tag, "--generate-notes"]
-            if "-" in args.tag:
-                command.append("--prerelease")
-            subprocess.run(command, check=True)
     except (ValueError, OSError, KeyError, subprocess.CalledProcessError) as exc:
         parser.exit(1, f"release packaging failed: {exc}\n")
 
