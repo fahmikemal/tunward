@@ -7,6 +7,7 @@ pub use server::WsUdpStream;
 pub use server::configure_tproxy;
 pub use server::connect;
 pub use server::connect_to_addresses;
+pub use server::idle_watchdog;
 #[cfg(target_os = "linux")]
 pub use server::mk_send_socket_tproxy;
 pub use server::run_server;
