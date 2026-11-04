@@ -439,7 +439,7 @@ budget and call the old event fixed without comparing traces and direct controls
 
 ~~~sh
 python3 -m venv target/qualification/dns-tools
-target/qualification/dns-tools/bin/python -m pip install -r scripts/requirements-qualification.txt
+target/qualification/dns-tools/bin/python -m pip install --require-hashes -r scripts/requirements-qualification.txt
 target/qualification/dns-tools/bin/python scripts/qualify_dns.py --output target/qualification/dns-review
 python3 scripts/qualify_runtime.py --output target/qualification/runtime-review
 python3 scripts/qualify_device_scale.py --devices 200 --output target/qualification/device-scale-review
