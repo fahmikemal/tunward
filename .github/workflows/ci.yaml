@@ -250,7 +250,7 @@ jobs:
         timeout-minutes: 5
         run: python3 scripts/qualify_pki.py --output "$QUALIFICATION_ROOT/pki"
       - name: Install controlled DNS test dependencies
-        run: python3 -m pip install -r scripts/requirements-qualification.txt
+        run: python3 -m pip install --require-hashes -r scripts/requirements-qualification.txt
       - name: Qualify DNS and ECH edge cases
         timeout-minutes: 5
         run: python3 scripts/qualify_dns.py --output "$QUALIFICATION_ROOT/dns"

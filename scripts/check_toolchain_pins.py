@@ -9,6 +9,7 @@ import tomllib
 ROOT = Path(__file__).resolve().parents[1]
 SOURCES = {
     ".github/workflows/ci.yaml": r'^\s*RUST_VERSION:\s*"?([0-9][0-9.]*)"?\s*$',
+    ".github/workflows/codeql.yaml": r'^\s*RUST_VERSION:\s*"?([0-9][0-9.]*)"?\s*$',
     ".github/workflows/release.yaml": r'^\s*RUST_VERSION:\s*"?([0-9][0-9.]*)"?\s*$',
     ".github/workflows/runtime-qualification.yaml": r'^\s*RUST_VERSION:\s*"?([0-9][0-9.]*)"?\s*$',
     "Dockerfile": r"^FROM rust:([0-9][0-9.]*)-",
