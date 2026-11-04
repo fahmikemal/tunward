@@ -5,6 +5,9 @@ on:
 concurrency:
   group: auto-close-${{ github.event.issue.number }}
 
+permissions:
+  contents: read
+
 jobs:
   auto_close_issues:
     runs-on: ubuntu-24.04
