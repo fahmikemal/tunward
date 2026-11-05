@@ -1,0 +1,63 @@
+# Built only by `cargo fuzz`, so it is its own workspace with its own lock file. `ring` avoids the
+# C build of aws-lc, and no target needs the SQLite of fleet-inventory.
+[package]
+name = "tunward-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+tunward = { path = "../tunward", default-features = false, features = ["ring"] }
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+panic = "abort"
+
+[[bin]]
+name = "tunnel_envelope"
+path = "fuzz_targets/tunnel_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "forwarded_for"
+path = "fuzz_targets/forwarded_for.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_proxy_target"
+path = "fuzz_targets/http_proxy_target.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "socks5_udp_datagram"
+path = "fuzz_targets/socks5_udp_datagram.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tunnel_records"
+path = "fuzz_targets/tunnel_records.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "allow_list"
+path = "fuzz_targets/allow_list.rs"
+test = false
+doc = false
+bench = false

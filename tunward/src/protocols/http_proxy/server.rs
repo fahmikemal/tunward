@@ -189,7 +189,7 @@ async fn handle_request(
 }
 
 /// The host and port a proxy request names, or `None` when it names no reachable destination.
-fn destination(uri: &Uri, is_connect: bool) -> Option<(Host, u16)> {
+pub(crate) fn destination(uri: &Uri, is_connect: bool) -> Option<(Host, u16)> {
     // `Uri::host` keeps the brackets of an IPv6 literal, which is the form `Host::parse` expects.
     let host = Host::parse(uri.host()?).ok()?;
     let port = uri.port_u16().unwrap_or(if is_connect { 443 } else { 80 });

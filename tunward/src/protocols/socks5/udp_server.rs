@@ -108,6 +108,15 @@ pub struct Socks5UdpStreamWriter {
     udp_header: Vec<u8>,
 }
 
+/// The header of datagrams returned to a peer. A domain that `parse_udp_request` accepted came with
+/// a one-byte length and is valid UTF-8, so it always fits back into a header.
+pub(crate) fn reply_header(destination: &TargetAddr) -> Vec<u8> {
+    match destination {
+        TargetAddr::Ip(ip) => new_udp_header(*ip).unwrap(),
+        TargetAddr::Domain(h, p) => new_udp_header((h.as_str(), *p)).unwrap(),
+    }
+}
+
 #[pin_project(PinnedDrop)]
 pub struct Socks5UdpStream {
     #[pin]
@@ -146,10 +155,7 @@ impl Socks5UdpStream {
             active: AtomicBool::new(true),
             reader_waker: AtomicWaker::new(),
         });
-        let udp_header = match &destination {
-            TargetAddr::Ip(ip) => new_udp_header(*ip).unwrap(),
-            TargetAddr::Domain(h, p) => new_udp_header((h.as_str(), *p)).unwrap(),
-        };
+        let udp_header = reply_header(&destination);
         let s = Self {
             recv_data: rx,
             send_socket,
