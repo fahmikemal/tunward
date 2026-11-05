@@ -52,7 +52,10 @@ The primary key is the exact case-sensitive CN extracted from a verified client
 certificate. Caller labels, request paths, forwarded headers, and IP addresses
 cannot create verified identities. Client CNs must be unique within the server's
 trusted-issuer scope; identical CNs from different trusted issuers share one
-inventory row, as they do for quotas and CN revocation.
+inventory row, as they do for quotas and CN revocation. With
+`--tls-client-identity-field san-uri` or `san-dns`, "CN" in this guide means
+the single SAN URI or SAN DNS name that option selects instead; see the
+[mTLS guide](using_mtls.md).
 
 | Field | Meaning |
 | --- | --- |
@@ -79,9 +82,12 @@ observations, not continuous heartbeat/last-packet measurements or an audit log
 of successful business operations.
 
 Existing identities can reconnect at capacity. A new identity is denied when
-the configured maximum stored rows is reached. No automatic eviction deletes
-offline devices. Raising the limit requires restart. Lowering it below the
-stored row count still permits existing identities but prevents new rows.
+the configured maximum stored rows is reached: its connection is refused and the
+server logs `inventory device capacity reached`. That refusal is a policy
+outcome, not a storage failure, so it leaves `inventory_healthy` and `/healthz`
+unchanged. No automatic eviction deletes offline devices. Raising the limit
+requires restart. Lowering it below the stored row count still permits existing
+identities but prevents new rows.
 
 ## Live records and counts
 
@@ -155,19 +161,34 @@ without replacing their contents. One process owns a database through a sibling
 `.lock` file. Do not remove/replace that lock while a server is running. Each
 replica needs its own inventory and an external aggregation/distribution design.
 
-SQLite runs on a dedicated thread with a 256-command queue. Network tasks await
-acknowledgements without doing database I/O on the forwarding executor. Queue
-overload rejects a request; callers have a five-second response deadline.
-SQLite's lock wait is one second. Cancelling/timing out a caller does not recall
-an observation already queued or being committed.
+SQLite runs on a dedicated thread with a 256-request queue. Network tasks await
+acknowledgements without doing database I/O on the forwarding executor. The
+worker commits the observations waiting in its queue together, up to 256 in one
+transaction, so a burst of connections costs one disk sync per batch rather than
+one per connection. A caller that finds the queue full waits for room. Each
+caller has five seconds from the moment it asks, for room in the queue and the
+answer together. SQLite's lock wait is one second. Cancelling/timing out a
+caller does not recall an observation already queued or being committed.
 
-WAL mode and `synchronous=FULL` are required. New connection admission with
-inventory enabled waits for its observation commit; a write failure prevents
-that connection from opening targets. Existing forwarding continues. Reads do
-not clear a previous write failure. `/healthz` exposes `inventory_enabled` and
-`inventory_healthy`, returning 503 when the worker reports failure. A successful
-later observation restores that status; it is an observed worker-health signal,
-not a continuous disk-capacity probe. Investigate admission/reload logs as well.
+WAL mode and `synchronous=FULL` are required, and an observation is acknowledged
+only once its batch is durably committed. New connection admission with
+inventory enabled waits for that commit. A storage error (a full disk, an I/O
+error, a lock held past the wait) fails every observation in its batch, and none
+of those connections opens targets. A new identity refused at capacity is
+refused alone; the rest of its batch is still recorded. Existing forwarding
+continues. Reads do not clear a previous write failure. `/healthz` exposes
+`inventory_enabled` and `inventory_healthy`, returning 503 when the worker
+reports a storage failure. A later committed observation restores that status;
+it is an observed worker-health signal, not a continuous disk-capacity probe.
+Investigate admission/reload logs as well.
+
+Measured on one Linux host, 1000 mTLS connections opened at once against a
+release build were all admitted. That held on a local NVMe disk and with every
+`fsync` slowed to 10 ms or 50 ms, standing in for a network volume. Before
+batching, the same test admitted 740, 299 and 96 of them. The other connections
+failed with `inventory worker unavailable or queue full`. Some on the slowest
+disk failed with `inventory response deadline exceeded`. Measure your own
+storage before relying on a given reconnect rate.
 
 Keep the directory writable only by trusted operators/the service account.
 New files use owner-only permissions on Unix; existing database/lock files with
@@ -193,10 +214,13 @@ python3 scripts/qualify_fleet.py --output target/qualification/fleet-review
 
 The Linux loopback suite checks transport/label parity, separate verified devices,
 pending/reverse records, cancellation cleanup, abrupt process restart, stable-CN
-key rotation, pagination/capacity, database lock failure/recovery, cleartext
-labels, single ownership, and preservation of a foreign database. Unit tests
-cover concurrent parameterized writes, capacity/pagination, schema rejection,
-and cloned lease lifetimes. These checks do not qualify physical MDM inventory,
+key rotation, pagination/capacity with health unchanged at capacity, 512
+simultaneous connections from 16 devices all admitted and counted once, database
+lock failure/recovery, cleartext labels, single ownership, and preservation of a
+foreign database. Unit tests cover concurrent parameterized writes, batches in
+which one observation is refused and the rest land, a burst four times the queue,
+a storage failure that fails a whole batch and recovers, capacity/pagination,
+schema rejection, and cloned lease lifetimes. These checks do not qualify physical MDM inventory,
 cluster consistency, every filesystem/OS, or production endurance.
 
 ## Architectural decoupling and future control plane

@@ -174,6 +174,8 @@ class FleetChecks(QuotaChecks):
             endpoint, _ = await self.client(stack, "wts", "c")
             await self.denied(stack, endpoint)
             assert self.accepted == before
+            status, health = await self.response(stack, "/healthz")
+            assert status == 200 and health["inventory_healthy"] is True, "a full inventory is not a storage failure"
             first = await self.api(stack, "/api/v1/devices?limit=1")
             second = await self.api(stack, f'/api/v1/devices?limit=1&after={first["next_cursor"]}')
             assert [d["id"] for d in first["devices"] + second["devices"]] == ["device-a", "device-b"]
@@ -184,7 +186,44 @@ class FleetChecks(QuotaChecks):
             assert (await self.response(stack, "/api/v1/devices", "POST"))[0] == 404
             await self.held(stack, endpoints[0])
             return {"bounded_pagination": True, "new_identity_rejected_at_capacity": True,
-                    "known_identity_still_allowed": True, "api_read_only": True}
+                    "known_identity_still_allowed": True, "api_read_only": True, "full_inventory_stays_healthy": True}
+
+    async def admission_burst(self):
+        # A reconnect storm: every verified connection waits for its observation to commit before it is
+        # admitted, and more of them arrive at once than the inventory queue holds (256). Each device
+        # stays within the default mTLS quota of 32 sessions, so only the inventory could refuse them.
+        devices, sessions = 16, 32
+        names = [f"burst-{index:02d}" for index in range(devices)]
+        for serial, name in enumerate(names, 2000):
+            await command("openssl", "req", "-new", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
+                          "-subj", f"/CN={name}", "-keyout", self.certs / f"{name}.key", "-out", self.certs / f"{name}.csr")
+            await command("openssl", "x509", "-req", "-in", self.certs / f"{name}.csr", "-CA", self.certs / "ca.pem",
+                          "-CAkey", self.certs / "ca.key", "-set_serial", str(serial), "-days", "4",
+                          "-extfile", self.certs / "client.ext", "-out", self.certs / f"{name}.pem")
+            (self.certs / f"{name}.key").chmod(0o600)
+        async with self.server("admission-burst") as stack:
+            async def connect(name):
+                context = ssl.create_default_context(cafile=self.certs / "ca.pem")
+                context.load_cert_chain(self.certs / f"{name}.pem", self.certs / f"{name}.key")
+                _, writer = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", stack["port"], ssl=context), 20)
+                stack["writers"].append(writer)
+            await asyncio.gather(*(connect(name) for name in names for _ in range(sessions)))
+            for _ in range(300):
+                records = await self.api(stack, "/api/v1/connections")
+                if len(records) == devices * sessions:
+                    break
+                await asyncio.sleep(0.05)
+            assert len(records) == devices * sessions, f"{len(records)} of {devices * sessions} connections admitted"
+            stored = (await self.api(stack, f"/api/v1/devices?limit={devices}"))["devices"]
+            assert [d["id"] for d in stored] == names, stored
+            assert all(d["observed_connections"] == d["active_connections"] == sessions for d in stored), stored
+            status, health = await self.response(stack, "/healthz")
+            assert status == 200 and health["inventory_healthy"] is True, health
+            await asyncio.gather(*(close(writer) for writer in stack["writers"]))
+            stack["writers"].clear()
+            await self.settled(stack)
+            return {"devices": devices, "simultaneous_connections": devices * sessions, "all_admitted": True,
+                    "each_observed_once": True}
 
     async def database_failure(self):
         async with self.server("database-failure") as stack:
@@ -251,6 +290,7 @@ class FleetChecks(QuotaChecks):
             for name, case in [("transport-parity-and-cleanup", self.parity), ("failed-setup", self.failed_setup),
                 *[(f"reverse-{s}", lambda s=s: self.reverse(s)) for s in ("wss", "https", "wts")],
                 ("restart-and-key-rotation", self.persistence), ("capacity-and-pagination", self.pagination_capacity),
+                ("admission-burst", self.admission_burst),
                 ("database-write-failure", self.database_failure), ("unverified-labels", self.unverified),
                 ("startup-and-ownership", self.startup)]:
                 await self.suite.check(f"fleet-inventory/{name}", case, 60)

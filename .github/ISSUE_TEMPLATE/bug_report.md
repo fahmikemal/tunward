@@ -35,8 +35,10 @@ Replace credentials, secret path prefixes, and device/customer identifiers.
 
 - Server verification enabled:
 - Server certificate SAN matches the connection domain/IP:
-- mTLS enabled; sanitized client CN/path relationship:
+- mTLS enabled; identity field (`cn`, `san-uri`, `san-dns`); sanitized client identity/path relationship:
 - Relevant restriction rules, without secrets:
+- Device quotas (default under mTLS, custom, or `--no-device-quotas`), tenant
+  policy, revocation, fleet inventory:
 - For WebTransport, UDP port published/reachable:
 
 Do not attach CA, server, or device private keys.

@@ -87,14 +87,29 @@ pub(super) type ReverseConnection<T> = (
 /// When an idle check closes a reverse listener.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClosePolicy {
-    /// At the first check no request waits on it: an ephemeral listener, or one that holds quota.
+    /// At the first check no request waits on it: a single-use ephemeral listener.
     FirstIdleCheck,
-    /// At a check no request waits on it and none arrived since the previous one: a fixed port.
+    /// At a check no request waits on it and none arrived since the previous one: a fixed port
+    /// checked every idle timeout.
     NoNewRequest,
-    /// Once a whole interval passed with no request waiting and none arriving. Its tunnel asks again
-    /// as soon as a request is served, so a check that falls between two requests must not close it
-    /// and give the tunnel another port.
-    Allocated,
+    /// Once a whole interval passed with no request waiting and none arriving. A tunnel asks again as
+    /// soon as a request is served, a round trip later, so a check that falls between two requests
+    /// must not close its listener: an allocated one would give the tunnel another port, and any
+    /// other would refuse connections until the next request opened it again. This applies to
+    /// allocated listeners and to those that hold quota, which are checked every second.
+    WholeIdleInterval,
+}
+
+impl ClosePolicy {
+    fn of(is_ephemeral: bool, allocated: bool, holds_quota: bool) -> Self {
+        if is_ephemeral {
+            Self::FirstIdleCheck
+        } else if allocated || holds_quota {
+            Self::WholeIdleInterval
+        } else {
+            Self::NoNewRequest
+        }
+    }
 }
 
 struct IdleCheck {
@@ -112,7 +127,7 @@ impl IdleCheck {
     /// it, and `serves_peers` whether connections it handed out still depend on it.
     fn unused(&mut self, waiting: bool, serves_peers: impl FnOnce() -> bool, seen_clients: &AtomicUsize) -> bool {
         match self.policy {
-            ClosePolicy::Allocated => {
+            ClosePolicy::WholeIdleInterval => {
                 let arrived = seen_clients.swap(0, Ordering::Relaxed) != 0;
                 let gone = !waiting && !self.waited && !arrived;
                 self.waited = waiting;
@@ -199,13 +214,7 @@ impl<T: DownstreamListener> ReverseTunnelServer<T> {
                     idle_timeout
                 };
                 let mut timer = time::interval(check_interval);
-                let mut idle_check = IdleCheck::new(if allocated {
-                    ClosePolicy::Allocated
-                } else if retained_quota.is_some() || is_ephemeral {
-                    ClosePolicy::FirstIdleCheck
-                } else {
-                    ClosePolicy::NoNewRequest
-                });
+                let mut idle_check = IdleCheck::new(ClosePolicy::of(is_ephemeral, allocated, retained_quota.is_some()));
                 let mut accept_backoff = AcceptBackoff::new("Error while listening for incoming connections");
                 pin_mut!(listening_server);
                 loop {
@@ -279,6 +288,7 @@ impl<T: DownstreamListener> ReverseTunnelServer<T> {
 mod tests {
     use super::*;
     use crate::executor::DefaultTokioExecutor;
+    use crate::quotas::QuotaManager;
     use crate::tunnel::downstream_listeners::{TcpDownstreamListener, UdpDownstreamListener};
     use std::net::Ipv4Addr;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -367,6 +377,17 @@ mod tests {
     }
 
     #[test]
+    fn only_single_use_listeners_close_at_the_first_idle_check() {
+        // (ephemeral, allocated, holds quota)
+        assert_eq!(ClosePolicy::of(true, false, false), ClosePolicy::FirstIdleCheck);
+        assert_eq!(ClosePolicy::of(true, false, true), ClosePolicy::FirstIdleCheck);
+        assert_eq!(ClosePolicy::of(false, true, false), ClosePolicy::WholeIdleInterval);
+        assert_eq!(ClosePolicy::of(false, true, true), ClosePolicy::WholeIdleInterval);
+        assert_eq!(ClosePolicy::of(false, false, true), ClosePolicy::WholeIdleInterval);
+        assert_eq!(ClosePolicy::of(false, false, false), ClosePolicy::NoNewRequest);
+    }
+
+    #[test]
     fn an_allocated_listener_survives_a_check_between_two_requests_of_its_tunnel() {
         let seen = AtomicUsize::new(0);
         let idle = || false;
@@ -386,7 +407,7 @@ mod tests {
         assert!(!fixed.unused(false, idle, &seen));
         assert!(fixed.unused(false, idle, &seen));
 
-        let mut allocated = IdleCheck::new(ClosePolicy::Allocated);
+        let mut allocated = IdleCheck::new(ClosePolicy::WholeIdleInterval);
         // The first check comes right away, possibly before the opening request waits.
         assert!(!allocated.unused(false, idle, &seen));
         assert!(!allocated.unused(true, idle, &seen));
@@ -421,6 +442,20 @@ mod tests {
         allocations: &Arc<AtomicUsize>,
         interval: Duration,
     ) -> TcpRequest {
+        let any_port = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        tcp_request_with(servers, key, any_port, allocations, interval, None)
+    }
+
+    /// One reverse request on `key` whose listener binds `bind` and holds `quota`, if any, checked
+    /// every `interval` (every second at most when it holds quota).
+    fn tcp_request_with(
+        servers: &Arc<ReverseTunnelServer<TcpDownstreamListener>>,
+        key: ReverseListenerKey,
+        bind: SocketAddr,
+        allocations: &Arc<AtomicUsize>,
+        interval: Duration,
+        quota: Option<TunnelPermit>,
+    ) -> TcpRequest {
         let servers = servers.clone();
         let allocations = allocations.clone();
         tokio::spawn(async move {
@@ -432,13 +467,12 @@ mod tests {
                     async move {
                         allocations.fetch_add(1, Ordering::Relaxed);
                         let destination = (Host::Ipv4(Ipv4Addr::LOCALHOST), 9);
-                        let listener =
-                            TcpDownstreamListener::new((Ipv4Addr::LOCALHOST, 0).into(), destination, false).await?;
+                        let listener = TcpDownstreamListener::new(bind, destination, false).await?;
                         let bound = listener.bound_addr();
                         Ok((listener, bound))
                     },
                     None,
-                    (None, RevocationGuard::default()),
+                    (quota, RevocationGuard::default()),
                     |_| false,
                 )
                 .await
@@ -561,6 +595,69 @@ mod tests {
             1,
             "a check between two requests of the tunnel closed its listener"
         );
+    }
+
+    #[tokio::test]
+    async fn a_fixed_listener_holding_quota_stays_open_when_a_check_falls_between_two_requests() {
+        // Under mTLS the default quotas apply, and a listener holding a tunnel permit is checked every
+        // second. A check that fell between a served request and the next one used to close it, and
+        // visitors arriving before the next request reopened it were refused. Across a WAN that gap
+        // lasts a round trip, so this hit a fixed-port reverse tunnel about once every 1 s / RTT visitors.
+        let interval = Duration::from_millis(400);
+        let quotas = QuotaManager::new(crate::yaml::from_slice(b"version: 1\ndefault: {max_tunnels: 8}").unwrap());
+        let session = quotas.open_session("device-a").unwrap();
+        let servers = Arc::new(ReverseTunnelServer::new());
+        let allocations = Arc::new(AtomicUsize::new(0));
+        let owner = ListenerOwner {
+            instance: uuid::Uuid::now_v7(),
+            tenant: None,
+            device: Some(Arc::from("device-a")),
+        };
+        let fixed = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let key = owner.socket_key(fixed, None);
+        assert!(matches!(key, ReverseListenerKey::Socket(_, bind) if bind == fixed));
+        let request = |key: &ReverseListenerKey| {
+            let permit = session.open_tunnel().unwrap();
+            tcp_request_with(&servers, key.clone(), fixed, &allocations, interval, Some(permit))
+        };
+
+        let first = request(&key);
+        let listener = bound(&servers, &key).await;
+        assert_eq!(listener, fixed);
+        let opened = time::Instant::now();
+        let _one = visit(listener, b"one").await;
+        served(first, listener, b"one").await;
+
+        let second = request(&key);
+        let checks_passed = (opened.elapsed().as_millis() / interval.as_millis()) as u32 + 1;
+        let check = opened + interval * checks_passed;
+        time::sleep_until(check + interval / 4).await;
+        let _two = visit(listener, b"two").await;
+        served(second, listener, b"two").await;
+
+        // No request waits through the next check; the tunnel asks again half an interval after it.
+        time::sleep_until(check + interval * 3 / 2).await;
+        let third = request(&key);
+        let _three = visit(listener, b"three").await;
+        served(third, listener, b"three").await;
+        assert_eq!(
+            allocations.load(Ordering::Relaxed),
+            1,
+            "a check between two requests closed the listener"
+        );
+
+        // Once the tunnel stops asking, the listener still closes and gives its permit back.
+        time::timeout(Duration::from_secs(3), async {
+            while servers.servers.lock().contains_key(&key) {
+                time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the listener stayed open after its tunnel stopped asking");
+        assert!(std::net::TcpListener::bind(listener).is_ok());
     }
 
     #[test]

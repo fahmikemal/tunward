@@ -75,6 +75,9 @@ tenant/role headers, forwarded IP/certificate headers, or SQLite observations.
 CNs must be unique across the server's trusted issuers. Renewing a certificate
 with the same CN preserves membership and ownership, including with a new key.
 Separate issuers with identical CNs do not create separate devices.
+With `--tls-client-identity-field san-uri` or `san-dns`, "CN" in this guide
+means the single SAN URI or SAN DNS name that option selects instead; see the
+[mTLS guide](using_mtls.md).
 
 Unknown fields, unsupported versions, unknown roles/tenants/rule names, empty
 grants, duplicate restriction names, and invalid reservations fail startup.
@@ -103,7 +106,11 @@ With `allow_ephemeral: true`, requesting port zero selects up to 32 distinct
 random candidates from that address's reserved pool. Bind retries occur only
 for an address-in-use error. This can fail when sampled ports are busy even if
 other pool ports are free. Without tenant policy, port zero retains the existing
-OS-assigned behavior. Allocations are not durable and policy reservations do not
+OS-assigned behavior. Either way, a port-zero request that carries a client
+tunnel identifier, as clients from 0.1.0-beta.4 send, reuses the listener
+already allocated to that tunnel instead of choosing a port again, so the tunnel
+keeps its port while it keeps asking; see [the protocol guide](PROTOCOL_V2.md).
+Allocations are not durable and policy reservations do not
 reserve sockets against other processes or coordinate replicas. Qualify actual
 bind conflicts and align host/container port publication with the reserved pool.
 

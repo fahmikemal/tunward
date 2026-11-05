@@ -79,6 +79,9 @@ The key is the exact, case-sensitive CN from the verified client certificate,
 not `--client-id`, `--device-id`, an IP address, a URL path supplied by the client,
 or a forwarded certificate header. mTLS path/CN agreement and destination rules
 remain mandatory; a quota profile grants no additional access.
+With `--tls-client-identity-field san-uri` or `san-dns`, "CN" in this guide
+means the single SAN URI or SAN DNS name that option selects instead; see the
+[mTLS guide](using_mtls.md).
 
 CNs must be unique for devices within the server's trusted-issuer scope.
 Certificates from different trusted issuers with the same CN deliberately share
@@ -162,8 +165,15 @@ tunnel roles, named rule scope, and reserved reverse endpoints. Quota accounts
 do not themselves grant any tenant role.
 
 Unused quota-enabled listeners are checked at intervals capped at one second by
-the server idle timeout. Cleanup begins only after transport teardown/cancellation
-is observed. TCP EOF and QUIC peer loss have different detection times.
+the server idle timeout. Such a listener closes, returning its permit, once a
+whole interval passes with no request of its tunnel waiting and none arriving,
+so within about two intervals after its client stops asking. A check that falls
+in the round trip between a served request and the client's next one does not
+close it. In 0.1.0-beta.4 and earlier a fixed-port listener closed at such a
+check, and visitors arriving before the next request were refused or dropped.
+Across a 100 ms round trip that hit about half of the visitors of a busy
+listener.
+Cleanup begins only after transport teardown/cancellation is observed. TCP EOF and QUIC peer loss have different detection times.
 WebTransport idle timeout is derived as three times the configured heartbeat
 interval; the default 30-second interval therefore permits a 90-second detection
 window. A zero interval disables that QUIC idle timeout. Keep a finite heartbeat

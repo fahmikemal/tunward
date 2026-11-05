@@ -156,8 +156,10 @@ Use `--restrict-config /path/to/your-restrictions.yaml` instead of
 `--restrict-to` in the server example. Then a client can use
 `-R tcp://127.0.0.1:0:127.0.0.1:3000` with its existing TLS options.
 The reverse destination is reached from the client. Port zero requests an
-OS-assigned listener; lifecycle and observation limits are described in the
-[README](../README.md#fleet-observation-api).
+OS-assigned listener, which stays with that client tunnel while it keeps a
+request waiting. Its lifecycle is described under
+[tunnel specifications](../README.md#tunnel-specifications), and observation
+limits under the [fleet observation API](../README.md#fleet-observation-api).
 
 For persistent observations keyed by verified device CN, enable the separate
 [fleet inventory](FLEET_INVENTORY.md) with `--fleet-inventory FILE`. The database
@@ -171,9 +173,10 @@ field in one deliberately broad rule, and
 policies. Review each rule before adapting it; do not assume either is a
 restrictive deployment policy. A test loads every example, so they stay valid. Forward rule fields include
 protocol, port, host regex, and CIDR; reverse rules include protocol, bind CIDR,
-ports/mappings, and Unix path regex. Device quotas use a separate
-[quota configuration](DEVICE_QUOTAS.md), enabled with `--device-quota-config`;
-they do not grant or replace destination access.
+ports/mappings, and Unix path regex. Device quotas apply by default under mTLS.
+A [quota configuration](DEVICE_QUOTAS.md) given with `--device-quota-config`
+replaces those defaults, and `--no-device-quotas` turns them off. Quotas do not
+grant or replace destination access.
 
 For several groups on one server, use [tenant authorization](TENANT_ISOLATION.md)
 with `--tenant-config` and uniquely named restriction rules. It adds verified
@@ -211,9 +214,10 @@ authorization of every existing stream. Use the separate
 [live revocation policy](DEVICE_REVOCATION.md) to block a leaf-certificate
 fingerprint or verified device CN and terminate its active work. It requires
 `--device-revocation-config FILE` and applies across the three TLS transports.
-Session/tunnel, attempt-rate, and directional payload quotas can
-be configured using the [verified CN quota guide](DEVICE_QUOTAS.md); the
-development certificate generator does not configure them.
+Session/tunnel, attempt-rate, and directional payload quotas apply by default
+under mTLS and can be configured using the
+[verified CN quota guide](DEVICE_QUOTAS.md); the development certificate
+generator does not configure them.
 
 Use the [deployment lifecycle runbook](DEPLOYMENT.md) for certificate candidate
 validation, renewal, issuer migration, canary rollout, and rollback. The example

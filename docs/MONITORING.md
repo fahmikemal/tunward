@@ -31,7 +31,7 @@ The `/metrics` endpoint exports the following gauges and counters:
 | `tunward_active_connections` | Gauge | Current number of active network transport connections |
 | `tunward_active_tunnels` | Gauge | Current number of active forward and reverse tunnels |
 | `tunward_active_devices` | Gauge | Current number of distinct active verified mTLS devices |
-| `tunward_inventory_healthy` | Gauge | `1` if SQLite fleet inventory database is healthy and writable, `0` otherwise |
+| `tunward_inventory_healthy` | Gauge | `0` after the SQLite fleet inventory failed to commit observations (lock, I/O, full disk), `1` otherwise; a full inventory refusing new devices does not change it |
 | `tunward_build_info` | Gauge | Build information with `version` label, always `1` |
 
 ## Example Prometheus Scrape Configuration
@@ -81,7 +81,7 @@ groups:
           severity: warning
         annotations:
           summary: "Tunward device inventory database is degraded on {{ $labels.instance }}"
-          description: "SQLite inventory write/lock failure detected. New verified devices cannot be recorded."
+          description: "SQLite inventory write/lock failure detected. New verified connections are refused until a write commits again."
 
       - alert: TunwardHighTunnelCount
         expr: tunward_active_tunnels > 5000

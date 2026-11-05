@@ -29,10 +29,10 @@ dependencies in `scripts/requirements-qualification.txt`. Standalone generation 
 | `scripts/qualify_identity.py` | Disposable mTLS identities, path/destination isolation, and labels with quotas disabled |
 | `scripts/qualify_quotas.py` | Configured session/tunnel caps, rate/bandwidth, cross-transport identity, and reverse cleanup |
 | `scripts/qualify_revocation.py` | Live fingerprint/CN denial, active and idle session termination, TLS resumption, reverse and quota cleanup |
-| `scripts/qualify_fleet.py` | Shared transport records, verified inventory, abrupt restart/key rotation, capacity, pagination, and database failures |
+| `scripts/qualify_fleet.py` | Shared transport records, verified inventory, abrupt restart/key rotation, capacity without a health change, pagination, 512 simultaneous verified connections from 16 devices all admitted, and database failures |
 | `scripts/qualify_tenants.py` | Tenant roles/rule scope, reverse ownership and reserved binds, header spoofing, Unix paths, and combined quotas/revocation |
 | `scripts/qualify_trust_boundaries.py` | Spoofed `X-Forwarded-For` and `Forwarded` against the PROXY v2 source on WSS, HTTP/2 and WebTransport, including the header `--trusted-proxy-header` did not choose; a hostile server naming another reverse destination; taken WebTransport and management ports; default quotas under `--allow-insecure-dev` |
-| `scripts/qualify_reverse_tunnels.py` | A port-0 reverse TCP or UDP listener keeping its port across visitors, bursts and reply timeouts on WSS, HTTP/2 and WebTransport; reverse SOCKS5 and HTTP proxy `?allow=` lists against literal, domain and IPv4-mapped destinations; `allow=` refused where it cannot apply; a client naming a zero or far-future idle timeout not aborting the server |
+| `scripts/qualify_reverse_tunnels.py` | A port-0 reverse TCP or UDP listener keeping its port across visitors, bursts and reply timeouts on WSS, HTTP/2 and WebTransport; a fixed-port reverse TCP listener under the default quotas staying open between two requests of a client 100 ms away (through a delaying relay) on WSS and HTTP/2; reverse SOCKS5 and HTTP proxy `?allow=` lists against literal, domain and IPv4-mapped destinations; `allow=` refused where it cannot apply; a client naming a zero or far-future idle timeout not aborting the server |
 | `scripts/qualify_pool_timeout.py` | Delayed TLS establishment versus pool acquisition deadline |
 | `scripts/qualify_hardening.py` | Domain confinement to restriction CIDRs, DNS rebinding, refused UDP retries, TCP and WebTransport handshake bounds, and descriptor exhaustion |
 | `scripts/qualify_wan.py` | Expiring staging agent, native WAN clients, direct mTLS control, per-stream traces and client/server TCP diagnostics |
@@ -577,6 +577,17 @@ that binary and workload, not a standing certification for subsequent builds.
 Reports and binary/source hashes are local qualification artifacts under
 `target/qualification/`; they are not bundled private staging configuration.
 No completed 24-hour WAN result is established by these measurements.
+
+The 2026-11-05 investigation traced an intermittent `reverse/allow-list` failure
+to a defect rather than test timing. A fixed-port reverse listener holding quota
+closed at an idle check that fell between two requests of its tunnel. Behind a
+100 ms round trip, four concurrent visitors made 200 visits. The earlier binary
+served 105 of them, refused 16 and dropped 79, closing the listener 35 times.
+The fixed binary served all 200 and never closed it. The same day, 1000 mTLS
+connections were opened at once against an inventory-enabled server. The fixed
+binary admitted all of them, both on a local NVMe disk and with `fsync` slowed to
+10 ms and to 50 ms. The earlier binary admitted 740, 299 and 96. These are
+single-host loopback measurements, not WAN or production capacity results.
 
 Before wider deployment, define latency, availability, error, and recovery
 objectives; measure on the intended network/hardware with headroom; complete and

@@ -2,8 +2,11 @@
 
 Use a separate staging environment and a release manifest containing binary hash,
 source revision, policy versions, certificate fingerprints, inventory schema,
-and the matching [qualification evidence](STAGING_QUALIFICATION.md). Deployment
-is not completed by a healthy process or one successful tunnel.
+and the matching [qualification evidence](STAGING_QUALIFICATION.md). A published
+release already provides `checksums.txt`, a `release-manifest.json` with the
+archive and binary hashes, source commit and build run, and signed build
+provenance; add the deployment-specific entries to that. Deployment is not
+completed by a healthy process or one successful tunnel.
 
 ## Decisions and ownership
 
@@ -187,9 +190,14 @@ The template has not been activated on a production service by this repository t
 1. Preserve the approved binary, policy files, certificate/trust versions, and a
    consistent inventory backup. Use the [SQLite backup procedure](FLEET_INVENTORY.md)
    or stop its sole owner; copying only a live WAL database file is insufficient.
-2. Stage a new immutable release directory and verify its checksum. Test its
-   `--version` and CLI options against the intended configuration. Protocol v2
-   requires compatible peers; older wire versions need a separate listener.
+2. Stage a new immutable release directory. Verify the archive against
+   `checksums.txt` and against its signed build provenance with
+   `gh attestation verify` and the release's `tunward_<version>.intoto.jsonl`
+   (see [containers and releases](../README.md#containers)). A matching checksum
+   only says the download is intact. The provenance also shows that the release
+   workflow built it from the tagged commit. Test its `--version` and CLI options
+   against the intended configuration. Protocol v2 requires compatible peers;
+   older wire versions need a separate listener.
 3. Start a canary on a separate approved port/host with independent inventory and
    disjoint reverse pools. Never attach two owners to the same SQLite database.
 4. Run verified forward/reverse traffic, policy denials, quotas, revocation,

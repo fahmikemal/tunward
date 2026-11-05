@@ -1,7 +1,7 @@
 # Contributing
 
 Use this guide with the source version you are changing. The workspace is
-`0.1.0-beta`, and tunnel protocol v2 is incompatible with older peers.
+`0.1.0-beta.4`, and tunnel protocol v2 is incompatible with older peers.
 Keep documentation, client/server behavior, and migration instructions together.
 
 ## Environment
@@ -82,6 +82,11 @@ python3 scripts/qualify_quotas.py --output target/qualification/quota-review
 python3 scripts/qualify_revocation.py --output target/qualification/revocation-review
 python3 scripts/qualify_fleet.py --output target/qualification/fleet-review
 python3 scripts/qualify_tenants.py --output target/qualification/tenant-review
+python3 scripts/qualify_trust_boundaries.py --output target/qualification/trust-review
+python3 scripts/qualify_reverse_tunnels.py --output target/qualification/reverse-review
+python3 scripts/qualify_reload.py --output target/qualification/reload-review
+python3 scripts/qualify_hardening.py --output target/qualification/hardening-review
+python3 scripts/qualify_device_scale.py --devices 200 --output target/qualification/device-scale-review
 python3 scripts/qualify_pki.py --output target/qualification/pki-review
 python3 scripts/qualify_runtime.py --output target/qualification/runtime-review
 python3 scripts/check_publication.py
@@ -172,9 +177,9 @@ and weekly, and reports to code scanning.
 takes two steps:
 
 ~~~sh
-mise run release-prepare 0.1.0-beta.3   # branch, bump both manifests and Cargo.lock, open the PR
+mise run release-prepare 0.1.0-beta.5   # branch, bump both manifests and both lock files, open the PR
 # review and merge the pull request, and wait for CI on main to pass
-mise run release-tag 0.1.0-beta.3       # tag main and push only the tag
+mise run release-tag 0.1.0-beta.5       # tag main and push only the tag
 ~~~
 
 `release-prepare` refuses a dirty working tree and a version the release

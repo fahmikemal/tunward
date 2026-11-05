@@ -10,7 +10,7 @@ Tunward forwards TCP and UDP traffic over WebSocket, HTTP/2, or WebTransport.
 It supports forward and reverse tunnels, SOCKS5 and HTTP proxies, Unix sockets,
 stdio, and a local fleet observation API.
 
-The workspace version is **0.1.0-beta**. This tree uses **tunnel protocol v2**:
+The workspace version is **0.1.0-beta.4**. This tree uses **tunnel protocol v2**:
 upgrade both peers together or use a separate listener during migration. The
 package version alone does not establish wire compatibility. See the
 [protocol and migration guide](docs/PROTOCOL_V2.md).
@@ -199,7 +199,7 @@ mTLS server on `wss://[::]:8080` and expects these read-only mounts:
 docker run -d --name tunward --read-only --cap-drop ALL -p 127.0.0.1:8443:8080 \
   -v "$PWD/tls:/etc/tunward/tls:ro" \
   -v "$PWD/restrictions.yaml:/etc/tunward/restrictions.yaml:ro" \
-  oph1uchus/tunward:v0.1.0-beta.2
+  oph1uchus/tunward:v0.1.0-beta.4
 ~~~
 
 Without them the container exits and names the first missing file instead of
@@ -245,11 +245,11 @@ can reuse that tag's successful build artifacts. See
 [recovery prerequisites and limits](CONTRIBUTING.md#recover-a-partial-prerelease).
 
 The image tag equals the Git tag; beta tags do not create a `latest` or stable
-alias. For example, with the `v0.1.0-beta.2` prerelease:
+alias. For example, with the `v0.1.0-beta.4` prerelease:
 
 ~~~sh
-docker pull oph1uchus/tunward:v0.1.0-beta.2
-docker run --rm oph1uchus/tunward:v0.1.0-beta.2 /home/app/tunward --version
+docker pull oph1uchus/tunward:v0.1.0-beta.4
+docker run --rm oph1uchus/tunward:v0.1.0-beta.4 /home/app/tunward --version
 ~~~
 
 Maintainers must configure the GitHub Actions variable `DOCKERHUB_USERNAME`
@@ -399,7 +399,10 @@ The client logs the port it was given, and every later request of the same `-R`
 spec is served on it while the client keeps a request waiting, as `ssh -R 0:`
 keeps its port. A client absent for a whole idle check (one second under device
 quotas, otherwise the server idle timeout) may be given a new port, and warns
-when it is. The port is not a persistent reservation. Cached reverse listener
+when it is. The port is not a persistent reservation. A fixed-port listener
+likewise stays open through the round trip between two requests of its tunnel,
+so visitors arriving meanwhile wait for the next request instead of being
+refused. Cached reverse listener
 reuse is always scoped to the verified mTLS device and Server instance,
 independently of quotas and revocation. With quotas enabled, retained allocations also remain charged.
 
@@ -451,7 +454,10 @@ fingerprint; live counts remain in memory and start at zero after restart.
 Caller labels cannot create verified device records. Device queries return 503
 when persistence is disabled/unavailable; invalid pagination returns 400.
 Configured persistence failures reject new connection admission rather than
-silently lose observations, while existing forwarding continues. Read
+silently lose observations, while existing forwarding continues. Observations
+that arrive together are committed in one transaction, so a reconnect burst
+costs one disk sync per batch; a full inventory refuses new identities without
+reporting the store unhealthy. Read
 [the fleet guide](docs/FLEET_INVENTORY.md) for counters, capacity, permissions,
 backup, migration, and failure recovery. These observations do not prove physical
 MDM enrollment, tenant ownership, or end-to-end device health.

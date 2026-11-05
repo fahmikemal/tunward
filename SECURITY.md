@@ -2,7 +2,7 @@
 
 ## Scope and versions
 
-The current workspace version is `0.1.0-beta`. This source tree uses tunnel
+The current workspace version is `0.1.0-beta.4`. This source tree uses tunnel
 protocol v2 and requires compatible client/server peers. Record both binaries'
 versions and commits in a report; a matching package version alone does not
 identify a particular working tree or establish wire compatibility.
@@ -29,6 +29,23 @@ Include:
 
 Use networks/devices you own or are authorized to test. Coordinate disclosure
 with maintainers; this document does not promise a fixed response or patch SLA.
+
+## Published advisories
+
+| Advisory | Affected | Fixed in | Summary |
+| --- | --- | --- | --- |
+| [GHSA-p4cj-jwqj-28x6](https://github.com/fahmikemal/tunward/security/advisories/GHSA-p4cj-jwqj-28x6) | `<= 0.1.0-beta.3` | `0.1.0-beta.4` | A client-chosen idle timeout on a reverse UDP or SOCKS5 tunnel aborts the server (CVSS 6.5, medium) |
+
+For GHSA-p4cj-jwqj-28x6, who can trigger it depends on the release:
+
+- **0.1.0-beta.2 and 0.1.0-beta.3:** only a client that a `!ReverseTunnel` rule
+  allows to open a reverse `Udp` or `Socks5` tunnel.
+- **0.1.0-beta:** any client the server accepts, including on a server started
+  without `--restrict-config`, which allowed every tunnel in that release.
+
+The message of the fixing commit (`1cee777`) says no such rule exists by
+default. That holds for 0.1.0-beta.2 and later only; the advisory has the full
+scope.
 
 ## Current trust boundaries
 
@@ -95,8 +112,9 @@ The optional [SQLite inventory](docs/FLEET_INVENTORY.md) stores observed verifie
 CNs independently of labels. It is not enrollment or an access-control source.
 Protect database/state directories and backups; they contain device identities
 and certificate metadata. Inventory-enabled new connections fail when their
-observations cannot be committed. Existing forwarding is not terminated by a
-storage failure. API access remains loopback-only without built-in authentication.
+observations cannot be committed, and a new identity is refused once
+`--fleet-inventory-max-devices` identities are stored. Existing forwarding is
+not terminated by a storage failure. API access remains loopback-only without built-in authentication.
 
 Optional [tenant authorization](docs/TENANT_ISOLATION.md) requires verified
 mTLS membership, explicit tunnel roles, tenant-scoped named restrictions, and
