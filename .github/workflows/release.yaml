@@ -60,7 +60,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Install taplo-cli and cargo-nextest
-        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: taplo-cli,cargo-nextest
 
@@ -286,7 +286,7 @@ jobs:
               "$image" /home/app/tunward --help > /dev/null
           done
       - name: Log in to Docker Hub
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
