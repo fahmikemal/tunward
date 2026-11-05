@@ -29,7 +29,7 @@ dependencies in `scripts/requirements-qualification.txt`. Standalone generation 
 | `scripts/qualify_identity.py` | Disposable mTLS identities, path/destination isolation, and labels with quotas disabled |
 | `scripts/qualify_quotas.py` | Configured session/tunnel caps, rate/bandwidth, cross-transport identity, and reverse cleanup |
 | `scripts/qualify_revocation.py` | Live fingerprint/CN denial, active and idle session termination, TLS resumption, reverse and quota cleanup |
-| `scripts/qualify_fleet.py` | Shared transport records, verified inventory, abrupt restart/key rotation, capacity, pagination, and database failures |
+| `scripts/qualify_fleet.py` | Shared transport records, verified inventory, abrupt restart/key rotation, capacity without a health change, pagination, 512 simultaneous verified connections from 16 devices all admitted, and database failures |
 | `scripts/qualify_tenants.py` | Tenant roles/rule scope, reverse ownership and reserved binds, header spoofing, Unix paths, and combined quotas/revocation |
 | `scripts/qualify_trust_boundaries.py` | Spoofed `X-Forwarded-For` and `Forwarded` against the PROXY v2 source on WSS, HTTP/2 and WebTransport, including the header `--trusted-proxy-header` did not choose; a hostile server naming another reverse destination; taken WebTransport and management ports; default quotas under `--allow-insecure-dev` |
 | `scripts/qualify_reverse_tunnels.py` | A port-0 reverse TCP or UDP listener keeping its port across visitors, bursts and reply timeouts on WSS, HTTP/2 and WebTransport; reverse SOCKS5 and HTTP proxy `?allow=` lists against literal, domain and IPv4-mapped destinations; `allow=` refused where it cannot apply; a client naming a zero or far-future idle timeout not aborting the server |

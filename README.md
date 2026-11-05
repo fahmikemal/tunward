@@ -451,7 +451,10 @@ fingerprint; live counts remain in memory and start at zero after restart.
 Caller labels cannot create verified device records. Device queries return 503
 when persistence is disabled/unavailable; invalid pagination returns 400.
 Configured persistence failures reject new connection admission rather than
-silently lose observations, while existing forwarding continues. Read
+silently lose observations, while existing forwarding continues. Observations
+that arrive together are committed in one transaction, so a reconnect burst
+costs one disk sync per batch; a full inventory refuses new identities without
+reporting the store unhealthy. Read
 [the fleet guide](docs/FLEET_INVENTORY.md) for counters, capacity, permissions,
 backup, migration, and failure recovery. These observations do not prove physical
 MDM enrollment, tenant ownership, or end-to-end device health.
