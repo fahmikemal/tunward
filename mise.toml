@@ -66,10 +66,12 @@ for manifest in ("tunward/Cargo.toml", "tunward-cli/Cargo.toml"):
         sys.exit(f"{manifest}: no package version line")
     path.write_text(text)
 PY
-# Refresh the two packages' entries in Cargo.lock, and refuse a version the release workflow would reject.
+# Refresh the two packages' entries in Cargo.lock and in the fuzz workspace's own lock file, and refuse a
+# version the release workflow would reject.
 cargo metadata --format-version 1 > /dev/null
+cargo metadata --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null
 python3 scripts/check_release_tag.py --ref "refs/tags/$tag" > /dev/null
-git add tunward/Cargo.toml tunward-cli/Cargo.toml Cargo.lock
+git add tunward/Cargo.toml tunward-cli/Cargo.toml Cargo.lock fuzz/Cargo.lock
 git commit --quiet -m "chore(release): bump version to $version"
 git push --quiet --set-upstream origin "$branch"
 gh pr create --base main --head "$branch" --title "chore(release): bump version to $version" \
