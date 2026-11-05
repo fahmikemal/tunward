@@ -578,6 +578,17 @@ Reports and binary/source hashes are local qualification artifacts under
 `target/qualification/`; they are not bundled private staging configuration.
 No completed 24-hour WAN result is established by these measurements.
 
+The 2026-11-05 investigation traced an intermittent `reverse/allow-list` failure
+to a defect rather than test timing. A fixed-port reverse listener holding quota
+closed at an idle check that fell between two requests of its tunnel. Behind a
+100 ms round trip, four concurrent visitors made 200 visits. The earlier binary
+served 105 of them, refused 16 and dropped 79, closing the listener 35 times.
+The fixed binary served all 200 and never closed it. The same day, 1000 mTLS
+connections were opened at once against an inventory-enabled server. The fixed
+binary admitted all of them, both on a local NVMe disk and with `fsync` slowed to
+10 ms and to 50 ms. The earlier binary admitted 740, 299 and 96. These are
+single-host loopback measurements, not WAN or production capacity results.
+
 Before wider deployment, define latency, availability, error, and recovery
 objectives; measure on the intended network/hardware with headroom; complete and
 review endurance; and qualify real-device reconnect/sleep behavior. Resolve the

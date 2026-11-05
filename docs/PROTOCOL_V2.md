@@ -1,7 +1,7 @@
 # Tunnel protocol v2
 
 This document describes the wire behavior in the current source tree. The
-workspace package version is `0.1.0-beta`; record a commit or binary hash as
+workspace package version is `0.1.0-beta.4`; record a commit or binary hash as
 well when comparing builds.
 
 ## Compatibility and migration

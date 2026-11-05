@@ -11,6 +11,13 @@ WebSocket/HTTP2/WebTransport, verified-device quotas and revocation, tenant
 permissions and reverse ownership, persistent fleet observations, offline
 configuration validation, and managed graceful file reload.
 
+The prereleases since then, up to the current `0.1.0-beta.4`, added
+server-allocated reverse ports that stay with their client tunnel, `?allow=`
+lists for reverse SOCKS5 and HTTP proxies, the `Forwarded` header (RFC 7239) as
+a trusted-proxy source, PROXY protocol for SOCKS5 listeners, fair scheduling of
+WebTransport streams, fuzzing of the parsers of peer input in CI, and
+signed build provenance attached to each release from `0.1.0-beta.2` on.
+
 That is a sufficient feature baseline for controlled beta evaluation. The next
 work is safer defaults, defect investigation, and qualification of the intended
 deployment. A beta tag or passing CI does not establish stable or production
@@ -58,6 +65,25 @@ These gates remain separate from feature count:
   ([#16](https://github.com/fahmikemal/tunward/pull/16)). The tenant
   qualification now pauses that peer past the idle check, which fails on the
   earlier binary.
+- The intermittent `reverse/allow-list` qualification failure is **resolved**,
+  and it was a defect, not a test artifact. Under the default mTLS quotas a
+  fixed-port reverse listener is checked every second, and a check that fell
+  between a served request and the client's next one closed it. Visitors
+  arriving before the next request were refused or dropped: about half of them
+  across a 100 ms round trip. Such a listener now closes only after a whole
+  interval with no request waiting or arriving.
+  `reverse/fixed-port` runs a client through a relay that adds that round trip,
+  and fails on the earlier binary.
+- Inventory admission under reconnect bursts is **resolved**. Each verified
+  connection waited for its own synchronous commit behind a 256-entry queue, and
+  connections that found it full were refused. Of 1000 mTLS connections opened
+  at once, 260 were refused on a fast disk and 904 with a 50 ms sync.
+  Observations are now committed in batches, and all 1000 are admitted.
+  A full inventory no longer reports the store unhealthy, which had turned
+  `/healthz` to 503.
+- [GHSA-p4cj-jwqj-28x6](https://github.com/fahmikemal/tunward/security/advisories/GHSA-p4cj-jwqj-28x6)
+  is **fixed** in `0.1.0-beta.4`: a client-chosen idle timeout on a reverse UDP
+  or SOCKS5 tunnel aborted the server. See [published advisories](SECURITY.md#published-advisories).
 - Complete and review continuous 24–72 hour WAN evidence for the exact candidate
   binary and representative workloads. Test real MDM devices, sleep/reconnect,
   and network transitions separately from synthetic identities.

@@ -52,7 +52,10 @@ The primary key is the exact case-sensitive CN extracted from a verified client
 certificate. Caller labels, request paths, forwarded headers, and IP addresses
 cannot create verified identities. Client CNs must be unique within the server's
 trusted-issuer scope; identical CNs from different trusted issuers share one
-inventory row, as they do for quotas and CN revocation.
+inventory row, as they do for quotas and CN revocation. With
+`--tls-client-identity-field san-uri` or `san-dns`, "CN" in this guide means
+the single SAN URI or SAN DNS name that option selects instead; see the
+[mTLS guide](using_mtls.md).
 
 | Field | Meaning |
 | --- | --- |

@@ -59,6 +59,13 @@ source changes. Do not merge or push the old branch history into the cleaned
 repository. An operator-only recovery bundle is retained outside the published
 source; it still contains exposed material and must remain private.
 
+Since then a repository ruleset on `main` refuses force pushes and branch
+deletion and accepts changes only through pull requests with passing checks.
+Release tags and their signed provenance name commits on that history, so
+published commits are not rewritten again, even to correct a commit message.
+Corrections go into the documentation instead, as for the fix of
+[GHSA-p4cj-jwqj-28x6](../SECURITY.md#published-advisories).
+
 ## Coordinated hosting cutover
 
 Before changing hosted history, finalize and review the desired release source,

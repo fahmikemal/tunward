@@ -41,7 +41,9 @@ not required for it.
 CNs. For example, blocking `device-001` blocks that device's old and renewed
 certificates if both preserve that CN. As with quotas, device CNs must be unique
 within the server's trusted-issuer scope. Two trusted issuers assigning the same
-CN create one policy identity.
+CN create one policy identity. With `--tls-client-identity-field san-uri` or
+`san-dns`, "CN" in this guide means the single SAN URI or SAN DNS name that
+option selects instead; see the [mTLS guide](using_mtls.md).
 
 `blocked_cert_sha256` contains the SHA-256 digest of the entire DER-encoded leaf
 certificate. It accepts 64 hex digits, with optional colons and either case.

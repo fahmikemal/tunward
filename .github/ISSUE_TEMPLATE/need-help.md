@@ -32,7 +32,9 @@ or cleanup. State what already works without the tunnel.
 - Both peers implement the same wire protocol.
 - The target is reachable from the correct side of the tunnel.
 - The server SAN matches the domain/IP used by the client and its CA is trusted.
-- For mTLS, client CN and path prefix agree and restrictions permit the request.
+- For mTLS, the client identity (the CN, or the SAN chosen with
+  `--tls-client-identity-field`) and path prefix agree and restrictions permit
+  the request.
 - For WebTransport, UDP is reachable on the server port as well as TCP.
 - If tests use Podman, DOCKER_HOST points to that user's active Podman API socket.
 - With WireGuard/VPN routing, the tunward server remains reachable outside the

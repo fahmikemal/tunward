@@ -79,6 +79,9 @@ The key is the exact, case-sensitive CN from the verified client certificate,
 not `--client-id`, `--device-id`, an IP address, a URL path supplied by the client,
 or a forwarded certificate header. mTLS path/CN agreement and destination rules
 remain mandatory; a quota profile grants no additional access.
+With `--tls-client-identity-field san-uri` or `san-dns`, "CN" in this guide
+means the single SAN URI or SAN DNS name that option selects instead; see the
+[mTLS guide](using_mtls.md).
 
 CNs must be unique for devices within the server's trusted-issuer scope.
 Certificates from different trusted issuers with the same CN deliberately share
