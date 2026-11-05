@@ -1690,3 +1690,78 @@ async fn test_webtransport_handshakes_are_bounded_without_affecting_sessions(
     let fresh = TcpListener::bind(free_addr().0).await.unwrap();
     assert!(tcp_tunnel_reaches(&fresh_client, reachable(&fresh), &fresh).await);
 }
+
+/// A CA certificate in PEM, for files the TLS reloader watches.
+fn ca_pem(name: &str) -> String {
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.distinguished_name.push(rcgen::DnType::CommonName, name);
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let certificate = params.self_signed(&rcgen::KeyPair::generate().unwrap()).unwrap();
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(certificate.der());
+    let lines = encoded
+        .as_bytes()
+        .chunks(64)
+        .map(|line| std::str::from_utf8(line).unwrap());
+    format!(
+        "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+        lines.collect::<Vec<_>>().join("\n")
+    )
+}
+
+/// Wait until `reloader` reports a reload, for at most `limit`.
+async fn reloaded(reloader: &crate::tunnel::tls_reloader::TlsReloader, limit: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + limit;
+    while tokio::time::Instant::now() < deadline {
+        if reloader.should_reload_certificate() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+#[rstest]
+#[tokio::test]
+async fn client_cas_are_reloaded_with_the_embedded_certificate_and_after_an_invalid_write(dns_resolver: DnsResolver) {
+    let directory = std::env::temp_dir().join(format!("tunward-ca-reload-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    defer! { let _ = std::fs::remove_dir_all(&directory); };
+    let ca_path = directory.join("ca.pem");
+    std::fs::write(&ca_path, ca_pem("first")).unwrap();
+    let first = crate::protocols::tls::load_certificates_from_pem(&ca_path).unwrap();
+
+    let tls = TlsServerConfig {
+        tls_client_ca_certificates: Some(parking_lot::Mutex::new(first.clone())),
+        tls_client_ca_certs_path: Some(ca_path.clone()),
+        ..embedded_tls()
+    };
+    let config = Arc::new(ServerConfig {
+        tls: Some(tls),
+        ..server_config(dns_resolver)
+    });
+    let reloader = crate::tunnel::tls_reloader::TlsReloader::new_for_server(config.clone()).unwrap();
+    let client_cas = || {
+        config
+            .tls
+            .as_ref()
+            .unwrap()
+            .tls_client_ca_certificates
+            .as_ref()
+            .unwrap()
+            .lock()
+            .clone()
+    };
+
+    // A write that leaves no valid certificate keeps the previous CAs in use.
+    std::fs::write(&ca_path, "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n").unwrap();
+    assert!(!reloaded(&reloader, Duration::from_millis(500)).await);
+    assert_eq!(client_cas(), first);
+
+    // The next write is still picked up, although no custom server certificate is watched.
+    std::fs::write(&ca_path, ca_pem("second")).unwrap();
+    assert!(reloaded(&reloader, Duration::from_secs(5)).await);
+    let second = client_cas();
+    assert_ne!(second, first);
+    assert_eq!(second, crate::protocols::tls::load_certificates_from_pem(&ca_path).unwrap());
+}

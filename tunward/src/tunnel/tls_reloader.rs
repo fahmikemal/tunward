@@ -60,7 +60,11 @@ where
 }
 
 /// Handle a filesystem event for one watched TLS file: (re)load it on create/modify, or
-/// re-establish the watch if it was removed or failed to load.
+/// re-establish the watch if it was removed.
+///
+/// A file that fails to load keeps the material loaded before it in use. Its watch still holds, so
+/// the write that completes or fixes the file triggers the next attempt: retrying at once would
+/// only fail again, and re-watching to force a retry spins as fast as the file can be read.
 fn handle_file_event<R>(state: TlsReloaderState, event: &notify::Event, path: &Path, reload: R)
 where
     R: FnOnce() -> anyhow::Result<()>,
@@ -68,8 +72,9 @@ where
     match event.kind {
         EventKind::Create(_) | EventKind::Modify(_) => {
             if let Err(err) = reload() {
-                warn!("Error while loading TLS file {path:?}: {err:?}");
-                TlsReloader::try_rewatch_certificate(state, path.to_path_buf());
+                warn!(
+                    "Error while loading TLS file {path:?}, keeping the previous one until it changes again: {err:?}"
+                );
             }
         }
         EventKind::Remove(_) => {
@@ -85,16 +90,19 @@ struct TlsReloaderServerState {
     poll_watcher: Mutex<PollWatcher>,
     tls_reload_certificate: AtomicBool,
     server_config: Arc<ServerConfig>,
-    cert_path: PathBuf,
-    key_path: PathBuf,
+    /// Absent when the server uses its embedded certificate.
+    cert_path: Option<PathBuf>,
+    key_path: Option<PathBuf>,
     client_ca_path: Option<PathBuf>,
 }
 
 impl TlsReloaderServerState {
     /// Re-read the certificate from disk and swap it into the shared config, flagging a reload.
     fn reload_cert(&self) -> anyhow::Result<()> {
-        let tls = self.server_config.tls.as_ref().unwrap();
-        let tls_certs = tls::load_certificates_from_pem(&self.cert_path)?;
+        let (Some(tls), Some(cert_path)) = (self.server_config.tls.as_ref(), &self.cert_path) else {
+            return Ok(());
+        };
+        let tls_certs = tls::load_certificates_from_pem(cert_path)?;
         *tls.tls_certificate.lock() = tls_certs;
         self.tls_reload_certificate.store(true, Ordering::Relaxed);
         Ok(())
@@ -102,8 +110,10 @@ impl TlsReloaderServerState {
 
     /// Re-read the private key from disk and swap it into the shared config, flagging a reload.
     fn reload_key(&self) -> anyhow::Result<()> {
-        let tls = self.server_config.tls.as_ref().unwrap();
-        let tls_key = tls::load_private_key_from_file(&self.key_path)?;
+        let (Some(tls), Some(key_path)) = (self.server_config.tls.as_ref(), &self.key_path) else {
+            return Ok(());
+        };
+        let tls_key = tls::load_private_key_from_file(key_path)?;
         *tls.tls_key.lock() = tls_key;
         self.tls_reload_certificate.store(true, Ordering::Relaxed);
         Ok(())
@@ -175,32 +185,41 @@ pub struct TlsReloader {
 
 impl TlsReloader {
     pub fn new_for_server(server_config: Arc<ServerConfig>) -> anyhow::Result<Self> {
-        // If there is no custom certificate and private key, there is nothing to watch
-        let Some((Some(cert_path), Some(key_path), client_ca_certs)) = server_config
-            .tls
-            .as_ref()
-            .map(|t| (&t.tls_certificate_path, &t.tls_key_path, &t.tls_client_ca_certs_path))
-        else {
+        // Without a custom certificate, a custom key or client CAs there is nothing to watch. The
+        // client CAs are watched with the embedded server certificate too.
+        let Some((cert_path, key_path, client_ca_path)) = server_config.tls.as_ref().map(|t| {
+            (
+                t.tls_certificate_path.clone(),
+                t.tls_key_path.clone(),
+                t.tls_client_ca_certs_path.clone(),
+            )
+        }) else {
             return Ok(Self {
                 state: TlsReloaderState::Empty,
             });
         };
+        if cert_path.is_none() && key_path.is_none() && client_ca_path.is_none() {
+            return Ok(Self {
+                state: TlsReloaderState::Empty,
+            });
+        }
 
         let this = Arc::new(TlsReloaderServerState {
             fs_watcher: Mutex::new(notify::recommended_watcher(|_| {})?),
             poll_watcher: Mutex::new(placeholder_poll_watcher()?),
             tls_reload_certificate: AtomicBool::new(false),
-            cert_path: cert_path.to_path_buf(),
-            key_path: key_path.to_path_buf(),
-            client_ca_path: client_ca_certs.as_ref().map(|x| x.to_path_buf()),
+            cert_path,
+            key_path,
+            client_ca_path,
             server_config,
         });
 
-        info!("Starting to watch tls certificates and private key for changes to reload them");
-        let mut paths = vec![this.cert_path.as_path(), this.key_path.as_path()];
-        if let Some(client_ca_path) = &this.client_ca_path {
-            paths.push(client_ca_path.as_path());
-        }
+        info!("Starting to watch the server TLS files for changes to reload them");
+        let paths = [&this.cert_path, &this.key_path, &this.client_ca_path]
+            .into_iter()
+            .flatten()
+            .map(PathBuf::as_path)
+            .collect::<Vec<_>>();
 
         let (inotify, poll) = install_watchers(&paths, || {
             let this = Server(this.clone());
@@ -307,11 +326,15 @@ impl TlsReloader {
             return;
         }
 
-        if let Some(path) = event.paths.iter().find(|p| p.ends_with(&this.cert_path)) {
+        if let Some(cert_path) = &this.cert_path
+            && let Some(path) = event.paths.iter().find(|p| p.ends_with(cert_path))
+        {
             handle_file_event(Server(this.clone()), &event, path, || this.reload_cert());
         }
 
-        if let Some(path) = event.paths.iter().find(|p| p.ends_with(&this.key_path)) {
+        if let Some(key_path) = &this.key_path
+            && let Some(path) = event.paths.iter().find(|p| p.ends_with(key_path))
+        {
             handle_file_event(Server(this.clone()), &event, path, || this.reload_key());
         }
 

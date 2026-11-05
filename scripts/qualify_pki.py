@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 from pathlib import Path
+import ssl
 
 from check_tls_bundle import validate
 from qualify import close, port
@@ -12,7 +13,52 @@ from qualify_quotas import QuotaChecks
 from qualify_wan import certificates, command
 
 
+async def handshake(endpoint, certificate, key, issuer):
+    """'accepted' if the server takes the client certificate, else the TLS alert or error it got."""
+    context = ssl.create_default_context(cafile=str(issuer))
+    context.load_cert_chain(str(certificate), str(key))
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(
+            "127.0.0.1", endpoint, ssl=context, server_hostname="localhost"), 5)
+    except (ssl.SSLError, ConnectionError) as error:
+        return getattr(error, "reason", None) or type(error).__name__
+    try:
+        # TLS 1.3 reports a refused client certificate only after the handshake, on the first read.
+        writer.write(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(64), 5)
+        return "accepted" if response.startswith(b"HTTP/") else "closed"
+    except (ssl.SSLError, ConnectionError) as error:
+        return getattr(error, "reason", None) or type(error).__name__
+    finally:
+        await close(writer)
+
+
 class PKIChecks(QuotaChecks):
+    async def invalid_trust_write(self):
+        """An invalid write to a watched TLS file is reported once, and the next write still loads."""
+        endpoint, trust = port(), self.suite.out / "watched-ca.pem"
+        trust.write_bytes((self.certs / "ca.pem").read_bytes())
+        server = await self.suite.spawn("pki-invalid-ca-write", "server", f"wss://127.0.0.1:{endpoint}",
+            "--tls-certificate", str(self.certs / "server.pem"), "--tls-private-key", str(self.certs / "server.key"),
+            "--tls-client-ca-certs", str(trust), "--restrict-config", str(self.policy))
+        log = self.suite.out / "pki-invalid-ca-write.log"
+        try:
+            await self.suite.ready(endpoint, server)
+            trust.write_text("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n")
+            await asyncio.sleep(3)
+            warnings = log.read_text().count("Error while loading TLS file")
+            # One per write event the invalid content produced; the old reloader logged thousands a second.
+            assert 1 <= warnings <= 3, warnings
+            assert await handshake(endpoint, self.certs / "a.pem", self.certs / "a.key", self.certs / "ca.pem") == "accepted"
+            trust.write_bytes((self.certs / "ca.pem").read_bytes())
+            await asyncio.sleep(1)
+            assert log.read_text().count("Error while loading TLS file") == warnings
+            assert await handshake(endpoint, self.certs / "a.pem", self.certs / "a.key", self.certs / "ca.pem") == "accepted"
+            return {"warnings_for_invalid_write": warnings, "previous_trust_kept": True, "valid_rewrite_loads_without_warning": True}
+        finally:
+            await self.suite.stop(server)
+
     async def run(self):
         await self.prepare()
         renewed = self.suite.out / "renewed"
@@ -23,6 +69,7 @@ class PKIChecks(QuotaChecks):
                       "-CAkey", renewed / "ca.key", "-set_serial", "900", "-days", "4",
                       "-extfile", no_san, "-out", renewed / "cn-only.pem")
         try:
+            await self.suite.check("pki/invalid-client-ca-write", self.invalid_trust_write, 20)
             for name, certificate, key, ca, server_name, days, allowed in (
                 ("valid", renewed / "server.pem", renewed / "server.key", renewed / "ca.pem", "127.0.0.1", 1, True),
                 ("mismatched-key", renewed / "server.pem", self.certs / "server.key", renewed / "ca.pem", "127.0.0.1", 1, False),

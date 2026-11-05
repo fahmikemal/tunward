@@ -3,7 +3,7 @@ pub mod ca_reloader;
 pub mod client;
 pub mod downstream_listeners;
 pub mod server;
-mod tls_reloader;
+pub(crate) mod tls_reloader;
 pub mod transport;
 pub mod upstream_connectors;
 
