@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Release-binary checks of reverse tunnels: a server-allocated port (port 0) stays with its client
-tunnel across requests, reply timeouts, bursts and UDP peers, an allow= list limits where the
-server's peers reach through a reverse SOCKS5 or HTTP proxy tunnel, and the idle timeout a client
-names cannot abort the server."""
+tunnel across requests, reply timeouts, bursts and UDP peers, a fixed port stays open between two
+requests of a distant client, an allow= list limits where the server's peers reach through a reverse
+SOCKS5 or HTTP proxy tunnel, and the idle timeout a client names cannot abort the server."""
 import argparse
 import asyncio
 import base64
@@ -10,6 +10,7 @@ import hashlib
 import ipaddress
 import json
 from pathlib import Path
+import random
 import re
 import socket
 import struct
@@ -137,6 +138,90 @@ class ReverseTunnelChecks:
         finally:
             await asyncio.gather(*(self.suite.stop(process) for process in clients.values()))
             await self.suite.stop(srv)
+            echo.close()
+
+    @staticmethod
+    async def delayed_relay(upstream, delay):
+        """A TCP relay to `upstream` that holds every chunk for `delay` seconds in each direction, so a
+        client connecting through it is a round trip of twice that away from the server."""
+        loop = asyncio.get_running_loop()
+
+        async def pipe(reader, writer):
+            queue = asyncio.Queue()
+
+            async def pace():
+                try:
+                    while (item := await queue.get()) is not None:
+                        due, data = item
+                        await asyncio.sleep(max(0.0, due - loop.time()))
+                        writer.write(data)
+                        await writer.drain()
+                except OSError:
+                    pass
+                finally:
+                    await close(writer)
+
+            pacer = asyncio.create_task(pace())
+            try:
+                while data := await reader.read(65536):
+                    queue.put_nowait((loop.time() + delay, data))
+            except OSError:
+                pass
+            finally:
+                queue.put_nowait(None)
+                await pacer
+
+        async def relay(reader, writer):
+            try:
+                upstream_reader, upstream_writer = await asyncio.open_connection("127.0.0.1", upstream)
+            except OSError:
+                await close(writer)
+                return
+            await asyncio.gather(pipe(reader, upstream_writer), pipe(upstream_reader, writer))
+
+        server = await asyncio.start_server(relay, "127.0.0.1", 0)
+        return server, server.sockets[0].getsockname()[1]
+
+    async def fixed_port(self):
+        """A fixed-port reverse TCP listener stays open between two requests of its tunnel when the
+        client is a round trip of 100 ms away, so visitors arriving meanwhile are served. Under the
+        default mTLS quotas the server checks such a listener every second; a check that fell into
+        that round trip closed it and refused or dropped the visitors until the next request."""
+        echo, echo_port, _ = await self.echo_server()
+        rules = self.policy("fixed", "      - !ReverseTunnel {protocol: [Tcp], cidr: [127.0.0.1/32]}\n")
+        sp, _, srv = await self.server("fixed", rules)
+        relay, relay_port = await self.delayed_relay(sp, 0.05)
+        pace = random.Random(7)
+        outcomes = {}
+        try:
+            for scheme in ("wss", "https"):
+                fixed = port()
+                label = f"fixed-{scheme}"
+                cli = await self.client(label, relay_port, scheme, "-R", f"tcp://127.0.0.1:{fixed}:127.0.0.1:{echo_port}")
+                try:
+                    await self.suite.ready(fixed, cli)
+                    served = []
+
+                    async def visitor(worker):
+                        for visit in range(15):
+                            await asyncio.sleep(pace.uniform(0, 0.3))
+                            try:
+                                served.append(await self.echoed(fixed, f"{scheme}-{worker}-{visit}".encode()))
+                            except ConnectionRefusedError:
+                                served.append(False)
+
+                    await asyncio.gather(*(visitor(worker) for worker in range(4)))
+                    closed = self.log("fixed-server").count(f"reverse tunnel server on 127.0.0.1:{fixed}.")
+                    assert all(served) and not closed, (
+                        f"{scheme}: {served.count(False)} of {len(served)} visitors not served, "
+                        f"the listener closed {closed} times while its client kept asking")
+                    outcomes[scheme] = {"port": fixed, "visitors": len(served)}
+                finally:
+                    await self.suite.stop(cli)
+            return {"client_round_trip_ms": 100, "transports": outcomes, "listener_closures": 0}
+        finally:
+            await self.suite.stop(srv)
+            relay.close()
             echo.close()
 
     async def allocated_udp(self):
@@ -372,6 +457,7 @@ class ReverseTunnelChecks:
         await certificates(self.certs, "127.0.0.1")
         try:
             for name, check, timeout in (("allocated-port", self.allocated_port, 180), ("allocated-udp", self.allocated_udp, 60),
+                                         ("fixed-port", self.fixed_port, 120),
                                          ("allow-list", self.allow_list, 120), ("allow-refused", self.allow_refused, 30),
                                          ("client-chosen-timeouts", self.client_chosen_timeouts, 60)):
                 await self.suite.check(f"reverse/{name}", check, timeout)

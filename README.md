@@ -399,7 +399,10 @@ The client logs the port it was given, and every later request of the same `-R`
 spec is served on it while the client keeps a request waiting, as `ssh -R 0:`
 keeps its port. A client absent for a whole idle check (one second under device
 quotas, otherwise the server idle timeout) may be given a new port, and warns
-when it is. The port is not a persistent reservation. Cached reverse listener
+when it is. The port is not a persistent reservation. A fixed-port listener
+likewise stays open through the round trip between two requests of its tunnel,
+so visitors arriving meanwhile wait for the next request instead of being
+refused. Cached reverse listener
 reuse is always scoped to the verified mTLS device and Server instance,
 independently of quotas and revocation. With quotas enabled, retained allocations also remain charged.
 

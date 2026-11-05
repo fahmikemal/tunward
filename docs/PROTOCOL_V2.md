@@ -202,9 +202,12 @@ Cleanup depends on receiver/waiter lifecycle and an idle timer. Ephemeral
 listeners use checks capped at five seconds by the configured idle timeout;
 fixed listeners use the configured interval. Quota-enabled unused listeners
 instead check at intervals capped at one second by that timeout. A listener
-allocated to a client tunnel closes only after a whole check interval with no
-request of that tunnel waiting and none arriving, so the gap between one
-visitor's connection and the client's next request does not release it. A UDP listener
+allocated to a client tunnel, and a fixed-port listener that holds quota, closes
+only after a whole check interval with no request of its tunnel waiting and none
+arriving, so the round trip between one visitor's connection and the client's
+next request does not release it. In 0.1.0-beta.4 and earlier a fixed-port
+listener holding quota closed at the first check that found no request waiting,
+and refused visitors until the next request opened it again. A UDP listener
 stays open past these checks while it still serves a peer, because the listener
 sorts that peer's datagrams. An ephemeral listener without a tunnel identifier belongs to the request that
 opened it: once that request has its connection, later connections to the same
