@@ -1,5 +1,7 @@
 //! Live, process-local denial of verified device identities and certificate fingerprints.
 
+use crate::config::ClientCrlScope;
+use crate::protocols::tls::{ClientCrls, RevocationKeys};
 use anyhow::{Context, anyhow, ensure};
 use parking_lot::Mutex;
 use serde::Deserialize;
@@ -8,7 +10,7 @@ use std::future::Future;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::sync::watch;
 use tokio_rustls::rustls::{
     crypto::{CryptoProvider, hash::HashAlgorithm},
@@ -103,6 +105,8 @@ pub(crate) fn certificate_fingerprint(certificate: &CertificateDer<'_>) -> anyho
 struct Session {
     identity: Arc<str>,
     fingerprint: String,
+    /// What a client CRL is checked against; empty without `--tls-client-crl`.
+    crl_keys: RevocationKeys,
     revoked: watch::Sender<bool>,
 }
 
@@ -160,6 +164,21 @@ struct State {
     policy: Policy,
     healthy: bool,
     sessions: Vec<Weak<Session>>,
+    crl: Option<CrlState>,
+}
+
+/// The client CRLs in force, as the TLS verifier was last given them.
+struct CrlState {
+    scope: ClientCrlScope,
+    enforce_expiry: bool,
+    crls: Arc<ClientCrls>,
+}
+
+/// What `/healthz` reports about the client CRLs.
+pub(crate) struct CrlHealth {
+    pub next_update: Option<SystemTime>,
+    /// Past its next update, a CRL fails the handshakes that need it.
+    pub enforced_expiry: bool,
 }
 
 #[derive(Clone)]
@@ -171,6 +190,7 @@ impl RevocationManager {
             policy: Policy::default(),
             healthy: true,
             sessions: Vec::new(),
+            crl: None,
         })))
     }
     pub fn from_path(path: &Path) -> anyhow::Result<Self> {
@@ -180,23 +200,49 @@ impl RevocationManager {
             policy,
             healthy: true,
             sessions: Vec::new(),
+            crl: None,
         }))))
     }
 
-    pub fn register(&self, identity: &str, certificate: &CertificateDer<'_>) -> anyhow::Result<RevocationGuard> {
-        self.register_identity(identity, certificate_fingerprint(certificate)?)
+    /// Check sessions against client CRLs from now on, starting with `crls`.
+    pub fn enable_crls(&self, scope: ClientCrlScope, enforce_expiry: bool, crls: Arc<ClientCrls>) {
+        self.0.lock().crl = Some(CrlState {
+            scope,
+            enforce_expiry,
+            crls,
+        });
     }
 
-    fn register_identity(&self, identity: &str, fingerprint: String) -> anyhow::Result<RevocationGuard> {
+    /// `chain` is the verified client certificate followed by the CA certificates it presented.
+    pub fn register(&self, identity: &str, chain: &[CertificateDer<'_>]) -> anyhow::Result<RevocationGuard> {
+        let certificate = chain.first().context("verified client certificate required")?;
+        let fingerprint = certificate_fingerprint(certificate)?;
+        let scope = self.0.lock().crl.as_ref().map(|crl| crl.scope);
+        let crl_keys = scope.map(|scope| RevocationKeys::of(chain, scope)).unwrap_or_default();
+        self.register_identity(identity, fingerprint, crl_keys)
+    }
+
+    fn register_identity(
+        &self,
+        identity: &str,
+        fingerprint: String,
+        crl_keys: RevocationKeys,
+    ) -> anyhow::Result<RevocationGuard> {
         let mut state = self.0.lock();
         ensure!(state.healthy, "revocation policy unavailable; authenticated access denied");
         ensure!(
             !state.policy.denies(identity, &fingerprint),
             "device or certificate access revoked"
         );
+        // The handshake was verified against the CRLs of its time, which a newer one may revoke.
+        ensure!(
+            !state.crl.as_ref().is_some_and(|crl| crl.crls.revokes(&crl_keys)),
+            "client certificate revoked by --tls-client-crl"
+        );
         let session = Arc::new(Session {
             identity: Arc::from(identity),
             fingerprint,
+            crl_keys,
             revoked: watch::Sender::new(false),
         });
         if state.sessions.len().is_multiple_of(1024) {
@@ -227,6 +273,44 @@ impl RevocationManager {
             true
         });
         info!(healthy, cancelled_sessions = cancelled, "Applied device revocation policy");
+    }
+
+    /// Install client CRLs and close the sessions whose certificates they revoke. Returns how
+    /// many were closed.
+    pub fn apply_crls(&self, crls: Arc<ClientCrls>) -> usize {
+        let mut state = self.0.lock();
+        let State { sessions, crl, .. } = &mut *state;
+        let Some(crl) = crl else {
+            return 0;
+        };
+        if Arc::ptr_eq(&crl.crls, &crls) {
+            return 0;
+        }
+        crl.crls = crls;
+        let mut cancelled = 0;
+        sessions.retain(|session| {
+            let Some(session) = session.upgrade() else {
+                return false;
+            };
+            if crl.crls.revokes(&session.crl_keys) && !session.revoked.send_replace(true) {
+                cancelled += 1;
+            }
+            true
+        });
+        info!(cancelled_sessions = cancelled, "Applied client CRLs");
+        cancelled
+    }
+
+    /// The client CRLs in force, if `--tls-client-crl` is set.
+    pub fn crls(&self) -> Option<Arc<ClientCrls>> {
+        self.0.lock().crl.as_ref().map(|crl| crl.crls.clone())
+    }
+
+    pub fn crl_health(&self) -> Option<CrlHealth> {
+        self.0.lock().crl.as_ref().map(|crl| CrlHealth {
+            next_update: crl.crls.next_update(),
+            enforced_expiry: crl.enforce_expiry,
+        })
     }
 
     pub async fn reload(self, path: PathBuf) {
@@ -273,51 +357,78 @@ mod tests {
     }
 
     fn manager() -> RevocationManager {
-        RevocationManager(Arc::new(Mutex::new(State {
-            policy: Policy::default(),
-            healthy: true,
-            sessions: Vec::new(),
-        })))
+        RevocationManager::empty()
     }
 
     #[tokio::test]
     async fn certificate_revocation_preserves_rotated_key_and_other_device() {
         let manager = manager();
-        let a = manager.register_identity("a", "old".into()).unwrap();
-        let rotated = manager.register_identity("a", "new".into()).unwrap();
-        let b = manager.register_identity("b", "other".into()).unwrap();
+        let a = manager
+            .register_identity("a", "old".into(), RevocationKeys::default())
+            .unwrap();
+        let rotated = manager
+            .register_identity("a", "new".into(), RevocationKeys::default())
+            .unwrap();
+        let b = manager
+            .register_identity("b", "other".into(), RevocationKeys::default())
+            .unwrap();
         manager.apply(Some(policy(&[], &["old"])));
         a.cancelled().await;
         assert!(!rotated.is_revoked());
         assert!(!b.is_revoked());
-        assert!(manager.register_identity("a", "old".into()).is_err());
+        assert!(
+            manager
+                .register_identity("a", "old".into(), RevocationKeys::default())
+                .is_err()
+        );
         manager.apply(Some(policy(&["a"], &[])));
         rotated.cancelled().await;
         assert!(!b.is_revoked());
-        assert!(manager.register_identity("a", "newer".into()).is_err());
+        assert!(
+            manager
+                .register_identity("a", "newer".into(), RevocationKeys::default())
+                .is_err()
+        );
     }
 
     #[tokio::test]
     async fn cancellation_is_sticky_across_restore_and_late_subscriptions() {
         let manager = manager();
-        let old = manager.register_identity("a", "key".into()).unwrap();
+        let old = manager
+            .register_identity("a", "key".into(), RevocationKeys::default())
+            .unwrap();
         manager.apply(Some(policy(&["a"], &[])));
         manager.apply(Some(Policy::default()));
         old.cancelled().await;
         assert!(old.clone().run(async { Ok(()) }).await.is_err());
-        assert!(!manager.register_identity("a", "key".into()).unwrap().is_revoked());
+        assert!(
+            !manager
+                .register_identity("a", "key".into(), RevocationKeys::default())
+                .unwrap()
+                .is_revoked()
+        );
     }
 
     #[tokio::test]
     async fn broken_policy_closes_all_and_recovery_only_admits_new_sessions() {
         let manager = manager();
-        let old = manager.register_identity("a", "key".into()).unwrap();
+        let old = manager
+            .register_identity("a", "key".into(), RevocationKeys::default())
+            .unwrap();
         manager.apply(None);
         old.cancelled().await;
-        assert!(manager.register_identity("b", "key".into()).is_err());
+        assert!(
+            manager
+                .register_identity("b", "key".into(), RevocationKeys::default())
+                .is_err()
+        );
         manager.apply(Some(Policy::default()));
         assert!(old.is_revoked());
-        assert!(manager.register_identity("a", "key".into()).is_ok());
+        assert!(
+            manager
+                .register_identity("a", "key".into(), RevocationKeys::default())
+                .is_ok()
+        );
     }
 
     #[test]
@@ -345,11 +456,56 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_new_crl_closes_the_sessions_it_revokes_and_refuses_them_afterwards() {
+        crate::tunnel::ca_reloader::SystemCaReloader::init_crypto_provider();
+        let ca = crate::protocols::tls::TestCa::new("CA");
+        let crls = |serials: &[u64]| {
+            Arc::new(ClientCrls::parse(ca.crl(serials, time::Duration::days(1)).as_ref(), &[ca.der()]).unwrap())
+        };
+        let manager = manager();
+        manager.enable_crls(ClientCrlScope::Chain, true, crls(&[]));
+        let (a, b) = (ca.client("device-a", 11), ca.client("device-b", 12));
+        let session_a = manager.register("device-a", std::slice::from_ref(&a)).unwrap();
+        let session_b = manager.register("device-b", std::slice::from_ref(&b)).unwrap();
+
+        // Reapplying the CRLs in force changes nothing.
+        let current = manager.crls().unwrap();
+        assert_eq!(manager.apply_crls(current), 0);
+
+        assert_eq!(manager.apply_crls(crls(&[11])), 1);
+        session_a.cancelled().await;
+        assert!(!session_b.is_revoked());
+        let refused = manager.register("device-a", std::slice::from_ref(&a)).err().unwrap();
+        assert_eq!(refused.to_string(), "client certificate revoked by --tls-client-crl");
+        // A new certificate for the same device is not revoked by the old one's serial.
+        assert!(manager.register("device-a", &[ca.client("device-a", 13)]).is_ok());
+
+        // Cancellation is sticky, as for the revocation policy.
+        assert_eq!(manager.apply_crls(crls(&[])), 0);
+        assert!(session_a.is_revoked());
+        assert!(manager.register("device-a", std::slice::from_ref(&a)).is_ok());
+    }
+
+    #[test]
+    fn sessions_are_not_checked_against_crls_unless_enabled() {
+        crate::tunnel::ca_reloader::SystemCaReloader::init_crypto_provider();
+        let ca = crate::protocols::tls::TestCa::new("CA");
+        let manager = manager();
+        let session = manager.register("device", &[ca.client("device", 1)]).unwrap();
+        let crls = ClientCrls::parse(ca.crl(&[1], time::Duration::days(1)).as_ref(), &[ca.der()]).unwrap();
+        assert_eq!(manager.apply_crls(Arc::new(crls)), 0);
+        assert!(!session.is_revoked());
+        assert!(manager.crl_health().is_none());
+    }
+
     #[test]
     fn expired_weak_sessions_are_reclaimed() {
         let manager = manager();
         for _ in 0..2050 {
-            manager.register_identity("a", "key".into()).unwrap();
+            manager
+                .register_identity("a", "key".into(), RevocationKeys::default())
+                .unwrap();
         }
         assert!(manager.0.lock().sessions.len() <= 1024);
         manager.apply(Some(Policy::default()));

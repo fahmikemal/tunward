@@ -57,6 +57,19 @@ impl FromStr for ClientIdentityField {
     }
 }
 
+/// Which certificates of a client's chain `--tls-client-crl` is checked against.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+pub enum ClientCrlScope {
+    /// The client certificate and every intermediate CA certificate up to the trust anchor.
+    #[default]
+    #[cfg_attr(feature = "clap", value(name = "chain"))]
+    Chain,
+    /// The client certificate only.
+    #[cfg_attr(feature = "clap", value(name = "end-entity"))]
+    EndEntity,
+}
+
 /// The request header in which a trusted proxy names the client.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
@@ -473,6 +486,54 @@ pub struct ServerCreationRequest {
     /// The ca will be automatically reloaded if it changes
     #[cfg_attr(feature = "clap", arg(long, value_name = "FILE_PATH", verbatim_doc_comment))]
     pub tls_client_ca_certs: Option<PathBuf>,
+
+    /// [Optional] Certificate revocation lists (CRLs) for --tls-client-ca-certs: one DER CRL, or
+    /// one or more PEM "X509 CRL" blocks. A client whose certificate, or an intermediate CA
+    /// certificate of its chain, is revoked fails the TLS handshake. Every CA that issues a
+    /// checked certificate needs a CRL in this file, even an empty one, or its certificates are
+    /// refused. CRLs issued by a CA in --tls-client-ca-certs must be signed by it.
+    /// The file is reloaded when it changes, or with the rest of the configuration under
+    /// --graceful-reload and --reload-socket; active sessions of newly revoked certificates close.
+    #[cfg_attr(
+        feature = "clap",
+        arg(
+            long,
+            value_name = "FILE",
+            requires = "tls_client_ca_certs",
+            env = "TUNWARD_TLS_CLIENT_CRL",
+            verbatim_doc_comment
+        )
+    )]
+    pub tls_client_crl: Option<PathBuf>,
+
+    /// Certificates of the client chain that --tls-client-crl is checked against: chain (the
+    /// client certificate and its intermediate CAs) or end-entity (the client certificate only).
+    #[cfg_attr(
+        feature = "clap",
+        arg(
+            long,
+            value_name = "SCOPE",
+            default_value = "chain",
+            requires = "tls_client_crl",
+            env = "TUNWARD_TLS_CLIENT_CRL_SCOPE",
+            verbatim_doc_comment
+        )
+    )]
+    pub tls_client_crl_scope: ClientCrlScope,
+
+    /// Keep accepting clients against a CRL past its nextUpdate time. By default an expired CRL
+    /// fails the handshakes it is needed for until a current one is loaded.
+    #[cfg_attr(
+        feature = "clap",
+        arg(
+            long,
+            default_value = "false",
+            requires = "tls_client_crl",
+            env = "TUNWARD_TLS_CLIENT_CRL_ALLOW_EXPIRED",
+            verbatim_doc_comment
+        )
+    )]
+    pub tls_client_crl_allow_expired: bool,
 
     /// [Optional] Field in the client certificate used to identify the client during mTLS authentication.
     /// Choices: cn, san-uri, san-dns. Default is cn.

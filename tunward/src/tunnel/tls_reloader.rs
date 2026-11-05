@@ -94,6 +94,7 @@ struct TlsReloaderServerState {
     cert_path: Option<PathBuf>,
     key_path: Option<PathBuf>,
     client_ca_path: Option<PathBuf>,
+    client_crl_path: Option<PathBuf>,
 }
 
 impl TlsReloaderServerState {
@@ -130,6 +131,28 @@ impl TlsReloaderServerState {
             *client_certs.lock() = tls_certs;
             self.tls_reload_certificate.store(true, Ordering::Relaxed);
         }
+        // A CRL refused because its new CA was not loaded yet is accepted now.
+        if self.client_crl_path.is_some()
+            && let Err(err) = self.reload_client_crl()
+        {
+            warn!("Keeping the previous client CRLs after the client CAs changed: {err:#}");
+        }
+        Ok(())
+    }
+
+    /// Re-read the client CRLs from disk and swap them into the shared config. Sessions they
+    /// revoke are closed by the server, which watches the shared config.
+    fn reload_client_crl(&self) -> anyhow::Result<()> {
+        let (Some(tls), Some(path)) = (self.server_config.tls.as_ref(), &self.client_crl_path) else {
+            return Ok(());
+        };
+        let (Some(crls), Some(client_cas)) = (&tls.tls_client_crls, &tls.tls_client_ca_certificates) else {
+            return Ok(());
+        };
+        let client_cas = client_cas.lock().clone();
+        let loaded = tls::ClientCrls::load(path, &client_cas, tls.tls_client_crl_scope)?;
+        *crls.lock() = Arc::new(loaded);
+        self.tls_reload_certificate.store(true, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -187,18 +210,19 @@ impl TlsReloader {
     pub fn new_for_server(server_config: Arc<ServerConfig>) -> anyhow::Result<Self> {
         // Without a custom certificate, a custom key or client CAs there is nothing to watch. The
         // client CAs are watched with the embedded server certificate too.
-        let Some((cert_path, key_path, client_ca_path)) = server_config.tls.as_ref().map(|t| {
+        let Some((cert_path, key_path, client_ca_path, client_crl_path)) = server_config.tls.as_ref().map(|t| {
             (
                 t.tls_certificate_path.clone(),
                 t.tls_key_path.clone(),
                 t.tls_client_ca_certs_path.clone(),
+                t.tls_client_crl_path.clone(),
             )
         }) else {
             return Ok(Self {
                 state: TlsReloaderState::Empty,
             });
         };
-        if cert_path.is_none() && key_path.is_none() && client_ca_path.is_none() {
+        if cert_path.is_none() && key_path.is_none() && client_ca_path.is_none() && client_crl_path.is_none() {
             return Ok(Self {
                 state: TlsReloaderState::Empty,
             });
@@ -211,15 +235,21 @@ impl TlsReloader {
             cert_path,
             key_path,
             client_ca_path,
+            client_crl_path,
             server_config,
         });
 
         info!("Starting to watch the server TLS files for changes to reload them");
-        let paths = [&this.cert_path, &this.key_path, &this.client_ca_path]
-            .into_iter()
-            .flatten()
-            .map(PathBuf::as_path)
-            .collect::<Vec<_>>();
+        let paths = [
+            &this.cert_path,
+            &this.key_path,
+            &this.client_ca_path,
+            &this.client_crl_path,
+        ]
+        .into_iter()
+        .flatten()
+        .map(PathBuf::as_path)
+        .collect::<Vec<_>>();
 
         let (inotify, poll) = install_watchers(&paths, || {
             let this = Server(this.clone());
@@ -342,6 +372,12 @@ impl TlsReloader {
             && let Some(path) = event.paths.iter().find(|p| p.ends_with(client_ca_path))
         {
             handle_file_event(Server(this.clone()), &event, path, || this.reload_client_ca());
+        }
+
+        if let Some(client_crl_path) = &this.client_crl_path
+            && let Some(path) = event.paths.iter().find(|p| p.ends_with(client_crl_path))
+        {
+            handle_file_event(Server(this.clone()), &event, path, || this.reload_client_crl());
         }
     }
 

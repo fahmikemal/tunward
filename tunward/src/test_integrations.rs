@@ -114,6 +114,10 @@ fn embedded_tls() -> TlsServerConfig {
         tls_certificate_path: None,
         tls_key_path: None,
         tls_client_ca_certs_path: None,
+        tls_client_crls: None,
+        tls_client_crl_path: None,
+        tls_client_crl_scope: Default::default(),
+        tls_client_crl_allow_expired: false,
     }
 }
 

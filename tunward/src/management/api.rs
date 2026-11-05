@@ -121,6 +121,14 @@ async fn handle_request<B: hyper::body::Body>(req: Request<B>, registry: FleetRe
                 if health.inventory_healthy.unwrap_or(true) { 1 } else { 0 },
                 health.version,
             );
+            let mut metrics = metrics;
+            if let Some(next_update) = health.tls_client_crl_next_update {
+                metrics.push_str(&format!(
+                    "# HELP tunward_tls_client_crl_next_update_seconds Earliest nextUpdate of the client CRLs in force, as a Unix timestamp\n\
+                     # TYPE tunward_tls_client_crl_next_update_seconds gauge\n\
+                     tunward_tls_client_crl_next_update_seconds {next_update}\n"
+                ));
+            }
             plain_response(StatusCode::OK, "text/plain; version=0.0.4; charset=utf-8", metrics.into_bytes())
         }
         (&Method::GET, "/api/v1/clients") => {

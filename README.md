@@ -476,6 +476,9 @@ tunward server --help
 | `--tls-verify-certificate[=true\|false]` | Client verification defaults to true; keep enabled for deployments |
 | `--tls-certificate`, `--tls-private-key` | Server identity or client mTLS identity, depending on subcommand |
 | `--tls-client-ca-certs FILE` | Server trust bundle for client certificate authentication |
+| `--tls-client-crl FILE` | CRLs (DER, or PEM blocks) checked against client certificates during the handshake; reloaded on change, closing sessions of newly revoked certificates |
+| `--tls-client-crl-scope chain\|end-entity` | Certificates of the client chain the CRLs are checked against (default: `chain`) |
+| `--tls-client-crl-allow-expired` | Keep accepting clients against a CRL past its nextUpdate (default: such handshakes fail) |
 | `--tls-client-identity-field cn\|san-uri\|san-dns` | Client certificate identity extraction field (default: `cn`; supports SPIFFE/SAN) |
 | `--device-quota-config FILE` | Startup-loaded per-device quotas; requires mTLS and uses verified device identity |
 | `--no-device-quotas` | Explicitly disable default finite device resource limits under mTLS |

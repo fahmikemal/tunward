@@ -1,7 +1,12 @@
+mod crl;
 mod server;
 pub(crate) use server::validate_server_config;
 mod utils;
 
+pub use crl::ClientCrls;
+#[cfg(test)]
+pub(crate) use crl::tests::{TestCa, pem};
+pub(crate) use crl::{RevocationKeys, rfc3339};
 pub use server::connect;
 pub use server::load_certificates_from_pem;
 pub use server::load_private_key_from_file;

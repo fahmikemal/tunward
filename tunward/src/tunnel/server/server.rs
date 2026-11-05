@@ -1,10 +1,11 @@
-use crate::config::{ClientAddressHeader, ClientIdentityField};
+use crate::config::{ClientAddressHeader, ClientCrlScope, ClientIdentityField};
 use crate::executor::DefaultTokioExecutor;
 use crate::management::registry::{ConnectionLease, TunnelLease};
 use crate::protocols;
 use crate::protocols::dns::DnsResolver;
 use crate::protocols::tcp::{AcceptBackoff, LogLimiter};
 use crate::protocols::tls;
+use crate::protocols::tls::ClientCrls;
 use crate::quotas::{DeviceQuotaConfig, QuotaError, QuotaManager, QuotaSession, TunnelPermit};
 use crate::reload::{ReloadState, ServerReload};
 use crate::restrictions::config_reloader::RestrictionsRulesReloader;
@@ -64,6 +65,13 @@ pub struct TlsServerConfig {
     pub tls_certificate_path: Option<PathBuf>,
     pub tls_key_path: Option<PathBuf>,
     pub tls_client_ca_certs_path: Option<PathBuf>,
+    /// CRLs for client certificates; checked during handshakes, and against active sessions when
+    /// they change.
+    pub tls_client_crls: Option<Mutex<Arc<ClientCrls>>>,
+    pub tls_client_crl_path: Option<PathBuf>,
+    pub tls_client_crl_scope: ClientCrlScope,
+    /// Keep using a CRL past its nextUpdate instead of failing the handshakes that need it.
+    pub tls_client_crl_allow_expired: bool,
 }
 
 pub struct ServerConfig {
@@ -201,9 +209,7 @@ impl<E: crate::TokioExecutorRef> Server<E> {
             Some(manager) => manager.register(
                 path.as_deref()
                     .ok_or_else(|| anyhow!("verified device identity required"))?,
-                certificates
-                    .and_then(|certs| certs.first())
-                    .ok_or_else(|| anyhow!("verified client certificate required"))?,
+                certificates.ok_or_else(|| anyhow!("verified client certificate required"))?,
             )?,
         };
         let quota = match &self.quotas {
@@ -728,6 +734,24 @@ impl<E: crate::TokioExecutorRef> Server<E> {
         outcome
     }
 
+    /// With `--tls-client-crl`, check sessions against the client CRLs and keep doing so as they
+    /// change: the task closes the sessions a new CRL revokes and reports when one expires. Under
+    /// managed reload, a reload hands the server new CRLs instead of the TLS file watcher.
+    fn watch_client_crls(&mut self) -> Option<tokio::task::AbortHandle> {
+        let tls = self.config.tls.as_ref()?;
+        let crls = tls.tls_client_crls.as_ref()?.lock().clone();
+        let manager = self.revocations.get_or_insert_with(RevocationManager::empty).clone();
+        manager.enable_crls(tls.tls_client_crl_scope, !tls.tls_client_crl_allow_expired, crls);
+        if let Some(state) = &self.managed {
+            state.attach_revocations(manager.clone());
+        }
+        if let Some(registry) = &self.fleet_registry {
+            registry.attach_revocations(manager.clone());
+        }
+        let config = self.managed.is_none().then(|| self.config.clone());
+        Some(self.executor.spawn(watch_client_crls(manager, config)))
+    }
+
     pub async fn serve(mut self, restrictions: RestrictionsRules) -> anyhow::Result<()> {
         if let Some(path) = &self.config.tenant_config {
             anyhow::ensure!(
@@ -792,6 +816,9 @@ impl<E: crate::TokioExecutorRef> Server<E> {
             }
             None
         };
+        let _crl_watch = self
+            .watch_client_crls()
+            .map(|task| scopeguard::guard(task, |task| task.abort()));
         info!("Starting tunward server listening on {}", self.config.bind);
 
         // setup upgrade request handler
@@ -1204,6 +1231,46 @@ where
         }
     }
     Err(last_error)
+}
+
+/// Apply the client CRLs the TLS file watcher loads, when `config` is given, and report when
+/// the CRLs in force pass their next update or are replaced by current ones.
+async fn watch_client_crls(manager: RevocationManager, config: Option<Arc<ServerConfig>>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut expired = false;
+    loop {
+        tick.tick().await;
+        if let Some(crls) = config
+            .as_ref()
+            .and_then(|config| config.tls.as_ref())
+            .and_then(|tls| tls.tls_client_crls.as_ref())
+        {
+            let crls = crls.lock().clone();
+            manager.apply_crls(crls);
+        }
+        let Some(crls) = manager.crls() else {
+            return;
+        };
+        let now = std::time::SystemTime::now();
+        match (expired, crls.expired_at(now)) {
+            (false, true) => {
+                let next_update = crls.next_update().map_or_else(|| "none".into(), tls::rfc3339);
+                if manager.crl_health().is_some_and(|health| health.enforced_expiry) {
+                    error!(
+                        "A client CRL passed its next update ({next_update}): handshakes that need it fail until a current CRL is loaded"
+                    );
+                } else {
+                    warn!(
+                        "A client CRL passed its next update ({next_update}); it stays in use under --tls-client-crl-allow-expired"
+                    );
+                }
+            }
+            (true, false) => info!("The client CRLs in force are current again"),
+            _ => {}
+        }
+        expired = crls.expired_at(now);
+    }
 }
 
 struct TlsContext<'a> {

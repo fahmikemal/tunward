@@ -1,5 +1,6 @@
 use super::devices::{DevicePage, DeviceRecord, Observation};
 use super::inventory::Inventory;
+use crate::revocation::RevocationManager;
 use ahash::AHashMap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -71,6 +72,15 @@ pub struct HealthStats {
     pub active_devices: usize,
     pub inventory_enabled: bool,
     pub inventory_healthy: Option<bool>,
+    /// Whether `--tls-client-crl` is set.
+    #[serde(default)]
+    pub tls_client_crl_enabled: bool,
+    /// The earliest nextUpdate of the client CRLs in force, in seconds since the Unix epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_client_crl_next_update: Option<u64>,
+    /// Whether a client CRL in force is past its nextUpdate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_client_crl_expired: Option<bool>,
 }
 
 #[derive(Clone)]
@@ -79,6 +89,7 @@ pub struct FleetRegistry {
     sessions: Arc<RwLock<AHashMap<String, SessionRecord>>>,
     connections: Arc<RwLock<AHashMap<String, ConnectionRecord>>>,
     inventory: Arc<OnceLock<Inventory>>,
+    revocations: Arc<OnceLock<RevocationManager>>,
     start_time: SystemTime,
 }
 
@@ -89,6 +100,7 @@ impl Default for FleetRegistry {
             sessions: Arc::new(RwLock::new(AHashMap::new())),
             connections: Arc::default(),
             inventory: Arc::default(),
+            revocations: Arc::default(),
             start_time: SystemTime::now(),
         }
     }
@@ -197,8 +209,16 @@ impl FleetRegistry {
         let active_clients = self.clients.read().len();
         let active_sessions = self.sessions.read().len();
         let inventory_healthy = self.inventory.get().map(Inventory::healthy);
+        let crl = self.revocations.get().and_then(RevocationManager::crl_health);
+        let now = SystemTime::now();
+        let crl_expired = crl
+            .as_ref()
+            .map(|crl| crl.next_update.is_some_and(|next_update| now > next_update));
+        // An expired CRL that is enforced fails the handshakes that need it, as new connections
+        // fail while the inventory cannot commit.
+        let crl_refusing = crl_expired == Some(true) && crl.as_ref().is_some_and(|crl| crl.enforced_expiry);
         HealthStats {
-            status: if inventory_healthy == Some(false) {
+            status: if inventory_healthy == Some(false) || crl_refusing {
                 "degraded"
             } else {
                 "healthy"
@@ -218,11 +238,22 @@ impl FleetRegistry {
                 .len(),
             inventory_enabled: self.inventory.get().is_some(),
             inventory_healthy,
+            tls_client_crl_enabled: crl.is_some(),
+            tls_client_crl_next_update: crl
+                .and_then(|crl| crl.next_update)
+                .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .map(|elapsed| elapsed.as_secs()),
+            tls_client_crl_expired: crl_expired,
         }
     }
 
     pub fn list_connections(&self) -> Vec<ConnectionRecord> {
         self.connections.read().values().cloned().collect()
+    }
+
+    /// Report the client CRLs the manager checks sessions against in `/healthz`.
+    pub(crate) fn attach_revocations(&self, manager: RevocationManager) {
+        let _ = self.revocations.set(manager);
     }
 
     pub(crate) async fn attach_inventory(&self, path: PathBuf, capacity: NonZeroU32) -> anyhow::Result<()> {
@@ -458,6 +489,46 @@ impl Drop for ListenerLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_enforced_expired_client_crl_degrades_health() {
+        crate::tunnel::ca_reloader::SystemCaReloader::init_crypto_provider();
+        let ca = crate::protocols::tls::TestCa::new("CA");
+        let crls = |valid_for| {
+            Arc::new(crate::protocols::tls::ClientCrls::parse(ca.crl(&[], valid_for).as_ref(), &[ca.der()]).unwrap())
+        };
+        let health = |enforce, valid_for| {
+            let registry = FleetRegistry::new();
+            let manager = RevocationManager::empty();
+            manager.enable_crls(crate::config::ClientCrlScope::Chain, enforce, crls(valid_for));
+            registry.attach_revocations(manager);
+            registry.health()
+        };
+
+        let current = health(true, time::Duration::days(1));
+        assert_eq!(current.status, "healthy");
+        assert!(current.tls_client_crl_enabled);
+        assert_eq!(current.tls_client_crl_expired, Some(false));
+        let next_update = current.tls_client_crl_next_update.unwrap();
+        let in_a_day = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 86400;
+        assert!(next_update.abs_diff(in_a_day) < 60, "{next_update}");
+
+        let expired = health(true, -time::Duration::minutes(5));
+        assert_eq!((expired.status, expired.tls_client_crl_expired), ("degraded", Some(true)));
+        // --tls-client-crl-allow-expired keeps the handshakes, so the server stays healthy.
+        let allowed = health(false, -time::Duration::minutes(5));
+        assert_eq!((allowed.status, allowed.tls_client_crl_expired), ("healthy", Some(true)));
+
+        let disabled = FleetRegistry::new().health();
+        assert!(!disabled.tls_client_crl_enabled);
+        assert_eq!(disabled.tls_client_crl_next_update, None);
+        let json = serde_json::to_value(&disabled).unwrap();
+        assert!(json.get("tls_client_crl_next_update").is_none());
+    }
 
     #[tokio::test]
     async fn leases_separate_verified_identity_from_shared_labels_and_drop_once() {

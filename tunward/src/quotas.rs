@@ -545,6 +545,7 @@ mod tests {
             device_quotas: Some(Arc::new(config)),
             tcp_tls: None,
             quic_tls: None,
+            client_crls: None,
         };
         let source = Arc::new(ArcSwap::from_pointee(snapshot));
         (QuotaManager::live(source.clone()), source)

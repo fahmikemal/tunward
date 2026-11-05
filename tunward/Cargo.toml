@@ -103,6 +103,7 @@ aws-lc-rs = [
   "hickory-resolver/tls-aws-lc-rs",
   "hickory-resolver/https-aws-lc-rs",
   "web-transport-quinn/aws-lc-rs",
+  "x509-parser/verify-aws",
 ]
 aws-lc-rs-bindgen = ["dep:aws-lc-rs", "aws-lc-rs/bindgen"]
 ring = [
@@ -111,4 +112,5 @@ ring = [
   "hickory-resolver/tls-ring",
   "hickory-resolver/https-ring",
   "web-transport-quinn/ring",
+  "x509-parser/verify",
 ]

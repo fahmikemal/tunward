@@ -102,6 +102,10 @@ pub(crate) fn load_server_files(args: &ServerCreationRequest) -> anyhow::Result<
         args.tls_certificate.is_some() == args.tls_private_key.is_some(),
         "--tls-certificate and --tls-private-key must be supplied together"
     );
+    ensure!(
+        args.tls_client_crl.is_none() || mtls_configured,
+        "--tls-client-crl requires TLS and --tls-client-ca-certs"
+    );
 
     let is_loopback = is_loopback_host(&args.remote_addr);
     if !is_loopback && !args.allow_insecure_dev {
@@ -144,6 +148,14 @@ pub(crate) fn load_server_files(args: &ServerCreationRequest) -> anyhow::Result<
                     .with_context(|| format!("Cannot load client CA {}", path.display()))
             })
             .transpose()?;
+        let client_crls = match (&args.tls_client_crl, &client_ca) {
+            (Some(path), Some(client_ca)) => Some(Mutex::new(Arc::new(tls::ClientCrls::load(
+                path,
+                &client_ca.lock(),
+                args.tls_client_crl_scope,
+            )?))),
+            _ => None,
+        };
         let config = TlsServerConfig {
             tls_certificate: Mutex::new(certificates),
             tls_key: Mutex::new(key),
@@ -151,6 +163,10 @@ pub(crate) fn load_server_files(args: &ServerCreationRequest) -> anyhow::Result<
             tls_certificate_path: args.tls_certificate.clone(),
             tls_key_path: args.tls_private_key.clone(),
             tls_client_ca_certs_path: args.tls_client_ca_certs.clone(),
+            tls_client_crls: client_crls,
+            tls_client_crl_path: args.tls_client_crl.clone(),
+            tls_client_crl_scope: args.tls_client_crl_scope,
+            tls_client_crl_allow_expired: args.tls_client_crl_allow_expired,
         };
         tls::validate_server_config(&config, args.enable_webtransport || args.remote_addr.scheme() == "wts")
             .context("Invalid server TLS identity or client trust bundle")?;
@@ -265,6 +281,9 @@ mod tests {
             tls_certificate: None,
             tls_private_key: None,
             tls_client_ca_certs: None,
+            tls_client_crl: None,
+            tls_client_crl_scope: Default::default(),
+            tls_client_crl_allow_expired: false,
             http_proxy: None,
             http_proxy_login: None,
             http_proxy_password: None,
@@ -373,6 +392,46 @@ mod tests {
         let pem = format!("-----BEGIN CERTIFICATE-----\n{b64}\n-----END CERTIFICATE-----\n");
         std::fs::write(&path, pem).unwrap();
         path
+    }
+
+    #[test]
+    fn a_client_crl_is_loaded_with_its_ca_and_checked_at_startup() {
+        crate::tunnel::ca_reloader::SystemCaReloader::init_crypto_provider();
+        let directory = std::env::temp_dir().join(format!("tunward-crl-config-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let ca = crate::protocols::tls::TestCa::new("CA");
+        let ca_path = directory.join("ca.pem");
+        std::fs::write(&ca_path, crate::protocols::tls::pem("CERTIFICATE", &ca.der())).unwrap();
+        let crl_path = directory.join("crl.der");
+        std::fs::write(&crl_path, ca.crl(&[3], time::Duration::days(1))).unwrap();
+
+        let mut req = sample_server_request("wss://127.0.0.1:8080");
+        req.tls_client_ca_certs = Some(ca_path.clone());
+        req.tls_client_crl = Some(crl_path.clone());
+        req.tls_client_crl_scope = crate::config::ClientCrlScope::EndEntity;
+        let files = load_server_files(&req).expect("valid CRL");
+        let tls = files.tls.unwrap();
+        assert_eq!(tls.tls_client_crls.unwrap().lock().ders().len(), 1);
+        assert_eq!(tls.tls_client_crl_path.as_deref(), Some(crl_path.as_path()));
+        assert_eq!(tls.tls_client_crl_scope, crate::config::ClientCrlScope::EndEntity);
+
+        // A CRL from another CA of the same name, as after a CA key was replaced.
+        std::fs::write(
+            &crl_path,
+            crate::protocols::tls::TestCa::new("CA").crl(&[], time::Duration::days(1)),
+        )
+        .unwrap();
+        let error = format!("{:#}", check_server_config(&req).unwrap_err());
+        assert!(error.contains("is not signed by the client CA of that name"), "{error}");
+
+        // Without client CAs there is nothing for a CRL to apply to.
+        req.tls_client_ca_certs = None;
+        let error = check_server_config(&req).unwrap_err().to_string();
+        assert!(
+            error.contains("--tls-client-crl requires TLS and --tls-client-ca-certs"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]

@@ -2,9 +2,10 @@
 use crate::config::ServerCreationRequest;
 use crate::management::registry::{ConnectionLease, WeakConnectionLease};
 use crate::protocols::tls;
+use crate::protocols::tls::ClientCrls;
 use crate::quotas::DeviceQuotaConfig;
 use crate::restrictions::types::RestrictionsRules;
-use crate::revocation::{RevocationGuard, WeakRevocationGuard};
+use crate::revocation::{RevocationGuard, RevocationManager, WeakRevocationGuard};
 use crate::server_config::{ServerConfigFiles, load_server_files};
 use crate::tenants::{TenantAccess, TenantPolicy};
 use crate::tunnel::transport::webtransport::mk_transport_config;
@@ -12,7 +13,7 @@ use anyhow::{Context, anyhow, ensure};
 use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio_rustls::TlsAcceptor;
@@ -76,6 +77,8 @@ pub(crate) struct ReloadSnapshot {
     pub device_quotas: Option<Arc<DeviceQuotaConfig>>,
     pub tcp_tls: Option<Arc<TlsAcceptor>>,
     pub quic_tls: Option<quinn::ServerConfig>,
+    /// The client CRLs the TLS configs above check, for the sessions they revoke.
+    pub client_crls: Option<Arc<ClientCrls>>,
 }
 
 impl ReloadSnapshot {
@@ -98,6 +101,11 @@ impl ReloadSnapshot {
         } else {
             None
         };
+        let client_crls = files
+            .tls
+            .as_ref()
+            .and_then(|tls| tls.tls_client_crls.as_ref())
+            .map(|crls| crls.lock().clone());
         Ok(Self {
             generation,
             restrictions: Arc::new(files.restrictions.clone()),
@@ -105,6 +113,7 @@ impl ReloadSnapshot {
             device_quotas: files.device_quotas.clone().map(Arc::new),
             tcp_tls,
             quic_tls,
+            client_crls,
         })
     }
 }
@@ -122,6 +131,7 @@ pub(crate) struct ReloadState {
     sessions: Mutex<Vec<ReloadSession>>,
     endpoint: Mutex<Option<quinn::Endpoint>>,
     gate: RwLock<()>,
+    revocations: OnceLock<RevocationManager>,
 }
 
 impl ReloadState {
@@ -132,7 +142,13 @@ impl ReloadState {
             sessions: Mutex::new(Vec::new()),
             endpoint: Mutex::new(None),
             gate: RwLock::new(()),
+            revocations: OnceLock::new(),
         }
+    }
+
+    /// Sessions the client CRLs of each new generation are checked against.
+    pub fn attach_revocations(&self, manager: RevocationManager) {
+        let _ = self.revocations.set(manager);
     }
 
     pub fn snapshot(&self) -> Arc<ReloadSnapshot> {
@@ -259,6 +275,9 @@ impl ReloadState {
             }
             true
         });
+        if let (Some(manager), Some(crls)) = (self.revocations.get(), &active.client_crls) {
+            disconnected_sessions += manager.apply_crls(crls.clone());
+        }
         Ok(ReloadStatus {
             generation: active.generation,
             disconnected_sessions,

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 
+use crate::config::ClientCrlScope;
 use crate::tunnel::client::ClientConfig;
 use crate::tunnel::server::TlsServerConfig;
 use crate::tunnel::transport::TransportAddr;
@@ -151,7 +152,17 @@ fn client_cert_verifier(tls_cfg: &TlsServerConfig) -> anyhow::Result<Arc<dyn Cli
             .with_context(|| "Failed to add mTLS client CA certificate")?;
     }
 
-    WebPkiClientVerifier::builder(Arc::new(root_store))
+    let mut builder = WebPkiClientVerifier::builder(Arc::new(root_store));
+    if let Some(crls) = &tls_cfg.tls_client_crls {
+        builder = builder.with_crls(crls.lock().ders().iter().cloned());
+        if tls_cfg.tls_client_crl_scope == ClientCrlScope::EndEntity {
+            builder = builder.only_check_end_entity_revocation();
+        }
+        if !tls_cfg.tls_client_crl_allow_expired {
+            builder = builder.enforce_revocation_expiration();
+        }
+    }
+    builder
         .build()
         .map_err(|err| anyhow!("Failed to build mTLS client verifier: {err:?}"))
 }
@@ -371,6 +382,114 @@ mod tests {
             };
             assert_eq!(kind, expected, "{label}");
             assert_eq!(key.secret_der(), der.as_slice(), "{label}");
+        }
+    }
+
+    mod client_crls {
+        use super::*;
+        use crate::config::ClientCrlScope;
+        use crate::protocols::tls::{ClientCrls, TestCa, pem};
+        use crate::tunnel::server::TlsServerConfig;
+        use parking_lot::Mutex;
+        use tokio_rustls::rustls::pki_types::CertificateRevocationListDer;
+
+        fn day() -> time::Duration {
+            time::Duration::days(1)
+        }
+
+        /// The embedded server certificate, trusting `cas` for clients and checking `crls`.
+        fn mtls(
+            cas: &[&TestCa],
+            crls: &[CertificateRevocationListDer<'static>],
+            scope: ClientCrlScope,
+            allow_expired: bool,
+        ) -> TlsServerConfig {
+            crate::tunnel::ca_reloader::SystemCaReloader::init_crypto_provider();
+            let cas = cas.iter().map(|ca| ca.der()).collect::<Vec<_>>();
+            let file = crls.iter().map(|crl| pem("X509 CRL", crl)).collect::<String>();
+            let crls = ClientCrls::parse(file.as_bytes(), &cas).unwrap();
+            TlsServerConfig {
+                tls_certificate: Mutex::new(crate::embedded_certificate::TLS_CERTIFICATE.0.clone()),
+                tls_key: Mutex::new(crate::embedded_certificate::TLS_CERTIFICATE.1.clone_key()),
+                tls_client_ca_certificates: Some(Mutex::new(cas)),
+                tls_certificate_path: None,
+                tls_key_path: None,
+                tls_client_ca_certs_path: None,
+                tls_client_crls: Some(Mutex::new(Arc::new(crls))),
+                tls_client_crl_path: None,
+                tls_client_crl_scope: scope,
+                tls_client_crl_allow_expired: allow_expired,
+            }
+        }
+
+        /// The server's verdict on a client presenting `chain`: `Ok` if the handshake completes.
+        async fn handshake(
+            tls: &TlsServerConfig,
+            chain: Vec<CertificateDer<'static>>,
+            key: PrivateKeyDer<'static>,
+        ) -> Result<(), String> {
+            let acceptor = tls_acceptor(tls, None).unwrap();
+            let connector = tls_connector(false, vec![], true, None, Some(chain), Some(key)).unwrap();
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            let server = tokio::spawn(async move { acceptor.accept(server_io).await.map(drop) });
+            let name = ServerName::try_from("localhost").unwrap();
+            // Under TLS 1.3 the client finishes before the server checks its certificate.
+            let _client = connector.connect(name, client_io).await;
+            server.await.unwrap().map_err(|err| err.to_string())
+        }
+
+        #[tokio::test]
+        async fn a_revoked_client_certificate_fails_the_handshake() {
+            let ca = TestCa::new("CA");
+            let tls = mtls(&[&ca], &[ca.crl(&[2], day())], ClientCrlScope::Chain, false);
+            let (valid, valid_key) = ca.client_identity("valid", 1);
+            let (revoked, revoked_key) = ca.client_identity("revoked", 2);
+            assert_eq!(handshake(&tls, vec![valid], valid_key).await, Ok(()));
+            let error = handshake(&tls, vec![revoked], revoked_key).await.unwrap_err();
+            assert!(error.contains("Revoked"), "{error}");
+            // The WebTransport listener builds its config with the same CRLs.
+            quic_server_config(&tls).unwrap();
+        }
+
+        #[tokio::test]
+        async fn a_ca_without_a_crl_has_its_clients_refused() {
+            let (listed, unlisted) = (TestCa::new("Listed"), TestCa::new("Unlisted"));
+            let tls = mtls(&[&listed, &unlisted], &[listed.crl(&[], day())], ClientCrlScope::Chain, false);
+            let (certificate, key) = unlisted.client_identity("device", 1);
+            let error = handshake(&tls, vec![certificate], key).await.unwrap_err();
+            assert!(error.contains("UnknownRevocationStatus"), "{error}");
+        }
+
+        #[tokio::test]
+        async fn an_expired_crl_refuses_clients_unless_allowed() {
+            let ca = TestCa::new("CA");
+            let expired = [ca.crl(&[], -time::Duration::minutes(5))];
+            let (certificate, key) = ca.client_identity("device", 1);
+            let refused = mtls(&[&ca], &expired, ClientCrlScope::Chain, false);
+            let error = handshake(&refused, vec![certificate.clone()], key.clone_key())
+                .await
+                .unwrap_err();
+            assert!(error.contains("certificate revocation list expired"), "{error}");
+            let allowed = mtls(&[&ca], &expired, ClientCrlScope::Chain, true);
+            assert_eq!(handshake(&allowed, vec![certificate], key).await, Ok(()));
+        }
+
+        #[tokio::test]
+        async fn the_scope_decides_whether_a_revoked_intermediate_counts() {
+            let root = TestCa::new("Root");
+            let intermediate = TestCa::issued_by("Intermediate", Some((&root, 40)));
+            let crls = [root.crl(&[40], day()), intermediate.crl(&[], day())];
+            let (certificate, key) = intermediate.client_identity("device", 1);
+            let chain = vec![certificate, intermediate.der()];
+
+            let chain_scope = mtls(&[&root], &crls, ClientCrlScope::Chain, false);
+            let error = handshake(&chain_scope, chain.clone(), key.clone_key())
+                .await
+                .unwrap_err();
+            assert!(error.contains("Revoked"), "{error}");
+            // The root needs no CRL when only client certificates are checked.
+            let end_entity = mtls(&[&root], &crls[1..], ClientCrlScope::EndEntity, false);
+            assert_eq!(handshake(&end_entity, chain, key).await, Ok(()));
         }
     }
 
