@@ -40,7 +40,7 @@ class TrustBoundaryChecks:
         return (self.suite.out / f"{label}.log").read_text(errors="replace")
 
     async def forwarded_for(self):
-        """A spoofed X-Forwarded-For reaches the target's PROXY v2 header only through a trusted proxy."""
+        """A spoofed address reaches the target's PROXY v2 header only in the chosen header of a trusted proxy."""
         sources = asyncio.Queue()
 
         async def target(reader, writer):
@@ -59,18 +59,28 @@ class TrustBoundaryChecks:
         target_port = server.sockets[0].getsockname()[1]
         rules = self.policy("forward", f"      - !Tunnel {{protocol: [Tcp], port: ['{target_port}'], cidr: [127.0.0.1/32]}}\n")
         observed = {}
+        trust = ["--trusted-proxy", "127.0.0.1"]
+        trust_forwarded = [*trust, "--trusted-proxy-header", "forwarded"]
+        xff = f"X-Forwarded-For: {SPOOFED}"
+        forwarded = f"Forwarded: for={SPOOFED};proto=https"
+        cases = (("untrusted", [], xff, "127.0.0.1"),
+                 ("untrusted-forwarded", ["--trusted-proxy-header", "forwarded"], forwarded, "127.0.0.1"),
+                 ("xff", trust, xff, SPOOFED),
+                 ("forwarded", trust_forwarded, forwarded, SPOOFED),
+                 # A proxy writes the chosen header, so the client could set the other one itself.
+                 ("xff-chosen-forwarded-sent", trust, forwarded, "127.0.0.1"),
+                 ("forwarded-chosen-xff-sent", trust_forwarded, xff, "127.0.0.1"))
         try:
-            for trusted, expected in ((None, "127.0.0.1"), ("127.0.0.1", SPOOFED)):
+            for case, extra, sent, expected in cases:
                 sp = port()
-                extra = ["--trusted-proxy", trusted] if trusted else []
-                srv = await self.suite.spawn(f"xff-server-{trusted or 'none'}", "server", f"wss://127.0.0.1:{sp}",
+                srv = await self.suite.spawn(f"xff-server-{case}", "server", f"wss://127.0.0.1:{sp}",
                                              *self.server_tls(), "--restrict-config", rules, "--enable-webtransport", *extra)
                 await self.suite.ready(sp, srv)
                 for scheme in ("wss", "https", "wts"):
                     lp = port()
-                    cli = await self.suite.spawn(f"xff-client-{trusted or 'none'}-{scheme}", "client",
+                    cli = await self.suite.spawn(f"xff-client-{case}-{scheme}", "client",
                                                  "-L", f"tcp://127.0.0.1:{lp}:127.0.0.1:{target_port}?proxy_protocol",
-                                                 "-H", f"X-Forwarded-For: {SPOOFED}", *self.client_tls(),
+                                                 "-H", sent, *self.client_tls(),
                                                  f"{scheme}://127.0.0.1:{sp}", extra_env=self.ca)
                     try:
                         await self.suite.ready(lp, cli)
@@ -85,8 +95,8 @@ class TrustBoundaryChecks:
                         await close(writer)
                     finally:
                         await self.suite.stop(cli)
-                    observed[f"{scheme}/trusted={trusted or 'none'}"] = source
-                    assert source == expected, f"{scheme} trusted={trusted}: PROXY v2 source {source}, expected {expected}"
+                    observed[f"{scheme}/{case}"] = source
+                    assert source == expected, f"{scheme} {case}: PROXY v2 source {source}, expected {expected}"
                 await self.suite.stop(srv)
         finally:
             server.close()

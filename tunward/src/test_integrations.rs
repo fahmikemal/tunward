@@ -1,4 +1,4 @@
-use crate::config::ClientIdentityField;
+use crate::config::{ClientAddressHeader, ClientIdentityField};
 use crate::embedded_certificate;
 use crate::executor::DefaultTokioExecutor;
 use crate::protocols;
@@ -101,6 +101,7 @@ fn server_config(dns_resolver: DnsResolver) -> ServerConfig {
         tls_handshake_timeout: Duration::from_secs(10),
         max_pending_tls_handshakes: std::num::NonZeroU32::new(1024).unwrap(),
         trusted_proxies: vec![],
+        trusted_proxy_header: ClientAddressHeader::default(),
     }
 }
 
@@ -248,20 +249,53 @@ fn no_restrictions() -> RestrictionsRules {
 }
 
 #[rstest]
-#[case::untrusted_peer(vec![], Ipv4Addr::LOCALHOST)]
-#[case::trusted_peer(vec!["127.0.0.1/32".parse().unwrap()], Ipv4Addr::new(203, 0, 113, 9))]
+#[case::untrusted_peer(vec![], ClientAddressHeader::XForwardedFor, "x-forwarded-for", "203.0.113.9", Ipv4Addr::LOCALHOST)]
+#[case::trusted_peer(
+    vec!["127.0.0.1/32".parse().unwrap()],
+    ClientAddressHeader::XForwardedFor,
+    "x-forwarded-for",
+    "203.0.113.9",
+    Ipv4Addr::new(203, 0, 113, 9)
+)]
+#[case::forwarded_from_untrusted_peer(vec![], ClientAddressHeader::Forwarded, "forwarded", "for=203.0.113.9", Ipv4Addr::LOCALHOST)]
+#[case::forwarded_from_trusted_peer(
+    vec!["127.0.0.1/32".parse().unwrap()],
+    ClientAddressHeader::Forwarded,
+    "forwarded",
+    "for=203.0.113.9;proto=https",
+    Ipv4Addr::new(203, 0, 113, 9)
+)]
+// A proxy writes one of the headers, so the client could set the other one itself.
+#[case::forwarded_while_x_forwarded_for_is_trusted(
+    vec!["127.0.0.1/32".parse().unwrap()],
+    ClientAddressHeader::XForwardedFor,
+    "forwarded",
+    "for=203.0.113.9",
+    Ipv4Addr::LOCALHOST
+)]
+#[case::x_forwarded_for_while_forwarded_is_trusted(
+    vec!["127.0.0.1/32".parse().unwrap()],
+    ClientAddressHeader::Forwarded,
+    "x-forwarded-for",
+    "203.0.113.9",
+    Ipv4Addr::LOCALHOST
+)]
 #[timeout(Duration::from_secs(10))]
 #[tokio::test]
 #[serial]
-async fn test_proxy_protocol_source_trusts_x_forwarded_for_only_from_trusted_proxies(
+async fn test_proxy_protocol_source_trusts_the_chosen_header_only_from_trusted_proxies(
     no_restrictions: RestrictionsRules,
     dns_resolver: DnsResolver,
     #[case] trusted_proxies: Vec<IpNet>,
+    #[case] trusted_proxy_header: ClientAddressHeader,
+    #[case] sent_header: &'static str,
+    #[case] sent_value: &'static str,
     #[case] expected_source: Ipv4Addr,
 ) {
     let server = Server::new(
         ServerConfig {
             trusted_proxies,
+            trusted_proxy_header,
             ..server_config(dns_resolver.clone())
         },
         DefaultTokioExecutor::default(),
@@ -272,10 +306,9 @@ async fn test_proxy_protocol_source_trusts_x_forwarded_for_only_from_trusted_pro
 
     // The client claims an address it does not have.
     let mut config = (*client_ws(server_port, dns_resolver.clone()).await.config).clone();
-    config.http_headers.insert(
-        HeaderName::from_static("x-forwarded-for"),
-        HeaderValue::from_static("203.0.113.9"),
-    );
+    config
+        .http_headers
+        .insert(HeaderName::from_static(sent_header), HeaderValue::from_static(sent_value));
     let client = Client::new(
         config,
         1,
@@ -997,6 +1030,7 @@ async fn test_fleet_management_and_ephemeral_reverse_tunnel(
         tls_handshake_timeout: Duration::from_secs(10),
         max_pending_tls_handshakes: std::num::NonZeroU32::new(1024).unwrap(),
         trusted_proxies: vec![],
+        trusted_proxy_header: ClientAddressHeader::default(),
     };
     let server = Server::new(server_config, DefaultTokioExecutor::default());
     let server_port = server.config.bind.port();
