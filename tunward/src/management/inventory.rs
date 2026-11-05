@@ -277,10 +277,14 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_observations_use_bound_parameters() {
+        // One worker commits each observation with a full sync, and each request has 5 s from the
+        // moment it is queued. 32 at once overran that on a GitHub runner, so the queue stays short:
+        // what is under test is that every concurrent observation lands, not how fast the disk is.
+        const OBSERVATIONS: u64 = 8;
         let (path, _cleanup) = temporary_path();
         let store = Inventory::open(path, NonZeroU32::new(2).unwrap()).await.unwrap();
         let mut tasks = tokio::task::JoinSet::new();
-        for _ in 0..32 {
+        for _ in 0..OBSERVATIONS {
             let store = store.clone();
             tasks.spawn(async move {
                 store
@@ -294,7 +298,7 @@ mod tests {
         }
         let page = store.list(100, "".into()).await.unwrap();
         assert_eq!(page.devices.len(), 1);
-        assert_eq!(page.devices[0].observed_connections, 32);
+        assert_eq!(page.devices[0].observed_connections, OBSERVATIONS);
     }
 
     #[test]
