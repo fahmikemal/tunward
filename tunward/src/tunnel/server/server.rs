@@ -610,7 +610,7 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                 let listening_server = bind_reverse(bind, tenant, |candidate| {
                     let credentials = credentials.clone();
                     async move {
-                        let listener = Socks5DownstreamListener::new(candidate, timeout, credentials).await?;
+                        let listener = Socks5DownstreamListener::new(candidate, timeout, credentials, false).await?;
                         let bound = listener.bound_addr();
                         Ok((listener, bound))
                     }

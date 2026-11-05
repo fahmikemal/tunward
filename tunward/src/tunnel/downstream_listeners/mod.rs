@@ -89,7 +89,7 @@ mod tests {
         let mut udp = UdpDownstreamListener::new(any, (Host::Ipv4(Ipv4Addr::LOCALHOST), 0), None)
             .await
             .unwrap();
-        let socks = Socks5DownstreamListener::new(any, None, None).await.unwrap();
+        let socks = Socks5DownstreamListener::new(any, None, None, false).await.unwrap();
         let http = HttpProxyDownstreamListener::new(any, None, None, false).await.unwrap();
 
         let udp_bound = udp.bound_addr();

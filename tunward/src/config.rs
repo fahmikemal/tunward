@@ -94,6 +94,7 @@ pub struct ClientCreationRequest {
     ///
     /// 'socks5://[::1]:1212'            =>       listen locally with socks5 on port 1212 and forward dynamically requested tunnel
     /// 'socks5://[::1]:1212?login=admin&password=admin' => listen locally with socks5 on port 1212 and only accept connection with login=admin and password=admin
+    /// 'socks5://[::1]:1212?proxy_protocol' => listen locally with socks5 on port 1212, and start each connection to a destination with a PROXY protocol header
     ///
     /// 'http://[::1]:1212'              =>       start a http proxy on port 1212 and forward dynamically requested tunnel
     /// 'http://[::1]:1212?login=admin&password=admin' => start a http proxy on port 1212 and only accept connection with login=admin and password=admin
@@ -939,6 +940,7 @@ mod parsers {
                     local_protocol: LocalProtocol::Socks5 {
                         timeout: get_timeout(&options),
                         credentials: get_credentials(&options),
+                        proxy_protocol: get_proxy_protocol(&options),
                     },
                     local: local_bind,
                     remote: (dest_host, dest_port),
@@ -995,7 +997,11 @@ mod parsers {
         let local_protocol = match proto.local_protocol {
             LocalProtocol::Tcp { .. } => LocalProtocol::ReverseTcp {},
             LocalProtocol::Udp { timeout } => LocalProtocol::ReverseUdp { timeout },
-            LocalProtocol::Socks5 { timeout, credentials } => LocalProtocol::ReverseSocks5 { timeout, credentials },
+            LocalProtocol::Socks5 {
+                timeout,
+                credentials,
+                proxy_protocol: _proxy_protocol,
+            } => LocalProtocol::ReverseSocks5 { timeout, credentials },
             LocalProtocol::HttpProxy {
                 timeout,
                 credentials,
@@ -1166,6 +1172,17 @@ mod parsers {
         ; "with full ipv6 tunnel")]
         fn test_parse_tunnel_arg(input: &str) -> LocalToRemote {
             parse_tunnel_arg(input).unwrap()
+        }
+
+        #[test]
+        fn a_socks5_listener_uses_proxy_protocol_only_when_asked() {
+            let asked = |arg| match parse_tunnel_arg(arg).unwrap().local_protocol {
+                LocalProtocol::Socks5 { proxy_protocol, .. } => proxy_protocol,
+                other => panic!("{other:?}"),
+            };
+            assert!(asked("socks5://[::1]:1212?proxy_protocol"));
+            assert!(asked("socks5://[::1]:1212?login=admin&password=secret&proxy_protocol"));
+            assert!(!asked("socks5://[::1]:1212"));
         }
 
         #[test]

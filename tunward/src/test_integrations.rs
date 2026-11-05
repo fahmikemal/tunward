@@ -926,7 +926,9 @@ async fn test_socks5_tunnel(server_no_tls: Server, no_restrictions: Restrictions
 
     let client_ws = client_ws(server_port, dns_resolver.clone()).await;
 
-    let server = Socks5DownstreamListener::new(tunnel_listen, None, None).await.unwrap();
+    let server = Socks5DownstreamListener::new(tunnel_listen, None, None, false)
+        .await
+        .unwrap();
     tokio::spawn(async move {
         client_ws.run_tunnel(server).await.unwrap();
     });
@@ -959,6 +961,64 @@ async fn test_socks5_tunnel(server_no_tls: Server, no_restrictions: Restrictions
 }
 
 #[rstest]
+#[case::asked(true)]
+#[case::not_asked(false)]
+#[timeout(Duration::from_secs(10))]
+#[tokio::test]
+#[serial]
+async fn test_socks5_tunnel_starts_a_target_connection_with_proxy_protocol_only_when_asked(
+    server_no_tls: Server,
+    no_restrictions: RestrictionsRules,
+    dns_resolver: DnsResolver,
+    #[case] proxy_protocol: bool,
+) {
+    let (tunnel_listen, tunnel_host) = free_addr();
+    let (endpoint_listen, _endpoint_host) = free_addr();
+
+    let server_port = server_no_tls.config.bind.port();
+    let server_h = tokio::spawn(server_no_tls.serve(no_restrictions));
+    defer! { server_h.abort(); };
+
+    let client_ws = client_ws(server_port, dns_resolver.clone()).await;
+    let server = Socks5DownstreamListener::new(tunnel_listen, None, None, proxy_protocol)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        client_ws.run_tunnel(server).await.unwrap();
+    });
+
+    let target = TcpListener::bind(endpoint_listen).await.unwrap();
+    let mut client = protocols::tcp::connect(
+        &tunnel_host,
+        tunnel_listen.port(),
+        SoMark::new(None),
+        Duration::from_secs(10),
+        &dns_resolver,
+    )
+    .await
+    .unwrap();
+
+    let rep = socks5_handshake_connect(&mut client, Ipv4Addr::LOCALHOST, endpoint_listen.port()).await;
+    assert_eq!(rep, 0x00, "reply must be success once the tunnel is established");
+    client.write_all(b"ping").await.unwrap();
+
+    let (mut upstream, _) = target.accept().await.unwrap();
+    if proxy_protocol {
+        // A PROXY protocol v2 header with IPv4 addresses is 28 bytes.
+        let mut header = [0; 28];
+        upstream.read_exact(&mut header).await.unwrap();
+        let header = ppp::v2::Header::try_from(&header[..]).unwrap();
+        let ppp::v2::Addresses::IPv4(addresses) = header.addresses else {
+            panic!("expected IPv4 addresses, got {:?}", header.addresses);
+        };
+        assert_eq!(addresses.source_address, Ipv4Addr::LOCALHOST);
+    }
+    let mut payload = [0; 4];
+    upstream.read_exact(&mut payload).await.unwrap();
+    assert_eq!(&payload, b"ping");
+}
+
+#[rstest]
 #[timeout(Duration::from_secs(10))]
 #[tokio::test]
 #[serial]
@@ -977,7 +1037,9 @@ async fn test_socks5_tunnel_unreachable_target_replies_error(
 
     let client_ws = client_ws(server_port, dns_resolver.clone()).await;
 
-    let server = Socks5DownstreamListener::new(tunnel_listen, None, None).await.unwrap();
+    let server = Socks5DownstreamListener::new(tunnel_listen, None, None, false)
+        .await
+        .unwrap();
     tokio::spawn(async move {
         client_ws.run_tunnel(server).await.unwrap();
     });

@@ -71,6 +71,7 @@ pub enum Socks5Stream {
     Tcp {
         proto: Socks5ServerProtocol<TcpStream, CommandRead>,
         reply_addr: SocketAddr,
+        proxy_protocol: bool,
     },
     Udp((Socks5UdpStream, Socks5UdpStreamWriter)),
 }
@@ -78,7 +79,9 @@ pub enum Socks5Stream {
 impl Socks5Stream {
     pub fn local_protocol(&self) -> LocalProtocol {
         match self {
-            Self::Tcp { .. } => LocalProtocol::Tcp { proxy_protocol: false }, // TODO: Implement proxy protocol
+            Self::Tcp { proxy_protocol, .. } => LocalProtocol::Tcp {
+                proxy_protocol: *proxy_protocol,
+            },
             Self::Udp(s) => LocalProtocol::Udp {
                 timeout: s.0.watchdog_deadline.as_ref().map(|x| x.period()),
             },
@@ -87,7 +90,7 @@ impl Socks5Stream {
 
     pub fn into_split(self) -> (Socks5ReadHalf, Socks5WriteHalf) {
         match self {
-            Self::Tcp { proto, reply_addr } => {
+            Self::Tcp { proto, reply_addr, .. } => {
                 let (read_half_tx, rx) = oneshot::channel();
                 (
                     Socks5ReadHalf::TcpPending(Some(rx)),
@@ -158,6 +161,7 @@ pub async fn run_server(
     bind: SocketAddr,
     timeout: Option<Duration>,
     credentials: Option<(String, String)>,
+    proxy_protocol: bool,
 ) -> Result<Socks5Listener, anyhow::Error> {
     let listener = TcpListener::bind(bind)
         .await
@@ -182,7 +186,7 @@ pub async fn run_server(
                                 let tx = tx.clone();
                                 let credentials = credentials.clone();
                                 tasks.spawn(async move {
-                                    if let Err(err) = accept_client(socket, timeout, credentials, tx).await {
+                                    if let Err(err) = accept_client(socket, timeout, credentials, proxy_protocol, tx).await {
                                         warn!("SOCKS5 connection rejected: {err}");
                                     }
                                 });
@@ -206,6 +210,7 @@ async fn accept_client(
     socket: TcpStream,
     timeout: Option<Duration>,
     credentials: Option<(String, String)>,
+    proxy_protocol: bool,
     tx: tokio::sync::mpsc::Sender<AcceptedSocks>,
 ) -> anyhow::Result<()> {
     let peer = socket.peer_addr()?;
@@ -263,6 +268,7 @@ async fn accept_client(
             Socks5Stream::Tcp {
                 proto,
                 reply_addr: SocketAddr::new(local_ip, 0),
+                proxy_protocol,
             },
             dest,
         )))
@@ -371,7 +377,7 @@ mod tests {
 
     /// The destination the server reads from a CONNECT naming `address` (an ATYP and its bytes).
     async fn requested(address: &[u8]) -> (Host, u16) {
-        let mut listener = run_server(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0), None, None)
+        let mut listener = run_server(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0), None, None, false)
             .await
             .unwrap();
         let request = [&[5, 1, 0][..], address, &443u16.to_be_bytes()].concat();
