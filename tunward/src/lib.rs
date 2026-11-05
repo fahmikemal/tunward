@@ -479,8 +479,13 @@ async fn create_client_tunnels(
                     }
                 }
             }
-            LocalProtocol::Socks5 { timeout, credentials } => {
-                let server = Socks5DownstreamListener::new(tunnel.local, *timeout, credentials.clone()).await?;
+            LocalProtocol::Socks5 {
+                timeout,
+                credentials,
+                proxy_protocol,
+            } => {
+                let server =
+                    Socks5DownstreamListener::new(tunnel.local, *timeout, credentials.clone(), *proxy_protocol).await?;
                 spawn_tunnel! {
                     if let Err(err) = client.run_tunnel(server).await {
                         error!("{:?}", err);
@@ -570,7 +575,8 @@ async fn run_server_impl(
     }
     for net in args.trusted_proxies.iter().filter(|net| net.prefix_len() == 0) {
         tracing::warn!(
-            "--trusted-proxy {net} trusts X-Forwarded-For from every address: any client can then choose the address recorded for it and sent to targets in PROXY protocol headers"
+            "--trusted-proxy {net} trusts {} from every address: any client can then choose the address recorded for it and sent to targets in PROXY protocol headers",
+            args.trusted_proxy_header.as_str()
         );
     }
     let managed = reload
@@ -625,6 +631,7 @@ async fn run_server_impl(
         tls_handshake_timeout: args.tls_handshake_timeout,
         max_pending_tls_handshakes: args.max_pending_tls_handshakes,
         trusted_proxies: args.trusted_proxies,
+        trusted_proxy_header: args.trusted_proxy_header,
     };
     let mut server = Server::new(server_config, executor);
     if let (Some(state), Some(reload)) = (managed, reload) {

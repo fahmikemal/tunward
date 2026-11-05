@@ -1,4 +1,4 @@
-use crate::config::ClientIdentityField;
+use crate::config::{ClientAddressHeader, ClientIdentityField};
 use crate::executor::DefaultTokioExecutor;
 use crate::management::registry::{ConnectionLease, TunnelLease};
 use crate::protocols;
@@ -95,8 +95,10 @@ pub struct ServerConfig {
     /// Connections beyond it are closed on arrival, so peers that never authenticate cannot exhaust
     /// file descriptors or memory. Established sessions do not count.
     pub max_pending_tls_handshakes: std::num::NonZeroU32,
-    /// Reverse proxies whose X-Forwarded-For header names the client; empty trusts none.
+    /// Reverse proxies whose `trusted_proxy_header` names the client; empty trusts none.
     pub trusted_proxies: Vec<IpNet>,
+    /// The header those proxies name the client in. The other one is never read.
+    pub trusted_proxy_header: ClientAddressHeader,
 }
 
 #[derive(Clone, Default)]
@@ -283,18 +285,25 @@ impl<E: crate::TokioExecutorRef> Server<E> {
             None => restrict_path_prefix.admit_tunnel().map_err(quota_rejection)?,
         };
         // The client address reaches logs, fleet records and PROXY protocol headers sent to targets,
-        // so X-Forwarded-For only counts when a trusted proxy relayed the request.
-        match forwarded_client(client_addr.ip(), req.headers(), &self.config.trusted_proxies) {
+        // so the client address header only counts when a trusted proxy relayed the request.
+        let address_header = self.config.trusted_proxy_header;
+        match forwarded_client(client_addr.ip(), req.headers(), &self.config.trusted_proxies, address_header) {
             ForwardedFor::Client(ip) => {
                 info!("Client {ip} relayed by trusted proxy {client_addr}");
                 Span::current().record("forwarded_for", tracing::field::display(ip));
                 client_addr.set_ip(ip);
             }
             ForwardedFor::Untrusted => {
-                debug!("Ignoring X-Forwarded-For from {client_addr}, which is not a --trusted-proxy");
+                debug!(
+                    "Ignoring {} from {client_addr}, which is not a --trusted-proxy",
+                    address_header.as_str()
+                );
             }
             ForwardedFor::Malformed => {
-                warn!("Ignoring a malformed or oversized X-Forwarded-For relayed by trusted proxy {client_addr}");
+                warn!(
+                    "Ignoring a malformed, oversized or addressless {} relayed by trusted proxy {client_addr}",
+                    address_header.as_str()
+                );
             }
             ForwardedFor::Absent => {}
         }
@@ -601,7 +610,7 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                 let listening_server = bind_reverse(bind, tenant, |candidate| {
                     let credentials = credentials.clone();
                     async move {
-                        let listener = Socks5DownstreamListener::new(candidate, timeout, credentials).await?;
+                        let listener = Socks5DownstreamListener::new(candidate, timeout, credentials, false).await?;
                         let bound = listener.bound_addr();
                         Ok((listener, bound))
                     }

@@ -112,7 +112,7 @@ In accordance with enterprise secure defaults:
 - **Destination CIDRs also bind domain names**: A restriction rule whose `cidr` constrains addresses allows a domain destination only at its resolved addresses inside that CIDR, and the server connects to those checked addresses without resolving again. See [destination policy](docs/using_mtls.md#destination-and-reverse-listener-policy) for the exact matching rules and migration.
 - **Bounded unauthenticated connections**: A TLS handshake must complete within `--tls-handshake-timeout` (default 10s), and at most `--max-pending-tls-handshakes` (default 1024) may be in progress on the TCP listener, and separately on the WebTransport listener, where a connection stays pending until it sends its session request; further connections are closed or refused on arrival while established sessions keep forwarding. After resource errors such as file-descriptor exhaustion, every accept loop pauses briefly and rate-limits its warnings instead of spinning.
 - **Default resource limits**: When mTLS is enabled, finite baseline limits (32 sessions, 256 tunnels, 100 rps / 200 burst, 10 MB/s bandwidth shaping) are enforced per verified device to protect against unrestricted resource consumption (OWASP API4:2023). Operators can supply custom limits via `--device-quota-config` or opt out via `--no-device-quotas`. The limits are keyed on the verified device, so a listener without mTLS, such as a cleartext loopback development listener, has none; an mTLS listener has them on loopback too.
-- **Client addresses from trusted proxies only**: `X-Forwarded-For` is ignored unless the connection comes from a `--trusted-proxy`. The client address is then the rightmost entry that is not a trusted proxy, following MDN's guidance, since anything before it was written by the client. That address appears in logs and fleet records, and in the PROXY protocol v2 header that `?proxy_protocol` tunnels send to their target.
+- **Client addresses from trusted proxies only**: `X-Forwarded-For`, or `Forwarded` (RFC 7239) with `--trusted-proxy-header forwarded`, is ignored unless the connection comes from a `--trusted-proxy`, and the header not chosen is never read. The client address is then the rightmost entry that is not a trusted proxy, following MDN's guidance, since anything before it was written by the client. That address appears in logs and fleet records, and in the PROXY protocol v2 header that `?proxy_protocol` tunnels send to their target.
 - **Modern PKI & SPIFFE/SAN Identity Extraction**: Supports extracting verified client identities from X.509 Common Name (`cn`), Subject Alternative Name URI (`san-uri` / SPIFFE ID), or Subject Alternative Name DNS (`san-dns`), enabling native integration with modern service meshes, MDM platforms, and enterprise PKI standards.
 
 Run it as the service user, with the intended arguments, environment and file
@@ -343,7 +343,8 @@ certificate and restriction options.
 A reverse proxy must preserve the selected protocol and bidirectional streaming;
 buffering or an HTTP/2-to-HTTP/1 downgrade can break the tunnel. Pass its address
 with `--trusted-proxy` so the server takes the client address from its
-`X-Forwarded-For`; without that option the header is ignored. WebTransport
+`X-Forwarded-For`, or from its `Forwarded` with `--trusted-proxy-header forwarded`;
+without `--trusted-proxy` the header is ignored. WebTransport
 needs QUIC/UDP reachability. Its client races resolved addresses with a 250 ms
 stagger and at most four attempts in flight, within the connection timeout, so
 a stalled IPv6 route does not postpone every IPv4 attempt. Its current client rejects `--http-proxy`,
@@ -359,6 +360,7 @@ are argument examples to combine with your transport and TLS options.
 | `-L tcp://127.0.0.1:8088:127.0.0.1:3000` | Local TCP listener, destination reached from the server |
 | `-L udp://127.0.0.1:5353:127.0.0.1:53?timeout_sec=30` | Local UDP listener with inactivity timeout |
 | `-L socks5://127.0.0.1:1080` | Local SOCKS5 proxy; destinations remain subject to server restrictions |
+| `-L 'socks5://127.0.0.1:1080?proxy_protocol'` | The same, starting each TCP connection to a destination with a PROXY protocol v2 header |
 | `-L http://127.0.0.1:8082` | Local HTTP forward/CONNECT proxy |
 | `-L unix:///tmp/tunward.sock:127.0.0.1:3000` | Local Unix socket ingress |
 | `-L stdio://127.0.0.1:22` | Stdin/stdout ingress, useful in SSH ProxyCommand |
@@ -483,7 +485,8 @@ tunward server --help
 | `--allow-insecure-dev` | Explicit exception permitting cleartext or unauthenticated non-loopback listeners for local testing; emits security warnings |
 | `--tls-handshake-timeout DURATION` | Close a TLS connection whose handshake (for WebTransport, also its session request) has not completed in time; default 10s, must be nonzero |
 | `--max-pending-tls-handshakes N` | TLS handshakes allowed in progress at once, per TCP and WebTransport listener; excess connections are closed or refused; default 1024 |
-| `--trusted-proxy IP[/PREFIX]` | Reverse proxy whose `X-Forwarded-For` names the client; repeat or separate with commas; default none, so the header is ignored |
+| `--trusted-proxy IP[/PREFIX]` | Reverse proxy whose client address header names the client; repeat or separate with commas; default none, so the header is ignored |
+| `--trusted-proxy-header HEADER` | The header a `--trusted-proxy` names the client in: `x-forwarded-for` or `forwarded` (RFC 7239); the other one is never read; default `x-forwarded-for` |
 | `-c, --connection-min-idle N` | Idle pool setting, default 0; accepted range 0..1000; WebTransport clamps to one session |
 | `--connection-retry-max-backoff DURATION` | Pool acquisition deadline, default 5m, must be nonzero |
 | `--reverse-tunnel-connection-retry-max-backoff DURATION` | Reverse reconnect backoff ceiling, default 1s |

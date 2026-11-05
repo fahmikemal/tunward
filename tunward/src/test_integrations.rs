@@ -1,4 +1,4 @@
-use crate::config::ClientIdentityField;
+use crate::config::{ClientAddressHeader, ClientIdentityField};
 use crate::embedded_certificate;
 use crate::executor::DefaultTokioExecutor;
 use crate::protocols;
@@ -101,6 +101,7 @@ fn server_config(dns_resolver: DnsResolver) -> ServerConfig {
         tls_handshake_timeout: Duration::from_secs(10),
         max_pending_tls_handshakes: std::num::NonZeroU32::new(1024).unwrap(),
         trusted_proxies: vec![],
+        trusted_proxy_header: ClientAddressHeader::default(),
     }
 }
 
@@ -248,20 +249,53 @@ fn no_restrictions() -> RestrictionsRules {
 }
 
 #[rstest]
-#[case::untrusted_peer(vec![], Ipv4Addr::LOCALHOST)]
-#[case::trusted_peer(vec!["127.0.0.1/32".parse().unwrap()], Ipv4Addr::new(203, 0, 113, 9))]
+#[case::untrusted_peer(vec![], ClientAddressHeader::XForwardedFor, "x-forwarded-for", "203.0.113.9", Ipv4Addr::LOCALHOST)]
+#[case::trusted_peer(
+    vec!["127.0.0.1/32".parse().unwrap()],
+    ClientAddressHeader::XForwardedFor,
+    "x-forwarded-for",
+    "203.0.113.9",
+    Ipv4Addr::new(203, 0, 113, 9)
+)]
+#[case::forwarded_from_untrusted_peer(vec![], ClientAddressHeader::Forwarded, "forwarded", "for=203.0.113.9", Ipv4Addr::LOCALHOST)]
+#[case::forwarded_from_trusted_peer(
+    vec!["127.0.0.1/32".parse().unwrap()],
+    ClientAddressHeader::Forwarded,
+    "forwarded",
+    "for=203.0.113.9;proto=https",
+    Ipv4Addr::new(203, 0, 113, 9)
+)]
+// A proxy writes one of the headers, so the client could set the other one itself.
+#[case::forwarded_while_x_forwarded_for_is_trusted(
+    vec!["127.0.0.1/32".parse().unwrap()],
+    ClientAddressHeader::XForwardedFor,
+    "forwarded",
+    "for=203.0.113.9",
+    Ipv4Addr::LOCALHOST
+)]
+#[case::x_forwarded_for_while_forwarded_is_trusted(
+    vec!["127.0.0.1/32".parse().unwrap()],
+    ClientAddressHeader::Forwarded,
+    "x-forwarded-for",
+    "203.0.113.9",
+    Ipv4Addr::LOCALHOST
+)]
 #[timeout(Duration::from_secs(10))]
 #[tokio::test]
 #[serial]
-async fn test_proxy_protocol_source_trusts_x_forwarded_for_only_from_trusted_proxies(
+async fn test_proxy_protocol_source_trusts_the_chosen_header_only_from_trusted_proxies(
     no_restrictions: RestrictionsRules,
     dns_resolver: DnsResolver,
     #[case] trusted_proxies: Vec<IpNet>,
+    #[case] trusted_proxy_header: ClientAddressHeader,
+    #[case] sent_header: &'static str,
+    #[case] sent_value: &'static str,
     #[case] expected_source: Ipv4Addr,
 ) {
     let server = Server::new(
         ServerConfig {
             trusted_proxies,
+            trusted_proxy_header,
             ..server_config(dns_resolver.clone())
         },
         DefaultTokioExecutor::default(),
@@ -272,10 +306,9 @@ async fn test_proxy_protocol_source_trusts_x_forwarded_for_only_from_trusted_pro
 
     // The client claims an address it does not have.
     let mut config = (*client_ws(server_port, dns_resolver.clone()).await.config).clone();
-    config.http_headers.insert(
-        HeaderName::from_static("x-forwarded-for"),
-        HeaderValue::from_static("203.0.113.9"),
-    );
+    config
+        .http_headers
+        .insert(HeaderName::from_static(sent_header), HeaderValue::from_static(sent_value));
     let client = Client::new(
         config,
         1,
@@ -893,7 +926,9 @@ async fn test_socks5_tunnel(server_no_tls: Server, no_restrictions: Restrictions
 
     let client_ws = client_ws(server_port, dns_resolver.clone()).await;
 
-    let server = Socks5DownstreamListener::new(tunnel_listen, None, None).await.unwrap();
+    let server = Socks5DownstreamListener::new(tunnel_listen, None, None, false)
+        .await
+        .unwrap();
     tokio::spawn(async move {
         client_ws.run_tunnel(server).await.unwrap();
     });
@@ -926,6 +961,64 @@ async fn test_socks5_tunnel(server_no_tls: Server, no_restrictions: Restrictions
 }
 
 #[rstest]
+#[case::asked(true)]
+#[case::not_asked(false)]
+#[timeout(Duration::from_secs(10))]
+#[tokio::test]
+#[serial]
+async fn test_socks5_tunnel_starts_a_target_connection_with_proxy_protocol_only_when_asked(
+    server_no_tls: Server,
+    no_restrictions: RestrictionsRules,
+    dns_resolver: DnsResolver,
+    #[case] proxy_protocol: bool,
+) {
+    let (tunnel_listen, tunnel_host) = free_addr();
+    let (endpoint_listen, _endpoint_host) = free_addr();
+
+    let server_port = server_no_tls.config.bind.port();
+    let server_h = tokio::spawn(server_no_tls.serve(no_restrictions));
+    defer! { server_h.abort(); };
+
+    let client_ws = client_ws(server_port, dns_resolver.clone()).await;
+    let server = Socks5DownstreamListener::new(tunnel_listen, None, None, proxy_protocol)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        client_ws.run_tunnel(server).await.unwrap();
+    });
+
+    let target = TcpListener::bind(endpoint_listen).await.unwrap();
+    let mut client = protocols::tcp::connect(
+        &tunnel_host,
+        tunnel_listen.port(),
+        SoMark::new(None),
+        Duration::from_secs(10),
+        &dns_resolver,
+    )
+    .await
+    .unwrap();
+
+    let rep = socks5_handshake_connect(&mut client, Ipv4Addr::LOCALHOST, endpoint_listen.port()).await;
+    assert_eq!(rep, 0x00, "reply must be success once the tunnel is established");
+    client.write_all(b"ping").await.unwrap();
+
+    let (mut upstream, _) = target.accept().await.unwrap();
+    if proxy_protocol {
+        // A PROXY protocol v2 header with IPv4 addresses is 28 bytes.
+        let mut header = [0; 28];
+        upstream.read_exact(&mut header).await.unwrap();
+        let header = ppp::v2::Header::try_from(&header[..]).unwrap();
+        let ppp::v2::Addresses::IPv4(addresses) = header.addresses else {
+            panic!("expected IPv4 addresses, got {:?}", header.addresses);
+        };
+        assert_eq!(addresses.source_address, Ipv4Addr::LOCALHOST);
+    }
+    let mut payload = [0; 4];
+    upstream.read_exact(&mut payload).await.unwrap();
+    assert_eq!(&payload, b"ping");
+}
+
+#[rstest]
 #[timeout(Duration::from_secs(10))]
 #[tokio::test]
 #[serial]
@@ -944,7 +1037,9 @@ async fn test_socks5_tunnel_unreachable_target_replies_error(
 
     let client_ws = client_ws(server_port, dns_resolver.clone()).await;
 
-    let server = Socks5DownstreamListener::new(tunnel_listen, None, None).await.unwrap();
+    let server = Socks5DownstreamListener::new(tunnel_listen, None, None, false)
+        .await
+        .unwrap();
     tokio::spawn(async move {
         client_ws.run_tunnel(server).await.unwrap();
     });
@@ -997,6 +1092,7 @@ async fn test_fleet_management_and_ephemeral_reverse_tunnel(
         tls_handshake_timeout: Duration::from_secs(10),
         max_pending_tls_handshakes: std::num::NonZeroU32::new(1024).unwrap(),
         trusted_proxies: vec![],
+        trusted_proxy_header: ClientAddressHeader::default(),
     };
     let server = Server::new(server_config, DefaultTokioExecutor::default());
     let server_port = server.config.bind.port();

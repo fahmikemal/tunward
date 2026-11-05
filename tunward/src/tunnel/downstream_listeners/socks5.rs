@@ -17,8 +17,9 @@ impl Socks5DownstreamListener {
         bind_addr: SocketAddr,
         timeout: Option<Duration>,
         credentials: Option<(String, String)>,
+        proxy_protocol: bool,
     ) -> anyhow::Result<Self> {
-        let listener = socks5::run_server(bind_addr, timeout, credentials)
+        let listener = socks5::run_server(bind_addr, timeout, credentials, proxy_protocol)
             .await
             .with_context(|| anyhow!("Cannot start Socks5 server on {bind_addr}"))?;
 

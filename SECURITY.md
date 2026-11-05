@@ -63,12 +63,18 @@ addresses of a domain, and treats an IPv4-mapped IPv6 address as the IPv4
 address it reaches. The list bounds where the server's peers go, not what they
 send there.
 
-`X-Forwarded-For` is caller-controlled. The server ignores it unless the
-connection's peer is a configured `--trusted-proxy`, and then takes the
-rightmost entry that is not a trusted proxy as the client address recorded in
-logs and fleet records and sent to targets in PROXY protocol headers. Trusting
-`0.0.0.0/0` or `::/0` lets every client choose that address; the server warns
-about it at startup.
+`X-Forwarded-For` and `Forwarded` are caller-controlled. The server ignores them
+unless the connection's peer is a configured `--trusted-proxy`, reads only the
+one `--trusted-proxy-header` names, and takes the rightmost entry that is not a
+trusted proxy as the client address recorded in logs and fleet records and sent
+to targets in PROXY protocol headers. Trusting `0.0.0.0/0` or `::/0` lets every
+client choose that address; the server warns about it at startup.
+
+A list that is malformed, too long, or whose deciding `Forwarded` element names
+no address (`for=unknown`, `for=_hidden`) is not used, and the proxy's own
+address is recorded instead. A client cannot choose an address this way, but
+where a proxy appends to the header, the client can hide behind that proxy
+address. Have the proxy replace the header where it can.
 
 The management API accepts loopback binds only and has no built-in API
 authentication. Local processes able to reach it can read its observation data.

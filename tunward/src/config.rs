@@ -57,6 +57,27 @@ impl FromStr for ClientIdentityField {
     }
 }
 
+/// The request header in which a trusted proxy names the client.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+pub enum ClientAddressHeader {
+    #[default]
+    #[cfg_attr(feature = "clap", value(name = "x-forwarded-for"))]
+    XForwardedFor,
+    /// The `Forwarded` header of RFC 7239.
+    #[cfg_attr(feature = "clap", value(name = "forwarded"))]
+    Forwarded,
+}
+
+impl ClientAddressHeader {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::XForwardedFor => "x-forwarded-for",
+            Self::Forwarded => "forwarded",
+        }
+    }
+}
+
 // Field docs double as the CLI help text, so bracketed examples such as `[::1]` and bare URLs stay as written.
 #[allow(rustdoc::broken_intra_doc_links, rustdoc::bare_urls)]
 #[derive(Clone, Debug)]
@@ -73,6 +94,7 @@ pub struct ClientCreationRequest {
     ///
     /// 'socks5://[::1]:1212'            =>       listen locally with socks5 on port 1212 and forward dynamically requested tunnel
     /// 'socks5://[::1]:1212?login=admin&password=admin' => listen locally with socks5 on port 1212 and only accept connection with login=admin and password=admin
+    /// 'socks5://[::1]:1212?proxy_protocol' => listen locally with socks5 on port 1212, and start each connection to a destination with a PROXY protocol header
     ///
     /// 'http://[::1]:1212'              =>       start a http proxy on port 1212 and forward dynamically requested tunnel
     /// 'http://[::1]:1212?login=admin&password=admin' => start a http proxy on port 1212 and only accept connection with login=admin and password=admin
@@ -496,11 +518,11 @@ pub struct ServerCreationRequest {
     )]
     pub max_pending_tls_handshakes: std::num::NonZeroU32,
 
-    /// Address or CIDR range of a reverse proxy in front of this server whose X-Forwarded-For header
+    /// Address or CIDR range of a reverse proxy in front of this server whose client address header
     /// is trusted. Repeat it, or separate several with commas. The client address recorded in logs,
     /// fleet records and the PROXY protocol header sent to targets is then the rightmost
-    /// X-Forwarded-For entry that is not a trusted proxy.
-    /// Without it, X-Forwarded-For is ignored and the connection's peer address is used.
+    /// entry of that header that is not a trusted proxy.
+    /// Without it, the header is ignored and the connection's peer address is used.
     #[cfg_attr(
         feature = "clap",
         arg(
@@ -513,6 +535,21 @@ pub struct ServerCreationRequest {
         )
     )]
     pub trusted_proxies: Vec<ipnet::IpNet>,
+
+    /// The header a --trusted-proxy names the client in: x-forwarded-for, or forwarded (RFC 7239).
+    /// Only this one is read, so name the header your proxy writes: a client could otherwise set the
+    /// other one itself and choose its own address.
+    #[cfg_attr(
+        feature = "clap",
+        arg(
+            long = "trusted-proxy-header",
+            value_name = "HEADER",
+            default_value = "x-forwarded-for",
+            env = "TUNWARD_TRUSTED_PROXY_HEADER",
+            verbatim_doc_comment
+        )
+    )]
+    pub trusted_proxy_header: ClientAddressHeader,
 
     /// If set, will use this http proxy to connect to the client
     #[cfg_attr(
@@ -903,6 +940,7 @@ mod parsers {
                     local_protocol: LocalProtocol::Socks5 {
                         timeout: get_timeout(&options),
                         credentials: get_credentials(&options),
+                        proxy_protocol: get_proxy_protocol(&options),
                     },
                     local: local_bind,
                     remote: (dest_host, dest_port),
@@ -959,7 +997,11 @@ mod parsers {
         let local_protocol = match proto.local_protocol {
             LocalProtocol::Tcp { .. } => LocalProtocol::ReverseTcp {},
             LocalProtocol::Udp { timeout } => LocalProtocol::ReverseUdp { timeout },
-            LocalProtocol::Socks5 { timeout, credentials } => LocalProtocol::ReverseSocks5 { timeout, credentials },
+            LocalProtocol::Socks5 {
+                timeout,
+                credentials,
+                proxy_protocol: _proxy_protocol,
+            } => LocalProtocol::ReverseSocks5 { timeout, credentials },
             LocalProtocol::HttpProxy {
                 timeout,
                 credentials,
@@ -1130,6 +1172,17 @@ mod parsers {
         ; "with full ipv6 tunnel")]
         fn test_parse_tunnel_arg(input: &str) -> LocalToRemote {
             parse_tunnel_arg(input).unwrap()
+        }
+
+        #[test]
+        fn a_socks5_listener_uses_proxy_protocol_only_when_asked() {
+            let asked = |arg| match parse_tunnel_arg(arg).unwrap().local_protocol {
+                LocalProtocol::Socks5 { proxy_protocol, .. } => proxy_protocol,
+                other => panic!("{other:?}"),
+            };
+            assert!(asked("socks5://[::1]:1212?proxy_protocol"));
+            assert!(asked("socks5://[::1]:1212?login=admin&password=secret&proxy_protocol"));
+            assert!(!asked("socks5://[::1]:1212"));
         }
 
         #[test]

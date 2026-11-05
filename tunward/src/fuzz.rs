@@ -3,6 +3,7 @@
 //! The checks live in the crate, where they can reach private parsers, so `cargo test` also replays
 //! `fuzz/seeds` through them on the pinned toolchain, without a fuzzer.
 
+use crate::config::ClientAddressHeader;
 use crate::protocols::http_proxy::destination;
 use crate::protocols::socks5::udp_server::reply_header;
 use crate::protocols::udp::idle_watchdog;
@@ -96,8 +97,8 @@ fn check_envelope(token: &str) {
     assert_eq!((echoed.host, echoed.port), (remote.host, remote.port));
 }
 
-/// The header a reverse proxy relays. The first byte picks the connection's peer, and the rest holds
-/// one header value per line.
+/// The header a reverse proxy relays. The first byte picks the connection's peer and which header is
+/// chosen, and the rest holds one header value per line.
 pub fn forwarded_for(data: &[u8]) {
     let Some((&flags, lists)) = data.split_first() else {
         return;
@@ -109,17 +110,44 @@ pub fn forwarded_for(data: &[u8]) {
     } else {
         Ipv4Addr::new(192, 0, 2, 1)
     });
+    let (header, unread, proxy, client_text, real_clients): (_, _, _, _, &[&str]) = if flags & 2 == 0 {
+        (
+            ClientAddressHeader::XForwardedFor,
+            ClientAddressHeader::Forwarded,
+            "10.0.0.2",
+            "203.0.113.66, not an address",
+            &["203.0.113.9", "203.0.113.9:4711", "[::ffff:203.0.113.9]"],
+        )
+    } else {
+        (
+            ClientAddressHeader::Forwarded,
+            ClientAddressHeader::XForwardedFor,
+            "for=10.0.0.2",
+            "for=203.0.113.66, for=unknown;x=\"",
+            &[
+                "for=203.0.113.9",
+                "for=\"203.0.113.9:4711\";proto=https",
+                "by=10.0.0.1;for=\"[::ffff:203.0.113.9]\"",
+            ],
+        )
+    };
     let values: Vec<_> = lists
         .split(|&byte| byte == b'\n')
         .filter_map(|v| HeaderValue::from_bytes(v).ok())
         .collect();
-    let read = |extra_before: Option<&str>, extra_after: Option<&str>| {
+    let read_lines = |lines: &[HeaderValue]| {
         let mut headers = HeaderMap::new();
-        let extra = |value: Option<&str>| value.map(|value| HeaderValue::from_str(value).expect("a valid value"));
-        for value in extra(extra_before).iter().chain(&values).chain(&extra(extra_after)) {
-            headers.append("x-forwarded-for", value.clone());
+        for line in lines {
+            headers.append(header.as_str(), line.clone());
         }
-        forwarded_client(peer, &headers, &trusted)
+        forwarded_client(peer, &headers, &trusted, header)
+    };
+    let read = |extra_before: Option<&str>, extra_after: Option<&str>| {
+        let extra = |value: Option<&str>| value.map(|value| HeaderValue::from_str(value).expect("a valid value"));
+        let before = extra(extra_before);
+        let after = extra(extra_after);
+        let lines: Vec<_> = before.iter().chain(&values).chain(&after).cloned().collect();
+        read_lines(&lines)
     };
 
     let result = read(None, None);
@@ -127,6 +155,43 @@ pub fn forwarded_for(data: &[u8]) {
         assert_eq!(result, ForwardedFor::Absent);
     } else if !is_trusted(peer) {
         assert_eq!(result, ForwardedFor::Untrusted);
+    }
+    // The header that was not chosen belongs to the client, and changes nothing.
+    let mut both = HeaderMap::new();
+    for value in &values {
+        both.append(header.as_str(), value.clone());
+        both.append(unread.as_str(), value.clone());
+    }
+    both.append(unread.as_str(), HeaderValue::from_static("198.51.100.66"));
+    assert_eq!(forwarded_client(peer, &both, &trusted, header), result);
+    if is_trusted(peer) {
+        let the_real_client = ForwardedFor::Client(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)));
+        let text = values.last().map_or(&b""[..], HeaderValue::as_bytes);
+        // A client's text cannot hide the element a trusted proxy adds after it on the same line.
+        for real_client in real_clients {
+            let line = [text, b", ", real_client.as_bytes()].concat();
+            let line = HeaderValue::from_bytes(&line).expect("a valid value and a valid element");
+            let result = read_lines(&[line]);
+            assert!(result == the_real_client || result == ForwardedFor::Malformed, "{result:?}");
+        }
+        // Nor can it add an element from inside a value the proxy quoted.
+        if header == ClientAddressHeader::Forwarded {
+            let mut host = b"for=203.0.113.9;host=\"".to_vec();
+            for &byte in text {
+                if matches!(byte, b'"' | b'\\') {
+                    host.push(b'\\');
+                }
+                host.push(byte);
+            }
+            host.push(b'"');
+            let line = HeaderValue::from_bytes(&host).expect("a valid value");
+            let expected = if line.to_str().is_ok() {
+                the_real_client
+            } else {
+                ForwardedFor::Malformed
+            };
+            assert_eq!(read_lines(&[line]), expected);
+        }
     }
     let ForwardedFor::Client(client) = result else {
         return;
@@ -140,10 +205,10 @@ pub fn forwarded_for(data: &[u8]) {
         );
     };
     // A further trusted proxy changes nothing, wherever the client was found.
-    same_or_refused(read(None, Some("10.0.0.2")));
+    same_or_refused(read(None, Some(proxy)));
     // Whatever the client wrote before reaching the proxies cannot change who it is.
     if !is_trusted(client) {
-        same_or_refused(read(Some("203.0.113.66, not an address"), None));
+        same_or_refused(read(Some(client_text), None));
     }
 }
 
