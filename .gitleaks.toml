@@ -2,5 +2,7 @@
 useDefault = true
 
 [allowlist]
-description = "Ignore mTLS test/doc certificates and build target directory"
+description = "Ignore mTLS test/doc certificates, the build target directory and RFC 6455's sample WebSocket key"
 paths = ['''.*certs/mTLS/.*''', '''.*target/.*''']
+# The Sec-WebSocket-Key example of RFC 6455 section 1.3, base64 of "the sample nonce"; test clients send it.
+regexes = ['''^dGhlIHNhbXBsZSBub25jZQ==$''']
