@@ -10,6 +10,7 @@ use std::io;
 use std::io::{Error, ErrorKind};
 use std::net::SocketAddr;
 
+use crate::protocols::udp::idle_watchdog;
 use crate::tunnel::to_host_port;
 use bytes::{Buf, Bytes, BytesMut};
 use fast_socks5::new_udp_header;
@@ -161,8 +162,7 @@ impl Socks5UdpStream {
             send_socket,
             peer,
             destination,
-            watchdog_deadline: watchdog_deadline
-                .map(|timeout| tokio::time::interval_at(tokio::time::Instant::now() + timeout, timeout)),
+            watchdog_deadline: idle_watchdog(watchdog_deadline),
             data_read_before_deadline: false,
             io: io.clone(),
             keys_to_delete,
@@ -344,6 +344,48 @@ impl Drop for Socks5UdpServer {
         for io in self.peers.values() {
             io.active.store(false, Ordering::Release);
             io.reader_waker.wake();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::{StreamExt, pin_mut};
+    use std::net::Ipv4Addr;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn a_client_chosen_idle_timeout_does_not_panic_a_new_relay_flow() {
+        for timeout_from_client in [Duration::ZERO, Duration::from_secs(u64::MAX), Duration::MAX] {
+            let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let bind = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+            let (relay, server) = run_server(bind, Some(timeout_from_client), client.local_addr().unwrap())
+                .await
+                .unwrap();
+            pin_mut!(server);
+            let request = [
+                &[0, 0, 0, 1][..],
+                &Ipv4Addr::LOCALHOST.octets(),
+                &53u16.to_be_bytes(),
+                b"hello",
+            ]
+            .concat();
+            client.send_to(&request, relay).await.unwrap();
+            let stream = timeout(Duration::from_secs(1), server.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            pin_mut!(stream);
+            let mut buf = [0u8; 16];
+            let len = timeout(Duration::from_secs(1), stream.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&buf[..len], b"hello");
         }
     }
 }

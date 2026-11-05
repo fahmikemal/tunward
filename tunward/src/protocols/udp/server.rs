@@ -105,6 +105,20 @@ impl UdpServer {
     }
 }
 
+/// Longer than any process runs, and short enough to add to a time without overflowing.
+const NEVER: Duration = Duration::from_secs(86400 * 365 * 30);
+
+/// The timer that closes a UDP flow left idle for `timeout`, if `timeout` sets a usable one.
+///
+/// The client of a reverse tunnel chooses this value, and `interval_at` panics on zero and on a time
+/// it cannot represent, which would abort the server. Zero disables the timeout, as `timeout_sec=0`
+/// does, and so does a timeout too long ever to elapse.
+pub fn idle_watchdog(timeout: Option<Duration>) -> Option<Interval> {
+    timeout
+        .filter(|timeout| !timeout.is_zero() && *timeout < NEVER)
+        .map(|timeout| tokio::time::interval_at(tokio::time::Instant::now() + timeout, timeout))
+}
+
 #[pin_project(PinnedDrop)]
 pub struct UdpStream {
     recv_socket: Arc<UdpSocket>,
@@ -154,8 +168,7 @@ impl UdpStream {
             recv_socket,
             send_socket,
             peer,
-            watchdog_deadline: watchdog_deadline
-                .map(|timeout| tokio::time::interval_at(tokio::time::Instant::now() + timeout, timeout)),
+            watchdog_deadline: idle_watchdog(watchdog_deadline),
             data_read_before_deadline: false,
             has_been_notified: false,
             pending_notification: None,
@@ -604,6 +617,52 @@ mod tests {
         let ret = timeout(Duration::from_millis(100), stream.read(&mut buf[10..])).await;
         assert!(matches!(ret, Ok(Ok(5))));
         assert_eq!(&buf[..16], b"helloworld test\0");
+    }
+
+    #[tokio::test]
+    async fn only_a_usable_idle_timeout_starts_a_timer() {
+        for unusable in [
+            Duration::ZERO,
+            NEVER,
+            Duration::from_secs(i64::MAX as u64),
+            Duration::from_secs(u64::MAX),
+            Duration::MAX,
+        ] {
+            assert!(idle_watchdog(Some(unusable)).is_none(), "{unusable:?} started a timer");
+        }
+        assert!(idle_watchdog(None).is_none());
+        for usable in [
+            Duration::from_nanos(1),
+            Duration::from_secs(30),
+            NEVER - Duration::from_secs(1),
+        ] {
+            assert_eq!(idle_watchdog(Some(usable)).map(|timer| timer.period()), Some(usable));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_chosen_idle_timeout_does_not_panic_a_new_flow() {
+        for timeout_from_client in [Duration::ZERO, Duration::from_secs(u64::MAX), Duration::MAX] {
+            let server_addr = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+            let server = run_server(server_addr, Some(timeout_from_client), |_| Ok(()), |l| Ok(l.clone()))
+                .await
+                .unwrap();
+            pin_mut!(server);
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            client.send_to(b"hello", server_addr).await.unwrap();
+            let stream = timeout(Duration::from_secs(1), server.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            pin_mut!(stream);
+            let mut buf = [0u8; 16];
+            let len = timeout(Duration::from_secs(1), stream.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&buf[..len], b"hello");
+        }
     }
 
     #[tokio::test]

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Release-binary checks of reverse tunnels: a server-allocated port (port 0) stays with its client
-tunnel across requests, reply timeouts, bursts and UDP peers, and an allow= list limits where the
-server's peers reach through a reverse SOCKS5 or HTTP proxy tunnel."""
+tunnel across requests, reply timeouts, bursts and UDP peers, an allow= list limits where the
+server's peers reach through a reverse SOCKS5 or HTTP proxy tunnel, and the idle timeout a client
+names cannot abort the server."""
 import argparse
 import asyncio
+import base64
 import hashlib
 import ipaddress
 import json
@@ -11,6 +13,7 @@ from pathlib import Path
 import re
 import socket
 import struct
+import uuid
 
 from qualify import Suite, close, port
 from qualify_wan import certificates
@@ -297,11 +300,80 @@ class ReverseTunnelChecks:
             refused[spec] = process.returncode
         return {"exit_codes": refused}
 
+    @staticmethod
+    async def visit_reverse_udp(listener):
+        """Keeps sending a datagram until the listener, which opens with the request, serves it."""
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as visitor:
+            while True:
+                visitor.sendto(b"visit", ("127.0.0.1", listener))
+                await asyncio.sleep(0.05)
+
+    @staticmethod
+    async def visit_socks5_relay(listener):
+        """Opens a SOCKS5 UDP association on the listener and keeps sending through its relay."""
+        while True:
+            try:
+                reader, writer = await asyncio.open_connection("127.0.0.1", listener)
+                break
+            except OSError:
+                await asyncio.sleep(0.05)
+        try:
+            writer.write(b"\x05\x01\x00")
+            await reader.readexactly(2)
+            writer.write(b"\x05\x03\x00\x01" + bytes(6))
+            relay = struct.unpack(">H", (await reader.readexactly(10))[8:])[0]
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as visitor:
+                datagram = b"\x00\x00\x00\x01\x7f\x00\x00\x01\x00\x35visit"
+                while True:
+                    visitor.sendto(datagram, ("127.0.0.1", relay))
+                    await asyncio.sleep(0.05)
+        finally:
+            await close(writer)
+
+    async def client_chosen_timeouts(self):
+        """A reverse request naming a zero or far-future idle timeout, which no tunward client sends,
+        is served by the two UDP paths that arm a timer from it, and the server keeps running."""
+        rules = self.policy("timeouts", "      - !ReverseTunnel {protocol: [Udp, Socks5], cidr: [127.0.0.1/32]}\n")
+        sp = port()
+        process = await self.suite.spawn("timeouts-server", "server", f"ws://127.0.0.1:{sp}",
+                                         "--restrict-config", rules, log_level="INFO")
+        await self.suite.ready(sp, process)
+        served = {}
+        try:
+            for name, timeout in (("zero", {"secs": 0, "nanos": 0}), ("far-future", {"secs": 2**64 - 1, "nanos": 0})):
+                for kind, protocol, visit in (
+                        ("udp", {"ReverseUdp": {"timeout": timeout}}, self.visit_reverse_udp),
+                        ("socks5", {"ReverseSocks5": {"timeout": timeout, "credentials": None}}, self.visit_socks5_relay)):
+                    listener = port()
+                    claims = {"v": 2, "id": str(uuid.uuid4()), "p": protocol, "r": "127.0.0.1", "rp": listener}
+                    envelope = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+                    reader, writer = await asyncio.open_connection("127.0.0.1", sp)
+                    visitor = asyncio.create_task(visit(listener))
+                    try:
+                        writer.write((f"GET /v1/events HTTP/1.1\r\nHost: 127.0.0.1:{sp}\r\nUpgrade: websocket\r\n"
+                                      "Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n"
+                                      "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                                      f"Sec-WebSocket-Protocol: v1, tunward.metadata.v2.{envelope}\r\n\r\n").encode())
+                        await writer.drain()
+                        # The server answers a reverse request once a visitor arrived and its flow opened.
+                        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 10)
+                    finally:
+                        visitor.cancel()
+                        await close(writer)
+                    assert head.startswith(b"HTTP/1.1 101"), f"{kind} with a {name} timeout: {head[:80]!r}"
+                    served[f"{kind}-{name}"] = 101
+            await asyncio.sleep(0.2)
+            assert process.returncode is None, f"the server exited with {process.returncode}"
+            return {"served": served}
+        finally:
+            await self.suite.stop(process)
+
     async def run(self):
         await certificates(self.certs, "127.0.0.1")
         try:
             for name, check, timeout in (("allocated-port", self.allocated_port, 180), ("allocated-udp", self.allocated_udp, 60),
-                                         ("allow-list", self.allow_list, 120), ("allow-refused", self.allow_refused, 30)):
+                                         ("allow-list", self.allow_list, 120), ("allow-refused", self.allow_refused, 30),
+                                         ("client-chosen-timeouts", self.client_chosen_timeouts, 60)):
                 await self.suite.check(f"reverse/{name}", check, timeout)
         finally:
             await asyncio.gather(*(self.suite.stop(process) for process in self.suite.processes))
