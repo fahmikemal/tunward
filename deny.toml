@@ -8,6 +8,13 @@ all-features = true
 [advisories]
 # Unmaintained crates are reported anywhere in the graph and fail the check. Yanked releases are refused.
 yanked = "deny"
+# testcontainers 0.28.0 (the latest release) requires this deprecated archiver.
+# It is absent from the CLI's normal/build graph. Keep this maintenance-only
+# exception narrow and remove it when testcontainers replaces the dependency.
+# Vulnerability advisories remain denied, including for development dependencies.
+ignore = [
+  { id = "RUSTSEC-2026-0440", reason = "Test-only astral-tokio-tar through testcontainers 0.28.0; no upstream replacement release is available and the archiver is not shipped in the CLI." },
+]
 
 [licenses]
 # Permissive licenses actually present in the graph. Copyleft terms such as LGPL-2.1-or-later only
