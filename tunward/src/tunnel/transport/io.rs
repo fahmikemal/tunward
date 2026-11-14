@@ -5,6 +5,7 @@ use crate::tunnel::transport::websocket::{WebsocketTransportRead, WebsocketTrans
 use crate::tunnel::transport::webtransport::{
     WebTransportRead, WebTransportUdpRead, WebTransportUdpWrite, WebTransportWrite,
 };
+use crate::tunnel::upstream_connectors::UpstreamConnector;
 use bytes::{BufMut, BytesMut};
 use futures_util::pin_mut;
 use std::future::Future;
@@ -20,15 +21,54 @@ use tokio::time::Instant;
 
 pub(super) const MAX_PACKET_LENGTH: usize = 64 * 1024;
 
+/// Preserve local cancellation when the server erases the concrete reader type.
+trait CancellableRead: AsyncRead + Send {
+    fn closed(self: Pin<&mut Self>) -> Pin<Box<dyn Future<Output = io::Error> + Send + '_>>;
+}
+
+impl<R: DownstreamRead> CancellableRead for R {
+    fn closed(self: Pin<&mut Self>) -> Pin<Box<dyn Future<Output = io::Error> + Send + '_>> {
+        Box::pin(DownstreamRead::cancelled(self))
+    }
+}
+
+pub(crate) struct BoxedLocalRead(Pin<Box<dyn CancellableRead>>);
+
+impl BoxedLocalRead {
+    pub(crate) fn new(reader: impl DownstreamRead) -> Self {
+        Self(Box::pin(reader))
+    }
+}
+
+impl AsyncRead for BoxedLocalRead {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<io::Result<()>> {
+        self.get_mut().0.as_mut().poll_read(cx, buf)
+    }
+}
+
+impl DownstreamRead for BoxedLocalRead {
+    async fn cancelled(self: Pin<&mut Self>) -> io::Error {
+        self.get_mut().0.as_mut().closed().await
+    }
+}
+
 pub trait TransportWrite: Send + 'static {
     fn buf_mut(&mut self) -> &mut BytesMut;
     fn write(&mut self) -> impl Future<Output = Result<(), std::io::Error>> + Send;
     fn ping(&mut self) -> impl Future<Output = Result<(), std::io::Error>> + Send;
     fn close(&mut self) -> impl Future<Output = Result<(), std::io::Error>> + Send;
+    /// Signal a fatal forwarding failure without turning it into a graceful FIN.
+    fn abort(&mut self) -> impl Future<Output = ()> + Send {
+        std::future::ready(())
+    }
     fn pending_operations_notify(&mut self) -> Arc<Notify>;
     fn handle_pending_operations(&mut self) -> impl Future<Output = Result<(), std::io::Error>> + Send;
     /// Peer cancellation must remain observable while RX is blocked writing to a local target.
     fn cancelled(&mut self) -> impl Future<Output = ()> + Send {
+        std::future::pending()
+    }
+    /// A connection failure is fatal even after a directional FIN. Stopping reads alone is not.
+    fn connection_closed(&mut self) -> impl Future<Output = ()> + Send {
         std::future::pending()
     }
 }
@@ -38,6 +78,12 @@ pub trait TransportRead: Send + 'static {
         &mut self,
         writer: impl AsyncWrite + Unpin + Send,
     ) -> impl Future<Output = Result<(), std::io::Error>> + Send;
+
+    /// Observe fatal peer failure while buffered records flush or shut down the local writer.
+    /// Normal transport FIN must remain pending so buffered payload can finish draining.
+    fn cancelled(&mut self) -> impl Future<Output = io::Error> + Send {
+        std::future::pending()
+    }
 
     fn finish(&mut self) -> impl Future<Output = Result<(), std::io::Error>> + Send {
         std::future::ready(Ok(()))
@@ -54,6 +100,15 @@ pub enum TransportReader {
 }
 
 impl TransportRead for TransportReader {
+    async fn cancelled(&mut self) -> io::Error {
+        match self {
+            Self::Websocket(s) => TransportRead::cancelled(s).await,
+            Self::Http2(s) => TransportRead::cancelled(s).await,
+            Self::WebTransport(s) => TransportRead::cancelled(s.as_mut()).await,
+            Self::WebTransportUdp(s) => TransportRead::cancelled(s.as_mut()).await,
+        }
+    }
+
     async fn copy(&mut self, writer: impl AsyncWrite + Unpin + Send) -> Result<(), std::io::Error> {
         match self {
             Self::Websocket(s) => s.copy(writer).await,
@@ -118,6 +173,15 @@ impl TransportWrite for TransportWriter {
         }
     }
 
+    async fn abort(&mut self) {
+        match self {
+            Self::Websocket(s) => s.abort().await,
+            Self::Http2(s) => s.abort().await,
+            Self::WebTransport(s) => s.abort().await,
+            Self::WebTransportUdp(s) => s.abort().await,
+        }
+    }
+
     fn pending_operations_notify(&mut self) -> Arc<Notify> {
         match self {
             Self::Websocket(s) => s.pending_operations_notify(),
@@ -142,6 +206,15 @@ impl TransportWrite for TransportWriter {
             Self::Http2(s) => s.cancelled().await,
             Self::WebTransport(s) => s.cancelled().await,
             Self::WebTransportUdp(s) => s.cancelled().await,
+        }
+    }
+
+    async fn connection_closed(&mut self) {
+        match self {
+            Self::Websocket(s) => s.connection_closed().await,
+            Self::Http2(s) => s.connection_closed().await,
+            Self::WebTransport(s) => s.connection_closed().await,
+            Self::WebTransportUdp(s) => s.connection_closed().await,
         }
     }
 }
@@ -285,6 +358,13 @@ impl<R: DownstreamRead> LocalCancellation<R> for DownstreamCancellation {
     }
 }
 
+struct UpstreamCancellation<C>(std::marker::PhantomData<C>);
+impl<C: UpstreamConnector> LocalCancellation<C::Reader> for UpstreamCancellation<C> {
+    async fn cancelled(reader: Pin<&mut C::Reader>) -> io::Error {
+        C::cancelled(reader).await
+    }
+}
+
 async fn send_records<R: AsyncRead + Send, C: LocalCancellation<R>>(
     local_rx: R,
     tx: &mut impl TransportWrite,
@@ -309,7 +389,9 @@ async fn send_records<R: AsyncRead + Send, C: LocalCancellation<R>>(
             _ = &mut receive_done, if sent_fin => return Ok(()),
             // After our directional FIN the peer may legitimately stop reading this direction.
             // Until then, cancellation must also interrupt RX blocked on a non-reading target.
-            _ = tx.cancelled(), if !sent_fin => return Err(io::Error::new(ErrorKind::ConnectionAborted, "tunnel transport closed")),
+            _ = async {
+                if sent_fin { tx.connection_closed().await } else { tx.cancelled().await }
+            } => return Err(io::Error::new(ErrorKind::ConnectionAborted, "tunnel transport closed")),
             read = async {
                 if sent_fin || pending_len.is_some() {
                     Err(C::cancelled(local_rx.as_mut()).await)
@@ -355,12 +437,20 @@ async fn receive_records(
             result = rx.copy(&mut decoder) => result?,
         }
         if decoder.finished && received_fin.is_some() {
-            decoder.shutdown().await?;
+            select! {
+                error = rx.cancelled() => return Err(error),
+                result = decoder.shutdown() => result?,
+            }
             let _ = received_fin.take().unwrap().send(());
             // WebSocket Ping/Pong and protocol violations still need to be read after FIN.
             // Only the local writer is shut down; the transport lives until our own FIN.
         } else if !decoder.finished {
-            decoder.flush().await?;
+            // copy may end with a complete DATA record still buffered by the decoder.
+            // Its flush can block outside the transport's copy cancellation monitor.
+            select! {
+                error = rx.cancelled() => return Err(error),
+                result = decoder.flush() => result?,
+            }
         }
     }
 }
@@ -373,7 +463,7 @@ pub async fn forward(
     tx: impl TransportWrite,
     ping_frequency: Option<Duration>,
 ) -> anyhow::Result<()> {
-    forward_with_quota(local_rx, local_tx, rx, tx, ping_frequency, None).await
+    forward_inner::<_, Unmonitored>(local_rx, local_tx, rx, tx, ping_frequency, None).await
 }
 
 pub(crate) async fn forward_downstream(
@@ -387,14 +477,25 @@ pub(crate) async fn forward_downstream(
 }
 
 pub(crate) async fn forward_with_quota(
-    local_rx: impl AsyncRead + Send,
+    local_rx: impl DownstreamRead,
     local_tx: impl AsyncWrite + Send,
     rx: impl TransportRead,
     tx: impl TransportWrite,
     ping_frequency: Option<Duration>,
     quota: Option<TunnelPermit>,
 ) -> anyhow::Result<()> {
-    forward_inner::<_, Unmonitored>(local_rx, local_tx, rx, tx, ping_frequency, quota).await
+    forward_inner::<_, DownstreamCancellation>(local_rx, local_tx, rx, tx, ping_frequency, quota).await
+}
+
+pub(crate) async fn forward_upstream<C: UpstreamConnector>(
+    _connector: &C,
+    local_rx: C::Reader,
+    local_tx: C::Writer,
+    rx: impl TransportRead,
+    tx: impl TransportWrite,
+    ping_frequency: Option<Duration>,
+) -> anyhow::Result<()> {
+    forward_inner::<_, UpstreamCancellation<C>>(local_rx, local_tx, rx, tx, ping_frequency, None).await
 }
 
 async fn forward_inner<R: AsyncRead + Send, C: LocalCancellation<R>>(
@@ -414,9 +515,20 @@ async fn forward_inner<R: AsyncRead + Send, C: LocalCancellation<R>>(
         let _ = send_done_tx.send(());
         result
     };
-    tokio::try_join!(send, receive_records(local_tx, &mut rx, received_fin_tx, send_done_rx, upload))?;
-    tx.close().await?;
-    rx.finish().await?;
+    if let Err(error) =
+        tokio::try_join!(send, receive_records(local_tx, &mut rx, received_fin_tx, send_done_rx, upload))
+    {
+        tx.abort().await;
+        return Err(error.into());
+    }
+    if let Err(error) = tx.close().await {
+        tx.abort().await;
+        return Err(error.into());
+    }
+    if let Err(error) = rx.finish().await {
+        tx.abort().await;
+        return Err(error.into());
+    }
     drop(quota);
     Ok(())
 }
@@ -430,6 +542,7 @@ mod tests {
         cancelled: oneshot::Receiver<()>,
         fin_sent: Option<oneshot::Sender<()>>,
         blocked: Option<oneshot::Sender<()>>,
+        aborted: Option<oneshot::Sender<()>>,
     }
     impl TransportWrite for CancelledWrite {
         fn buf_mut(&mut self) -> &mut BytesMut {
@@ -452,6 +565,11 @@ mod tests {
         }
         async fn close(&mut self) -> io::Result<()> {
             Ok(())
+        }
+        async fn abort(&mut self) {
+            if let Some(aborted) = self.aborted.take() {
+                let _ = aborted.send(());
+            }
         }
         fn pending_operations_notify(&mut self) -> Arc<Notify> {
             Arc::new(Notify::new())
@@ -505,6 +623,7 @@ mod tests {
                     cancelled,
                     fin_sent: None,
                     blocked: None,
+                    aborted: None,
                 },
                 None,
                 Some(permit),
@@ -539,6 +658,72 @@ mod tests {
         }
     }
 
+    struct ResetAfterRecord {
+        reset: oneshot::Receiver<()>,
+    }
+
+    impl TransportRead for ResetAfterRecord {
+        async fn copy(&mut self, mut writer: impl AsyncWrite + Unpin + Send) -> io::Result<()> {
+            // A complete record ends at the chunk boundary. Its payload is still buffered
+            // when copy returns; the subsequent decoder flush is what reaches the target.
+            writer.write_all(&[DATA, 0, 0, 0, 1, 42]).await
+        }
+
+        async fn cancelled(&mut self) -> io::Error {
+            let _ = (&mut self.reset).await;
+            io::Error::new(ErrorKind::ConnectionAborted, "peer reset while flushing a buffered record")
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_after_our_fin_releases_quota_while_buffered_payload_flush_is_blocked() {
+        let mut limits = crate::quotas::DeviceQuotaConfig::default_production_limits();
+        limits.default.max_tunnels = std::num::NonZeroU32::new(1);
+        let quotas = crate::quotas::QuotaManager::new(limits);
+        let session = quotas.open_session("reset-during-flush").unwrap();
+        let permit = session.open_tunnel().unwrap();
+        let (local_rx, mut application) = tokio::io::duplex(1);
+        application.shutdown().await.unwrap();
+        let (blocked, was_blocked) = oneshot::channel();
+        let (fin_sent, fin_seen) = oneshot::channel();
+        let (reset, reset_seen) = oneshot::channel();
+        let (_cancel, cancelled) = oneshot::channel();
+        let (abort, aborted) = oneshot::channel();
+        let mut forwarding = scopeguard::guard(
+            tokio::spawn(forward_with_quota(
+                local_rx,
+                BlockedTarget(Some(blocked)),
+                ResetAfterRecord { reset: reset_seen },
+                CancelledWrite {
+                    buf: BytesMut::new(),
+                    cancelled,
+                    fin_sent: Some(fin_sent),
+                    blocked: None,
+                    aborted: Some(abort),
+                },
+                None,
+                Some(permit),
+            )),
+            |task| task.abort(),
+        );
+        tokio::time::timeout(Duration::from_secs(2), fin_seen)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), was_blocked)
+            .await
+            .unwrap()
+            .unwrap();
+        reset.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut *forwarding)
+            .await
+            .expect("peer reset must cancel the buffered-record flush after our FIN")
+            .unwrap();
+        assert!(result.is_err());
+        aborted.await.expect("failed forwarding must abort its send stream");
+        session.open_tunnel().expect("reset during flush must release quota");
+    }
+
     #[tokio::test]
     async fn local_tcp_reset_interrupts_a_backpressured_transport_write() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -559,6 +744,7 @@ mod tests {
                     cancelled,
                     fin_sent: None,
                     blocked: Some(blocked),
+                    aborted: None,
                 },
                 None,
             )),
@@ -581,10 +767,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn boxed_local_reset_releases_quota_during_a_blocked_transport_write() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut application = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        let (local_rx, local_tx) = socket.into_split();
+        let mut limits = crate::quotas::DeviceQuotaConfig::default_production_limits();
+        limits.default.max_tunnels = std::num::NonZeroU32::new(1);
+        let quotas = crate::quotas::QuotaManager::new(limits);
+        let session = quotas.open_session("boxed-reset").unwrap();
+        let permit = session.open_tunnel().unwrap();
+        let (abort, aborted) = oneshot::channel();
+        let (_cancel, cancelled) = oneshot::channel();
+        let (blocked, was_blocked) = oneshot::channel();
+        let mut forwarding = scopeguard::guard(
+            tokio::spawn(forward_with_quota(
+                BoxedLocalRead::new(local_rx),
+                local_tx,
+                ReplyAfterFin(None),
+                CancelledWrite {
+                    buf: BytesMut::new(),
+                    cancelled,
+                    fin_sent: None,
+                    blocked: Some(blocked),
+                    aborted: Some(abort),
+                },
+                None,
+                Some(permit),
+            )),
+            |task| task.abort(),
+        );
+        application.write_all(b"blocked").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), was_blocked)
+            .await
+            .unwrap()
+            .unwrap();
+        socket2::SockRef::from(&application)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+        drop(application);
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut *forwarding)
+            .await
+            .expect("boxed readers must retain local reset cancellation")
+            .unwrap();
+        assert!(result.is_err());
+        aborted.await.expect("a fatal local reset must abort the transport");
+        session.open_tunnel().expect("reset must release the tunnel quota");
+    }
+
+    #[tokio::test]
     async fn peer_stopping_reads_after_our_fin_preserves_the_reply() {
         let (fin_sent, fin_seen) = oneshot::channel();
         let (cancel, cancelled) = oneshot::channel();
         let (reply, released) = oneshot::channel();
+        let (abort, aborted) = oneshot::channel();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut application = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
             .await
@@ -601,6 +839,7 @@ mod tests {
                     cancelled,
                     fin_sent: Some(fin_sent),
                     blocked: None,
+                    aborted: Some(abort),
                 },
                 None,
             )),
@@ -625,6 +864,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+        assert!(aborted.await.is_err(), "normal half-close must not abort the transport");
     }
 
     #[derive(Default)]

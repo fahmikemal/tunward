@@ -8,20 +8,114 @@ use hyper::header::{CONNECTION, HOST, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::{TokioIo, TokioTimer};
-use std::io;
+use std::io::{self, IoSlice};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context as TaskContext, Poll};
+use std::task::{Context as TaskContext, Poll, ready};
 use std::time::Duration;
-use tokio::io::{AsyncWrite, DuplexStream, ReadHalf, WriteHalf};
-use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot};
+use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf, ReadHalf, WriteHalf};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 use url::Host;
 
-pub type HttpProxyRead = ReadHalf<DuplexStream>;
+pub struct HttpProxyRead {
+    inner: ReadHalf<DuplexStream>,
+    cancelled: watch::Receiver<bool>,
+}
+
+impl AsyncRead for HttpProxyRead {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl crate::tunnel::downstream_listeners::DownstreamRead for HttpProxyRead {
+    async fn cancelled(self: Pin<&mut Self>) -> io::Error {
+        let signal = &mut self.get_mut().cancelled;
+        loop {
+            if *signal.borrow_and_update() {
+                return io::Error::new(io::ErrorKind::ConnectionAborted, "HTTP proxy connection failed");
+            }
+            if signal.changed().await.is_err() {
+                // A normally completed HTTP connection is not an abort. Buffered reply
+                // data must still drain through the bridge after directional EOF.
+                return std::future::pending().await;
+            }
+        }
+    }
+}
+
+// Share readiness without duplicating the descriptor or spawning a monitor task.
+// Hyper owns the I/O handle; its connection/upgrade task watches ERROR independently
+// of HTTP body flow control and a full duplex bridge.
+struct ProxySocket(Arc<TcpStream>);
+
+impl AsyncRead for ProxySocket {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        loop {
+            ready!(self.0.poll_read_ready(cx))?;
+            match self.0.try_read(buf.initialize_unfilled()) {
+                Ok(count) => {
+                    buf.advance(count);
+                    return Poll::Ready(Ok(()));
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(error) => return Poll::Ready(Err(error)),
+            }
+        }
+    }
+}
+
+impl AsyncWrite for ProxySocket {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        loop {
+            ready!(self.0.poll_write_ready(cx))?;
+            match self.0.try_write(buf) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                result => return Poll::Ready(result),
+            }
+        }
+    }
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        loop {
+            ready!(self.0.poll_write_ready(cx))?;
+            match self.0.try_write_vectored(bufs) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                result => return Poll::Ready(result),
+            }
+        }
+    }
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+    fn poll_flush(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(socket2::SockRef::from(self.0.as_ref()).shutdown(std::net::Shutdown::Write))
+    }
+}
+
+async fn socket_failure(socket: &TcpStream) -> io::Error {
+    match socket.ready(tokio::io::Interest::ERROR).await {
+        Err(error) => error,
+        Ok(_) => socket
+            .take_error()
+            .unwrap_or_else(Some)
+            .unwrap_or_else(|| io::Error::new(io::ErrorKind::ConnectionAborted, "HTTP proxy socket failed")),
+    }
+}
+
 pub struct HttpProxyWrite {
     inner: WriteHalf<DuplexStream>,
     ready: Option<oneshot::Sender<bool>>,
@@ -112,6 +206,8 @@ async fn handle_request(
     auth: Option<String>,
     tx: mpsc::Sender<Accepted>,
     tasks: Arc<tokio::sync::Semaphore>,
+    socket: Arc<TcpStream>,
+    cancellation: watch::Sender<bool>,
 ) -> Result<Response<ProxyBody>, anyhow::Error> {
     let permit = match tasks.try_acquire_owned() {
         Ok(permit) => permit,
@@ -140,7 +236,10 @@ async fn handle_request(
     let (ready_tx, ready_rx) = oneshot::channel();
     tx.send(Ok((
         (
-            reader,
+            HttpProxyRead {
+                inner: reader,
+                cancelled: cancellation.subscribe(),
+            },
             HttpProxyWrite {
                 inner: writer,
                 ready: Some(ready_tx),
@@ -165,7 +264,15 @@ async fn handle_request(
             if let Ok(upgraded) = upgrade.await {
                 let mut downstream = TokioIo::new(upgraded);
                 let mut upstream = upstream;
-                let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
+                let result = tokio::select! {
+                    result = tokio::io::copy_bidirectional(&mut downstream, &mut upstream) => result.map(|_| ()),
+                    error = socket_failure(&socket) => Err(error),
+                };
+                if result.is_err() {
+                    cancellation.send_replace(true);
+                }
+            } else {
+                cancellation.send_replace(true);
             }
         });
         return Ok(response(StatusCode::OK));
@@ -179,11 +286,20 @@ async fn handle_request(
         .path_and_query(req.uri().path_and_query().map_or("/", |p| p.as_str()))
         .build()?;
     let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(upstream)).await?;
+    let driver_cancellation = cancellation.clone();
     tokio::spawn(async move {
         let _permit = permit;
-        let _ = connection.await;
+        if connection.await.is_err() {
+            driver_cancellation.send_replace(true);
+        }
     });
-    let mut result = sender.send_request(req).await?;
+    let mut result = match sender.send_request(req).await {
+        Ok(response) => response,
+        Err(error) => {
+            cancellation.send_replace(true);
+            return Err(error.into());
+        }
+    };
     strip_hop_headers(result.headers_mut());
     Ok(result.map(BodyExt::boxed))
 }
@@ -230,11 +346,20 @@ pub async fn run_server(
                             Ok((socket, _)) => {
                                 let auth = auth.clone(); let tx = tx.clone(); let permits = permits.clone();
                                 tasks.spawn(async move {
+                                    let socket = Arc::new(socket);
+                                    let (cancellation, _) = watch::channel(false);
+                                    let request_cancellation = cancellation.clone();
+                                    let request_socket = socket.clone();
                                     let mut builder = hyper::server::conn::http1::Builder::new();
                                     builder.timer(TokioTimer::new()).header_read_timeout(Some(timeout.unwrap_or(Duration::from_secs(10)).min(Duration::from_secs(10))))
                                         .max_buf_size(32 * 1024).half_close(true);
-                                    let service = service_fn(move |req| handle_request(req, auth.clone(), tx.clone(), permits.clone()));
-                                    if let Err(err) = builder.serve_connection(TokioIo::new(socket), service).with_upgrades().await {
+                                    let service = service_fn(move |req| handle_request(req, auth.clone(), tx.clone(), permits.clone(), request_socket.clone(), request_cancellation.clone()));
+                                    let result = tokio::select! {
+                                        result = builder.serve_connection(TokioIo::new(ProxySocket(socket.clone())), service).with_upgrades() => result.map_err(anyhow::Error::from),
+                                        error = socket_failure(&socket) => Err(error.into()),
+                                    };
+                                    if let Err(err) = result {
+                                        cancellation.send_replace(true);
                                         warn!("HTTP proxy connection ended: {err}");
                                     }
                                 });
@@ -255,6 +380,97 @@ pub async fn run_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tunnel::downstream_listeners::{DownstreamRead, DownstreamWrite};
+    use futures_util::StreamExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn connect_reply(application: &mut tokio::net::TcpStream) {
+        let mut header = Vec::new();
+        while !header.ends_with(b"\r\n\r\n") {
+            assert!(header.len() < 4096);
+            header.push(application.read_u8().await.unwrap());
+        }
+        assert!(header.starts_with(b"HTTP/1.1 200 "));
+    }
+
+    #[tokio::test]
+    async fn connect_reset_cancels_a_full_proxy_bridge() {
+        let mut proxy = run_server("127.0.0.1:0".parse().unwrap(), None, None).await.unwrap();
+        let mut application = tokio::net::TcpStream::connect(proxy.local_addr()).await.unwrap();
+        application
+            .write_all(b"CONNECT 127.0.0.1:80 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let ((mut reader, mut writer), _) = tokio::time::timeout(Duration::from_secs(2), proxy.listener.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        writer.on_tunnel_ready(Ok(())).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), connect_reply(&mut application))
+            .await
+            .unwrap();
+        socket2::SockRef::from(&application)
+            .set_send_buffer_size(65536)
+            .unwrap();
+        let payload = vec![42; 32 * 1024 * 1024];
+        let mut uploading = Box::pin(application.write_all(&payload));
+        let mut first = [0];
+        tokio::select! {
+            result = &mut uploading => panic!("upload unexpectedly completed before the bridge was drained: {result:?}"),
+            result = reader.read_exact(&mut first) => { result.unwrap(); },
+            _ = tokio::time::sleep(Duration::from_secs(2)) => panic!("CONNECT payload did not reach the bridge"),
+        }
+        assert_eq!(first, [42]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut uploading)
+                .await
+                .is_err()
+        );
+        drop(uploading);
+        socket2::SockRef::from(&application)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+        drop(application);
+        let error = tokio::time::timeout(Duration::from_secs(2), Pin::new(&mut reader).cancelled())
+            .await
+            .expect("a local TCP reset must cancel a backpressured HTTP bridge");
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+    }
+
+    #[tokio::test]
+    async fn connect_preserves_buffered_payload_and_half_close_reply() {
+        let mut proxy = run_server("127.0.0.1:0".parse().unwrap(), None, None).await.unwrap();
+        let mut application = tokio::net::TcpStream::connect(proxy.local_addr()).await.unwrap();
+        application
+            .write_all(b"CONNECT 127.0.0.1:80 HTTP/1.1\r\nHost: localhost\r\n\r\nearly payload")
+            .await
+            .unwrap();
+        let ((mut reader, mut writer), _) = tokio::time::timeout(Duration::from_secs(2), proxy.listener.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        writer.on_tunnel_ready(Ok(())).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), connect_reply(&mut application))
+            .await
+            .unwrap();
+        application.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), reader.read_to_end(&mut received))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, b"early payload");
+        writer.write_all(b"late reply").await.unwrap();
+        writer.shutdown().await.unwrap();
+        let mut reply = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), application.read_to_end(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply, b"late reply");
+    }
 
     #[test]
     fn consumes_proxy_credentials_and_connection_named_headers() {

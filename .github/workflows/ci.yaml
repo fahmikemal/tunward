@@ -113,6 +113,9 @@ jobs:
       - name: Test the recovery qualification relay
         run: python3 -m unittest discover -s scripts -p test_qualify_recovery.py
 
+      - name: Test proxy cleanup reset and handshake checks
+        run: python3 -m unittest discover -s scripts -p test_qualify_proxy_cleanup.py
+
       - name: Verify issue templates pass the auto-close workflow
         run: python3 -m unittest discover -s scripts -p test_issue_templates.py
 
@@ -211,6 +214,31 @@ jobs:
       - name: Verify recovery and resource cleanup under interrupted traffic
         timeout-minutes: 5
         run: python3 scripts/qualify_recovery.py --cycles 100 --output "$QUALIFICATION_ROOT/recovery"
+      - name: Verify forward and reverse proxy cleanup under backpressure
+        id: proxy_cleanup
+        timeout-minutes: 10
+        run: |
+          python3 scripts/qualify_proxy_cleanup.py --cycles 2 --output "$QUALIFICATION_ROOT/proxy-cleanup"
+          python3 scripts/qualify_proxy_cleanup.py --transports wts --modes forward-tcp,forward-socks,forward-http --cases fin-then-reset --cycles 20 --output "$QUALIFICATION_ROOT/proxy-fin-reset"
+          python3 scripts/qualify_proxy_soak.py --seconds 30 --per-mode 1 --output "$QUALIFICATION_ROOT/proxy-soak"
+      - name: Annotate failed proxy qualification cases
+        if: failure() && steps.proxy_cleanup.conclusion == 'failure'
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          root = Path(os.environ["QUALIFICATION_ROOT"])
+          for profile in ("proxy-cleanup", "proxy-fin-reset", "proxy-soak"):
+              path = root / profile / "results.json"
+              if not path.exists():
+                  continue
+              for row in json.loads(path.read_text()):
+                  if row.get("status") == "fail":
+                      message = f"{profile}: {row['name']}: {row.get('error', 'check failed')}"
+                      message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+                      print(f"::error title=Proxy qualification::{message}")
+          PY
       - name: Restore the OpenSSL QUIC test client
         id: openssl-quic
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

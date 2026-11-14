@@ -193,6 +193,12 @@ impl TransportWrite for Http2TransportWrite {
             None => std::future::pending().await,
         }
     }
+
+    async fn connection_closed(&mut self) {
+        // HTTP/2 RST_STREAM/connection failure closes the body receiver. Unlike QUIC
+        // STOP_SENDING, this is not a normal directional half-close.
+        self.cancelled().await;
+    }
 }
 
 pub async fn connect(

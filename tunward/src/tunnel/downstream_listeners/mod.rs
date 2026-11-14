@@ -56,6 +56,7 @@ impl DownstreamRead for tokio::net::tcp::OwnedReadHalf {
 impl DownstreamRead for tokio::net::unix::OwnedReadHalf {}
 impl DownstreamRead for udp::UdpPeerReader {}
 impl DownstreamRead for crate::protocols::udp::UdpStream {}
+impl DownstreamRead for crate::protocols::udp::WsUdpStream {}
 impl DownstreamRead for tokio::io::DuplexStream {}
 impl<T: AsyncRead + Send + 'static> DownstreamRead for tokio::io::ReadHalf<T> {}
 
