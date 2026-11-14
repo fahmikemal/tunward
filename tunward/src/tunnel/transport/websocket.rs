@@ -1,4 +1,4 @@
-use super::io::{MAX_PACKET_LENGTH, TransportRead, TransportWrite};
+use super::io::{MAX_RECORD_LENGTH, TransportRead, TransportWrite};
 use crate::tunnel::RemoteAddr;
 use crate::tunnel::client::Client;
 use crate::tunnel::client::connection_pool::{L4ReadHalf, L4Stream, L4WriteHalf};
@@ -46,7 +46,7 @@ impl WebsocketTransportWrite {
     ) -> Self {
         Self {
             inner: ws,
-            buf: BytesMut::with_capacity(MAX_PACKET_LENGTH),
+            buf: BytesMut::with_capacity(MAX_RECORD_LENGTH),
             pending_operations,
             pending_ops_notify: notify,
             in_flight_ping,
@@ -79,23 +79,9 @@ impl TransportWrite for WebsocketTransportWrite {
             return Err(io::Error::new(ErrorKind::ConnectionAborted, err));
         }
 
-        // If the buffer has been completely filled with previous read, Grows it !
-        // For the buffer to not be a bottleneck when the TCP window scale.
-        // We clamp it to 128KB to avoid unbounded growth and as websocket max frame size is 64Mb by default
-        // For udp, the buffer will never grow.
-        const _128_KB: usize = 128 * 1024;
+        // Each write carries one bounded v2 record. Keep room for its header as well as the
+        // maximum payload, and reuse it instead of growing an adaptive stream-sized buffer.
         buf.clear();
-        if buf.capacity() == read_len && buf.capacity() < _128_KB {
-            let new_size = (buf.capacity() + (buf.capacity() / 4)).min(_128_KB); // grow buffer by 1.25 %
-            buf.reserve(new_size);
-            trace!(
-                "Buffer {} KB {} {} {}",
-                buf.capacity() as f64 / 1024.0,
-                new_size,
-                buf.len(),
-                buf.capacity()
-            )
-        }
 
         Ok(())
     }
@@ -207,10 +193,11 @@ impl TransportRead for WebsocketTransportRead {
                     };
                 }
                 OpCode::Close => {
+                    // A congested writer may have filled the control queue. The close reply is
+                    // best effort: waiting for room here would stop RX from cancelling forwarding.
                     let _ = self
                         .pending_operations
-                        .send(Frame::close(CloseCode::Normal.into(), &[]))
-                        .await;
+                        .try_send(Frame::close(CloseCode::Normal.into(), &[]));
                     self.notify_pending_ops.notify_one();
                     return Err(io::Error::new(ErrorKind::NotConnected, "websocket close"));
                 }
@@ -370,4 +357,88 @@ pub fn mk_websocket_tunnel(
     let in_flight_ping = Arc::new(AtomicUsize::new(0));
     let (ws_rx, pending_ops) = WebsocketTransportRead::new(ws_rx, in_flight_ping.clone());
     Ok((ws_rx, WebsocketTransportWrite::new(ws_tx, pending_ops, in_flight_ping)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tunnel::transport::io::MAX_PACKET_LENGTH;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+
+    async fn connected_websockets() -> (WebSocket<TcpStream>, WebSocket<L4Stream>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let (client, (server, _)) =
+            tokio::try_join!(TcpStream::connect(listener.local_addr().unwrap()), listener.accept(),).unwrap();
+        let client = WebSocket::after_handshake(client, Role::Client);
+        let mut server = WebSocket::after_handshake(L4Stream::from_tcp(server, Bytes::new()), Role::Server);
+        server.set_auto_pong(false);
+        server.set_auto_close(false);
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn peer_close_does_not_wait_for_a_saturated_control_queue() {
+        let (mut peer, server) = connected_websockets().await;
+        let (read, _) = server.split(|stream| stream.into_split());
+        let (mut read, (pending, _)) = WebsocketTransportRead::new(read, Arc::new(AtomicUsize::new(0)));
+        for _ in 0..pending.max_capacity() {
+            peer.write_frame(Frame::new(true, OpCode::Ping, None, Payload::Borrowed(&[])))
+                .await
+                .unwrap();
+        }
+        peer.write_frame(Frame::close(1000, &[])).await.unwrap();
+        peer.flush().await.unwrap();
+
+        // Keep both the peer and the congested control receiver alive: neither EOF nor a dropped
+        // queue may rescue a Close that incorrectly waits for the blocked sender to make room.
+        let result = tokio::time::timeout(Duration::from_secs(1), read.copy(tokio::io::sink()))
+            .await
+            .expect("peer Close must stop receiving even while the control queue is full");
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::NotConnected);
+        assert_eq!(pending.len(), pending.max_capacity());
+    }
+
+    #[tokio::test]
+    async fn maximum_records_reuse_the_websocket_write_buffer() {
+        use bytes::BufMut;
+        let (mut peer, server) = connected_websockets().await;
+        let (_, write) = server.split(|stream| stream.into_split());
+        let (_control_tx, control_rx) = tokio::sync::mpsc::channel(10);
+        let mut write =
+            WebsocketTransportWrite::new(write, (control_rx, Arc::new(Notify::new())), Arc::new(AtomicUsize::new(0)));
+        let initial_capacity = write.buf.capacity();
+        let sending = async {
+            for value in [17, 34] {
+                let buf = write.buf_mut();
+                buf.put_u8(0);
+                buf.put_u32(MAX_PACKET_LENGTH as u32);
+                buf.resize(MAX_PACKET_LENGTH + 5, value);
+                write.write().await.unwrap();
+                assert_eq!(
+                    write.buf.capacity(),
+                    initial_capacity,
+                    "a full legal record must not grow the per-tunnel write buffer"
+                );
+            }
+            write.buf_mut().extend_from_slice(&[1, 0, 0, 0, 0]);
+            write.write().await.unwrap();
+        };
+        let receiving = async {
+            for value in [17, 34] {
+                let frame = peer.read_frame().await.unwrap();
+                assert_eq!(frame.opcode, OpCode::Binary);
+                assert_eq!(frame.payload.len(), MAX_PACKET_LENGTH + 5);
+                assert_eq!(&frame.payload[..5], &[0, 0, 1, 0, 0]);
+                assert!(frame.payload[5..].iter().all(|byte| *byte == value));
+            }
+            let fin = peer.read_frame().await.unwrap();
+            assert_eq!(fin.payload.as_ref(), &[1, 0, 0, 0, 0]);
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(sending, receiving);
+        })
+        .await
+        .unwrap();
+    }
 }

@@ -17,7 +17,7 @@ use tokio::select;
 use tokio::sync::{Notify, oneshot};
 use tokio::time::Instant;
 
-pub(super) static MAX_PACKET_LENGTH: usize = 64 * 1024;
+pub(super) const MAX_PACKET_LENGTH: usize = 64 * 1024;
 
 pub trait TransportWrite: Send + 'static {
     fn buf_mut(&mut self) -> &mut BytesMut;
@@ -134,6 +134,7 @@ impl TransportWrite for TransportWriter {
 
 // Protocol v2 records are independent of WebSocket, HTTP/2 DATA, and QUIC chunk boundaries.
 const RECORD_HEADER_LEN: usize = 5;
+pub(super) const MAX_RECORD_LENGTH: usize = RECORD_HEADER_LEN + MAX_PACKET_LENGTH;
 const DATA: u8 = 0;
 const FIN: u8 = 1;
 
