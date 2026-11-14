@@ -35,6 +35,8 @@ dependencies in `scripts/requirements-qualification.txt`. Standalone generation 
 | `scripts/qualify_reverse_tunnels.py` | A port-0 reverse TCP or UDP listener keeping its port across visitors, bursts and reply timeouts on WSS, HTTP/2 and WebTransport; a fixed-port reverse TCP listener under the default quotas staying open between two requests of a client 100 ms away (through a delaying relay) on WSS and HTTP/2; reverse SOCKS5 and HTTP proxy `?allow=` lists against literal, domain and IPv4-mapped destinations; `allow=` refused where it cannot apply; a client naming a zero or far-future idle timeout not aborting the server |
 | `scripts/qualify_pool_timeout.py` | Delayed TLS establishment versus pool acquisition deadline |
 | `scripts/qualify_recovery.py` | Verified mTLS reconnect and resource cleanup on WSS, HTTP/2 and WebTransport: repeated EOF/reset, failed destinations, cancellation under backpressure, controlled TCP/UDP relay outages, server/client crashes, reverse endpoint reclamation, and silent authenticated TCP peers; Linux `/proc` samples record FD/thread counts, RSS, CPU time and exchange/cleanup latency |
+| `scripts/qualify_proxy_cleanup.py` | Verified mTLS forward/reverse TCP, SOCKS5, HTTP CONNECT and ordinary HTTP requests under upload/download resets and normal half-close; stream modes also reset after directional FIN. Checks session removal and reuse of a one-tunnel quota (plus one pending reverse request), with FD/thread samples |
+| `scripts/qualify_proxy_soak.py` | Concurrent verified-mTLS WSS, HTTP/2 and WebTransport workload: held forward/reverse TCP, SOCKS5 and CONNECT streams, transient connections and ordinary HTTP churn, sampled resources, byte integrity, restart recovery and final cleanup |
 | `scripts/qualify_hardening.py` | Domain confinement to restriction CIDRs, DNS rebinding, refused UDP retries, TCP and WebTransport handshake bounds, and descriptor exhaustion |
 | `scripts/qualify_wan.py` | Expiring staging agent, native WAN clients, direct mTLS control, per-stream traces and client/server TCP diagnostics |
 | `scripts/qualify_wan_endurance.py` | Periodic native WAN probes over a declared 24–72 hour window; separate cycle reports |
@@ -75,6 +77,7 @@ python3 scripts/qualify.py \
   --devices 32 --idle 32 --hold 2
 python3 scripts/qualify_identity.py --output target/qualification/identity-review
 python3 scripts/qualify_pool_timeout.py --output target/qualification/pool-review
+python3 scripts/qualify_proxy_cleanup.py --cycles 2 --output target/qualification/proxy-cleanup-review
 python3 scripts/qualify_quotas.py --output target/qualification/quota-review
 python3 scripts/qualify_revocation.py --output target/qualification/revocation-review
 python3 scripts/qualify_fleet.py --output target/qualification/fleet-review
@@ -83,6 +86,24 @@ python3 scripts/qualify_trust_boundaries.py --output target/qualification/trust-
 python3 scripts/qualify_reverse_tunnels.py --output target/qualification/reverse-review
 python3 scripts/qualify_hardening.py --output target/qualification/hardening-review
 ~~~
+
+For a local proxy endurance window, run:
+
+~~~sh
+python3 scripts/qualify_proxy_soak.py --seconds 1800 --per-mode 3 \
+  --output target/qualification/proxy-soak-review
+~~~
+
+Each transport holds 18 streams across six modes, exchanges and verifies 16 KiB
+every five seconds, and periodically opens eight transient streams plus two
+ordinary HTTP requests. Resource limits compare each process to its warmed
+baseline: at most four extra descriptors, two extra threads, 32 MiB RSS growth,
+and RSS below 1 GiB. Reports retain every sample, CPU time, latency percentiles,
+binary/runner hashes and a final completion receipt. Review the full requested
+duration, final cleanup, failures and hashes together. CI runs a 30-second,
+one-stream-per-mode smoke profile; that is not a 30-minute endurance result.
+This loopback workload does not qualify WAN latency, production capacity or
+physical-device availability.
 
 The hardening runner checks, on WS and on mTLS WSS, HTTPS, and WebTransport, that a
 domain is only reached at resolved addresses inside a constraining restriction

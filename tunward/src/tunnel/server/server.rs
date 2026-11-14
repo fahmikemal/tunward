@@ -25,6 +25,7 @@ use crate::tunnel::server::utils::{
     validate_tunnel_with_scope,
 };
 use crate::tunnel::tls_reloader::TlsReloader;
+use crate::tunnel::transport::io::BoxedLocalRead;
 use crate::tunnel::upstream_connectors::{TcpUpstreamConnector, UdpUpstreamConnector, UpstreamConnector};
 use crate::tunnel::{LocalProtocol, RemoteAddr, try_to_sock_addr};
 use ahash::AHasher;
@@ -48,7 +49,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, oneshot};
 use tokio_rustls::TlsAcceptor;
@@ -126,7 +127,7 @@ pub(super) struct EstablishedTunnel {
     pub remote_addr: RemoteAddr,
     /// The port a reverse tunnel's listener is bound to, reported to the client.
     pub listener_port: Option<u16>,
-    pub local_rx: Pin<Box<dyn AsyncRead + Send>>,
+    pub local_rx: BoxedLocalRead,
     pub local_tx: Pin<Box<dyn AsyncWrite + Send>>,
     pub need_cookie: bool,
     pub quota: Option<TunnelPermit>,
@@ -476,12 +477,7 @@ impl<E: crate::TokioExecutorRef> Server<E> {
         resources: (Option<&TunnelPermit>, &RevocationGuard, Option<&TunnelLease>),
         listener: (&ListenerOwner, Option<uuid::Uuid>),
         tenant: Option<&TenantAccess>,
-    ) -> anyhow::Result<(
-        RemoteAddr,
-        Option<u16>,
-        Pin<Box<dyn AsyncRead + Send>>,
-        Pin<Box<dyn AsyncWrite + Send>>,
-    )> {
+    ) -> anyhow::Result<(RemoteAddr, Option<u16>, BoxedLocalRead, Pin<Box<dyn AsyncWrite + Send>>)> {
         let (restriction, grant) = allowed;
         let (quota, revocation, fleet) = resources;
         let (owner, client_tunnel) = listener;
@@ -500,7 +496,7 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                     Some(_) => Err(anyhow!("UDP tunneling is not supported with HTTP proxy"))?,
                 };
 
-                Ok((remote, None, Box::pin(rx), Box::pin(tx)))
+                Ok((remote, None, BoxedLocalRead::new(rx), Box::pin(tx)))
             }
             LocalProtocol::Tcp { proxy_protocol } => {
                 let connector = TcpUpstreamConnector::new(
@@ -541,7 +537,7 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                     let _ = tx.write_all(&header).await;
                 }
 
-                Ok((remote, None, Box::pin(rx), Box::pin(tx)))
+                Ok((remote, None, BoxedLocalRead::new(rx), Box::pin(tx)))
             }
             LocalProtocol::ReverseTcp => {
                 static SERVERS: LazyLock<ReverseTunnelServer<TcpDownstreamListener>> =
@@ -570,7 +566,7 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                     )
                     .await?;
 
-                Ok((remote, Some(listener.port()), Box::pin(local_rx), Box::pin(local_tx)))
+                Ok((remote, Some(listener.port()), BoxedLocalRead::new(local_rx), Box::pin(local_tx)))
             }
             LocalProtocol::ReverseUdp { timeout } => {
                 static SERVERS: LazyLock<ReverseTunnelServer<UdpDownstreamListener>> =
@@ -598,7 +594,7 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                         UdpDownstreamListener::serves_peers,
                     )
                     .await?;
-                Ok((remote, Some(listener.port()), Box::pin(local_rx), Box::pin(local_tx)))
+                Ok((remote, Some(listener.port()), BoxedLocalRead::new(local_rx), Box::pin(local_tx)))
             }
             LocalProtocol::ReverseSocks5 { timeout, credentials } => {
                 static SERVERS: LazyLock<ReverseTunnelServer<Socks5DownstreamListener>> =
@@ -635,7 +631,7 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                 use crate::tunnel::downstream_listeners::DownstreamWrite;
                 let _ = local_tx.on_tunnel_ready(Ok(())).await;
 
-                Ok((remote, Some(listener.port()), Box::pin(local_rx), Box::pin(local_tx)))
+                Ok((remote, Some(listener.port()), BoxedLocalRead::new(local_rx), Box::pin(local_tx)))
             }
             LocalProtocol::ReverseHttpProxy { timeout, credentials } => {
                 static SERVERS: LazyLock<ReverseTunnelServer<HttpProxyDownstreamListener>> =
@@ -664,7 +660,7 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                     )
                     .await?;
 
-                Ok((remote, Some(listener.port()), Box::pin(local_rx), Box::pin(local_tx)))
+                Ok((remote, Some(listener.port()), BoxedLocalRead::new(local_rx), Box::pin(local_tx)))
             }
             #[cfg(unix)]
             LocalProtocol::ReverseUnix { ref path } => {
@@ -697,7 +693,7 @@ impl<E: crate::TokioExecutorRef> Server<E> {
                     )
                     .await?;
 
-                Ok((remote, None, Box::pin(local_rx), Box::pin(local_tx)))
+                Ok((remote, None, BoxedLocalRead::new(local_rx), Box::pin(local_tx)))
             }
             #[cfg(not(unix))]
             LocalProtocol::ReverseUnix { .. } => {

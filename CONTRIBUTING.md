@@ -47,6 +47,17 @@ TCP reader. Report fatal errors there; ordinary directional EOF must keep the
 response direction alive. The public generic `transport::io::forward` function
 still accepts `AsyncRead + Send` without a `DownstreamRead` implementation.
 
+Server-side type erasure also preserves this cancellation signal. Built-in TCP
+and SOCKS5 upstream connectors monitor fatal errors during reverse forwarding.
+Custom `UpstreamConnector` implementations can override the optional `cancelled`
+method; its default remains pending, so existing implementations still compile.
+
+`HttpProxyRead` is now a reader wrapper rather than a type alias for
+`ReadHalf<DuplexStream>`. It still implements `AsyncRead` and `DownstreamRead`,
+and observes fatal errors on the proxy socket while the duplex bridge is full.
+Code that required the concrete `ReadHalf<DuplexStream>` type must accept the
+wrapper instead. Directional EOF remains distinct from a reset.
+
 ## Docker and Podman integration tests
 
 With Docker, use its running daemon and socket. You do not need a second Docker
@@ -102,6 +113,8 @@ python3 scripts/qualify.py --sections protocols,fleet,security,extended,isolatio
 python3 scripts/qualify_identity.py --output target/qualification/identity-review
 python3 scripts/qualify_pool_timeout.py --output target/qualification/pool-review
 python3 scripts/qualify_recovery.py --cycles 100 --output target/qualification/recovery-review
+python3 scripts/qualify_proxy_cleanup.py --cycles 2 --output target/qualification/proxy-cleanup-review
+python3 scripts/qualify_proxy_soak.py --seconds 1800 --per-mode 3 --output target/qualification/proxy-soak-review
 python3 scripts/qualify_quotas.py --output target/qualification/quota-review
 python3 scripts/qualify_revocation.py --output target/qualification/revocation-review
 python3 scripts/qualify_fleet.py --output target/qualification/fleet-review

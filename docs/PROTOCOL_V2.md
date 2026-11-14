@@ -122,10 +122,20 @@ a receive task blocked writing to a non-reading local target and release its
 tunnel permit. After sending FIN, a peer stopping reads is permitted while the
 opposite response direction remains active.
 
+A complete HTTP/2 connection failure or QUIC session closure remains fatal after
+FIN. A QUIC receive-stream reset also interrupts delivery to a blocked local
+writer. Fatal forwarding errors explicitly reset the QUIC send stream; dropping
+it would otherwise send a graceful transport FIN. Successful directional
+half-close still drains the response and never takes this reset path.
+
 Plain local TCP and SOCKS5 TCP readers also watch socket errors while an
 outgoing tunnel write waits for capacity. A local TCP reset can cancel that
 write and propagate cancellation to the peer even when the target is not
 reading. This watches errors rather than directional EOF, preserving half-close.
+The signal survives the server's erased reader type and applies to TCP/SOCKS5
+reverse destinations as well. HTTP CONNECT and ordinary HTTP proxy readers
+observe fatal socket errors independently of their bounded duplex bridge and
+HTTP body backpressure. Normal HTTP completion does not trigger cancellation.
 
 ## Tunnel readiness
 

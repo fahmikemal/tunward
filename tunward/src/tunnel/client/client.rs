@@ -322,7 +322,8 @@ impl<E: TokioExecutorRef> Client<E> {
                         }
                     };
 
-                    let _ = super::super::transport::io::forward(
+                    let _ = super::super::transport::io::forward_upstream(
+                        &*connector,
                         local_rx,
                         local_tx,
                         ws_rx,
