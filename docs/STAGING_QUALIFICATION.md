@@ -105,6 +105,15 @@ one-stream-per-mode smoke profile; that is not a 30-minute endurance result.
 This loopback workload does not qualify WAN latency, production capacity or
 physical-device availability.
 
+Both proxy runners configure a one-second heartbeat. Their eight-second cleanup
+budget must not be read as a guarantee for the default 30-second WSS heartbeat.
+Supplemental candidate tests with that default observed about 60 seconds to
+release a forward HTTP CONNECT tunnel after an upload reset against a blocked
+destination, both before and after directional FIN. Reverse TCP reset checks
+completed promptly in the same supplemental profile. Longer or disabled
+heartbeats need separate acceptance criteria and qualification; fast cleanup
+independent of the WSS heartbeat remains follow-up stabilization work.
+
 The hardening runner checks, on WS and on mTLS WSS, HTTPS, and WebTransport, that a
 domain is only reached at resolved addresses inside a constraining restriction
 CIDR, over TCP and UDP, that IPv4-mapped destinations follow IPv4 rules, and that a

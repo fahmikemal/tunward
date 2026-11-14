@@ -66,6 +66,11 @@ These gates remain separate from feature count:
   must retain the exact binary hash and completed duration separately. This
   work adds no product features. WAN testing remains deferred while the
   staging VPSs are occupied.
+- Tighten WSS cleanup under backpressure with the default or disabled heartbeat.
+  The proxy regression profile configures one second; supplemental default
+  30-second heartbeat tests still measured about 60 seconds to release a
+  blocked forward CONNECT tunnel after reset. Passing the shorter profile does
+  not establish the same cleanup deadline for the default configuration.
 - Investigate the historical WSS WAN timeout.
 - The intermittent tenant ephemeral reverse-UDP CI timeout is **resolved**. An
   ephemeral UDP reverse listener closed at its first idle check after its request
