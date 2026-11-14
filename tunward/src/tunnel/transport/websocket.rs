@@ -308,9 +308,18 @@ pub async fn connect(
         .and_then(Either::left)
         .ok_or_else(|| anyhow!("the connection pool did not return a TCP stream"))?;
 
-    let (ws, response) = fastwebsockets::handshake::client(&TokioExecutor::new(), req, transport)
-        .await
-        .with_context(|| format!("failed to do websocket handshake with the server {:?}", client_cfg.remote_addr))?;
+    let executor = TokioExecutor::new();
+    let upgrade = fastwebsockets::handshake::client(&executor, req, transport);
+    // Reverse requests wait for a visitor before the server upgrades them; the reverse loop
+    // owns that longer deadline. Ordinary requests must not wait forever after TCP/TLS connects.
+    let (ws, response) = if dest_addr.protocol.is_reverse_tunnel() {
+        upgrade.await
+    } else {
+        tokio::time::timeout(client_cfg.timeout_connect, upgrade)
+            .await
+            .with_context(|| format!("websocket tunnel setup timed out after {:?}", client_cfg.timeout_connect))?
+    }
+    .with_context(|| format!("failed to do websocket handshake with the server {:?}", client_cfg.remote_addr))?;
 
     super::check_version(response.headers())?;
     let (ws_rx, ws_tx) = mk_websocket_tunnel(ws, Role::Client, client_cfg.websocket_mask_frame)?;

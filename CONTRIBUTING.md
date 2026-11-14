@@ -78,6 +78,7 @@ cargo build --release --locked -p tunward-cli
 python3 scripts/qualify.py --sections protocols,fleet,security,extended,isolation,lifecycle,rotation
 python3 scripts/qualify_identity.py --output target/qualification/identity-review
 python3 scripts/qualify_pool_timeout.py --output target/qualification/pool-review
+python3 scripts/qualify_recovery.py --cycles 100 --output target/qualification/recovery-review
 python3 scripts/qualify_quotas.py --output target/qualification/quota-review
 python3 scripts/qualify_revocation.py --output target/qualification/revocation-review
 python3 scripts/qualify_fleet.py --output target/qualification/fleet-review

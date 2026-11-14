@@ -64,6 +64,8 @@ impl AsyncWrite for StdioFd {
     }
 }
 
+impl crate::tunnel::downstream_listeners::DownstreamRead for StdinStream {}
+
 pub struct StdinStream {
     stdin: StdioFd,
     _receiver: oneshot::Receiver<()>,

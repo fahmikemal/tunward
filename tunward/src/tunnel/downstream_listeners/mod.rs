@@ -25,12 +25,39 @@ pub use unix_sock::UnixDownstreamListener;
 
 use crate::tunnel::RemoteAddr;
 use std::future::Future;
+use std::io;
+use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_stream::Stream;
 
 /// Read half of a local duplex stream that can be forwarded through a tunnel.
-pub trait DownstreamRead: AsyncRead + Send + 'static {}
-impl<T: AsyncRead + Send + 'static> DownstreamRead for T {}
+pub trait DownstreamRead: AsyncRead + Send + 'static {
+    /// A fatal local error must interrupt a tunnel write blocked by remote backpressure.
+    /// A directional EOF is not cancellation: the response may still be in flight.
+    fn cancelled(self: Pin<&mut Self>) -> impl Future<Output = io::Error> + Send {
+        std::future::pending()
+    }
+}
+
+impl DownstreamRead for tokio::net::tcp::OwnedReadHalf {
+    async fn cancelled(self: Pin<&mut Self>) -> io::Error {
+        let reader = self.get_mut();
+        let socket: &tokio::net::TcpStream = reader.as_ref();
+        match socket.ready(tokio::io::Interest::ERROR).await {
+            Err(error) => error,
+            Ok(_) => socket
+                .take_error()
+                .unwrap_or_else(Some)
+                .unwrap_or_else(|| io::Error::new(io::ErrorKind::ConnectionAborted, "local TCP socket failed")),
+        }
+    }
+}
+#[cfg(unix)]
+impl DownstreamRead for tokio::net::unix::OwnedReadHalf {}
+impl DownstreamRead for udp::UdpPeerReader {}
+impl DownstreamRead for crate::protocols::udp::UdpStream {}
+impl DownstreamRead for tokio::io::DuplexStream {}
+impl<T: AsyncRead + Send + 'static> DownstreamRead for tokio::io::ReadHalf<T> {}
 
 /// Write half of a local duplex stream that can be forwarded through a tunnel. On top of being
 /// writable, it must acknowledge the end-to-end tunnel outcome to the local client once it is known.
