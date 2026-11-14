@@ -11,7 +11,7 @@ use hyper::Request;
 use hyper::body::{Frame, Incoming};
 use hyper::header::{AUTHORIZATION, CONTENT_TYPE, COOKIE};
 use hyper::http::response::Parts;
-use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::rt::{TokioIo, TokioTimer};
 use log::{debug, error, warn};
 use std::future::Future;
 use std::io;
@@ -24,14 +24,62 @@ use tokio::task::AbortHandle;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
+// Hyper spawns HTTP/2 connection/body tasks in addition to its public connection future.
+// Scope those tasks to this tunnel too: aborting only the public driver can leave a
+// backpressured request body (and its TCP socket) alive after forwarding is cancelled.
+struct ConnectionTasks(Arc<parking_lot::Mutex<Option<Vec<AbortHandle>>>>);
+
+impl ConnectionTasks {
+    fn new() -> Self {
+        Self(Arc::new(parking_lot::Mutex::new(Some(Vec::new()))))
+    }
+}
+
+impl Drop for ConnectionTasks {
+    fn drop(&mut self) {
+        if let Some(tasks) = self.0.lock().take() {
+            for task in tasks {
+                task.abort();
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ConnectionExecutor<E> {
+    executor: E,
+    tasks: Arc<parking_lot::Mutex<Option<Vec<AbortHandle>>>>,
+}
+
+// The executor is never structurally pinned or exposed through a pinned projection.
+impl<E> Unpin for ConnectionExecutor<E> {}
+
+impl<E, F> hyper::rt::Executor<F> for ConnectionExecutor<E>
+where
+    E: crate::TokioExecutorRef,
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    fn execute(&self, future: F) {
+        if let Some(tasks) = self.tasks.lock().as_mut() {
+            tasks.push(self.executor.spawn(future));
+        }
+    }
+}
+
 pub struct Http2TransportRead {
     inner: BodyStream<Incoming>,
     cnx_poller: Option<AbortHandle>,
+    tasks: Option<ConnectionTasks>,
 }
 
 impl Http2TransportRead {
     pub const fn new(inner: BodyStream<Incoming>, cnx_poller: Option<AbortHandle>) -> Self {
-        Self { inner, cnx_poller }
+        Self {
+            inner,
+            cnx_poller,
+            tasks: None,
+        }
     }
 }
 
@@ -138,6 +186,13 @@ impl TransportWrite for Http2TransportWrite {
     fn handle_pending_operations(&mut self) -> impl Future<Output = Result<(), io::Error>> + Send {
         std::future::ready(Ok(()))
     }
+
+    async fn cancelled(&mut self) {
+        match &self.inner {
+            Some(sender) => sender.closed().await,
+            None => std::future::pending().await,
+        }
+    }
 }
 
 pub async fn connect(
@@ -228,39 +283,55 @@ pub async fn connect(
         .take()
         .and_then(Either::left)
         .ok_or_else(|| anyhow!("the connection pool did not return a TCP stream"))?;
-    let (mut request_sender, cnx) = hyper::client::conn::http2::Builder::new(TokioExecutor::new())
-        .timer(TokioTimer::new())
-        .adaptive_window(true)
-        .keep_alive_interval(client.config.websocket_ping_frequency)
-        .keep_alive_timeout(Duration::from_secs(10))
-        .keep_alive_while_idle(false)
-        .handshake(TokioIo::new(transport))
-        .await
-        .with_context(|| format!("failed to do http2 handshake with the server {:?}", client.config.remote_addr))?;
-    let cnx_poller = client.executor.spawn(async move {
-        if let Err(err) = cnx.await {
-            error!("{err:?}")
+    let setup = async {
+        let tasks = ConnectionTasks::new();
+        let executor = ConnectionExecutor {
+            executor: client.executor.clone(),
+            tasks: tasks.0.clone(),
+        };
+        let (mut request_sender, cnx) = hyper::client::conn::http2::Builder::new(executor)
+            .timer(TokioTimer::new())
+            .adaptive_window(true)
+            .keep_alive_interval(client.config.websocket_ping_frequency)
+            .keep_alive_timeout(Duration::from_secs(10))
+            .keep_alive_while_idle(false)
+            .handshake(TokioIo::new(transport))
+            .await
+            .with_context(|| format!("failed to do http2 handshake with the server {:?}", client.config.remote_addr))?;
+        let cnx_poller = scopeguard::guard(
+            client.executor.spawn(async move {
+                if let Err(err) = cnx.await {
+                    error!("{err:?}")
+                }
+            }),
+            |task| task.abort(),
+        );
+        let response = request_sender
+            .send_request(req)
+            .await
+            .with_context(|| format!("failed to send http2 request with the server {:?}", client.config.remote_addr))?;
+
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "Http2 server rejected the connection: {:?}: {:?}",
+                response.status(),
+                String::from_utf8(response.into_body().collect().await?.to_bytes().to_vec()).unwrap_or_default()
+            ));
         }
-    });
 
-    let response = request_sender
-        .send_request(req)
-        .await
-        .with_context(|| format!("failed to send http2 request with the server {:?}", client.config.remote_addr))?;
-
-    if !response.status().is_success() {
-        return Err(anyhow!(
-            "Http2 server rejected the connection: {:?}: {:?}",
-            response.status(),
-            String::from_utf8(response.into_body().collect().await?.to_bytes().to_vec()).unwrap_or_default()
-        ));
+        super::check_version(response.headers())?;
+        let (parts, body) = response.into_parts();
+        let mut reader =
+            Http2TransportRead::new(BodyStream::new(body), Some(scopeguard::ScopeGuard::into_inner(cnx_poller)));
+        reader.tasks = Some(tasks);
+        Ok((reader, Http2TransportWrite::new(tx), parts))
+    };
+    // Keep idle reverse-listener waiting separate from the ordinary setup deadline.
+    if dest_addr.protocol.is_reverse_tunnel() {
+        setup.await
+    } else {
+        tokio::time::timeout(client.config.timeout_connect, setup)
+            .await
+            .with_context(|| format!("HTTP/2 tunnel setup timed out after {:?}", client.config.timeout_connect))?
     }
-
-    super::check_version(response.headers())?;
-    let (parts, body) = response.into_parts();
-    Ok((
-        Http2TransportRead::new(BodyStream::new(body), Some(cnx_poller)),
-        Http2TransportWrite::new(tx),
-        parts,
-    ))
 }

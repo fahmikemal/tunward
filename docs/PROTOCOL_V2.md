@@ -109,7 +109,23 @@ response are different observations.
 
 HTTP/2 uses bounded outgoing body queues. After closing its outbound body it
 drains peer END_STREAM, with a ten-second deadline, before releasing the
-connection driver. Enqueueing the final record alone does not prove delivery.
+connection driver. Client-side HTTP/2 background connection/body tasks share
+the tunnel's lifetime, including cancellation under backpressure. Enqueueing
+the final record alone does not prove delivery.
+WebTransport similarly drains QUIC FIN after both directional tunnel FINs,
+with a ten-second deadline, so normal completion does not reset an unfinished
+receive stream.
+
+Before sending its directional FIN, the forwarding task also watches HTTP/2
+body closure or WebTransport STOP_SENDING. Peer cancellation can then interrupt
+a receive task blocked writing to a non-reading local target and release its
+tunnel permit. After sending FIN, a peer stopping reads is permitted while the
+opposite response direction remains active.
+
+Plain local TCP and SOCKS5 TCP readers also watch socket errors while an
+outgoing tunnel write waits for capacity. A local TCP reset can cancel that
+write and propagate cancellation to the peer even when the target is not
+reading. This watches errors rather than directional EOF, preserving half-close.
 
 ## Tunnel readiness
 
@@ -130,6 +146,14 @@ target.
 Normal acknowledgement and idle reverse-request waiting use distinct deadlines.
 A WebTransport acknowledgement timeout invalidates the cached session so later
 requests can reconnect.
+
+After acquiring a pooled TCP/TLS connection, ordinary WebSocket and HTTP/2
+tunnel setup also has the client's connect deadline (ten seconds in the default
+construction paths). A peer that completes TLS but never answers the tunnel
+request cannot retain the pending setup indefinitely. Failed or cancelled
+HTTP/2 setup aborts its connection driver. Reverse requests continue to use the
+reverse loop's longer reply deadline because the server waits for a visitor.
+The pool acquisition deadline is separate and is unchanged.
 
 ## Pools, liveness, and limits
 

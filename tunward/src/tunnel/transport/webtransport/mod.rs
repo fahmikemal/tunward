@@ -65,6 +65,26 @@ impl TransportRead for WebTransportRead {
         self.chunks[..count].fill(Bytes::new());
         result.map_err(|err| io::Error::new(ErrorKind::ConnectionAborted, err))
     }
+
+    async fn finish(&mut self) -> io::Result<()> {
+        // Drain QUIC FIN after both v2 FIN records. Dropping an unfinished receiver would
+        // otherwise send STOP_SENDING during a normal peer shutdown.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(chunk) = self
+                .inner
+                .read_chunk(MAX_PACKET_LENGTH, true)
+                .await
+                .map_err(io::Error::other)?
+            {
+                if !chunk.bytes.is_empty() {
+                    return Err(io::Error::new(ErrorKind::InvalidData, "data after tunnel FIN"));
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| io::Error::new(ErrorKind::TimedOut, "WebTransport tunnel did not finish its stream"))?
+    }
 }
 
 async fn write_chunks(writer: &mut (impl AsyncWrite + Unpin), chunks: &[Bytes]) -> io::Result<()> {
@@ -151,5 +171,9 @@ impl TransportWrite for WebTransportWrite {
 
     async fn handle_pending_operations(&mut self) -> Result<(), io::Error> {
         Ok(())
+    }
+
+    async fn cancelled(&mut self) {
+        let _ = self.inner.stopped().await;
     }
 }

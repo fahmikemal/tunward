@@ -24,6 +24,29 @@ Python 3 and OpenSSL are required for certificate generation and qualification
 scripts. Container-backed Rust integration fixtures require a Docker-compatible
 API, access to the chosen engine, and available fixture images.
 
+## Custom library listeners
+
+Custom reader types used with `DownstreamListener` or
+`Client::connect_to_server` must explicitly implement
+`tunward::tunnel::downstream_listeners::DownstreamRead`. The former blanket
+implementation for every `AsyncRead + Send + 'static` has been replaced by
+implementations for built-in readers so TCP readers can report fatal socket
+errors during a backpressured tunnel write. Existing custom readers therefore
+need a source change even though the CLI and wire protocol are unchanged.
+
+For a custom type that already implements `AsyncRead + Send + 'static` and
+has no independent cancellation signal, the migration is:
+
+~~~rust
+impl tunward::tunnel::downstream_listeners::DownstreamRead for CustomReader {}
+~~~
+
+The default `cancelled` future stays pending. A custom TCP wrapper needs its
+own implementation to gain the same socket-error monitoring as the built-in
+TCP reader. Report fatal errors there; ordinary directional EOF must keep the
+response direction alive. The public generic `transport::io::forward` function
+still accepts `AsyncRead + Send` without a `DownstreamRead` implementation.
+
 ## Docker and Podman integration tests
 
 With Docker, use its running daemon and socket. You do not need a second Docker
@@ -78,6 +101,7 @@ cargo build --release --locked -p tunward-cli
 python3 scripts/qualify.py --sections protocols,fleet,security,extended,isolation,lifecycle,rotation
 python3 scripts/qualify_identity.py --output target/qualification/identity-review
 python3 scripts/qualify_pool_timeout.py --output target/qualification/pool-review
+python3 scripts/qualify_recovery.py --cycles 100 --output target/qualification/recovery-review
 python3 scripts/qualify_quotas.py --output target/qualification/quota-review
 python3 scripts/qualify_revocation.py --output target/qualification/revocation-review
 python3 scripts/qualify_fleet.py --output target/qualification/fleet-review

@@ -87,9 +87,16 @@ async def run(args):
                     outcomes = await asyncio.gather(*(asyncio.wait_for(suite.exchange("tcp", lp), 12)
                                                       for _ in range(4)), return_exceptions=True)
                     errors = [type(item).__name__ for item in outcomes if isinstance(item, BaseException)]
-                    log = (suite.out / f"{label}.log").read_text()
-                    pool_timeouts = log.count("from the pool: TimedOut")
                     assert len(errors) == (0 if expected else 4), errors
+                    # The local socket can close just before its task logs the setup error.
+                    # Wait for that diagnostic without weakening the four-timeout assertion.
+                    diagnostic_deadline = time.monotonic() + 1
+                    while True:
+                        log = (suite.out / f"{label}.log").read_text()
+                        pool_timeouts = log.count("from the pool: TimedOut")
+                        if expected or pool_timeouts >= 4 or time.monotonic() >= diagnostic_deadline:
+                            break
+                        await asyncio.sleep(.01)
                     assert pool_timeouts == (0 if expected else 4), log
                     if not expected:
                         assert errors == ["IncompleteReadError"] * 4, errors

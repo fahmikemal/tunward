@@ -215,6 +215,168 @@ async fn client_ws(server_port: u16, dns_resolver: DnsResolver) -> Client {
     .unwrap()
 }
 
+#[rstest]
+#[case::websocket_timeout(TransportScheme::Ws, false)]
+#[case::http2_timeout(TransportScheme::Http, false)]
+#[case::websocket_cancel(TransportScheme::Ws, true)]
+#[case::http2_cancel(TransportScheme::Http, true)]
+#[tokio::test]
+async fn test_stalled_tunnel_setup_releases_transport(
+    dns_resolver: DnsResolver,
+    #[case] scheme: TransportScheme,
+    #[case] cancel: bool,
+) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let config = ClientConfig {
+        remote_addr: TransportAddr::new(scheme, Host::Ipv4(Ipv4Addr::LOCALHOST), endpoint.port(), None).unwrap(),
+        socket_so_mark: SoMark::new(None),
+        http_upgrade_path_prefix: "tunward".into(),
+        http_upgrade_credentials: None,
+        http_headers: HashMap::new(),
+        http_headers_file: None,
+        http_header_host: HeaderValue::from_str(&endpoint.to_string()).unwrap(),
+        timeout_connect: Duration::from_millis(100),
+        websocket_ping_frequency: None,
+        websocket_mask_frame: false,
+        dns_resolver,
+        http_proxy: None,
+        webtransport: None,
+        client_id: None,
+    };
+    let client = Client::new(
+        config,
+        0,
+        Duration::from_secs(2),
+        Duration::from_secs(1),
+        DefaultTokioExecutor::default(),
+    )
+    .await
+    .unwrap();
+    let remote = RemoteAddr {
+        protocol: LocalProtocol::Tcp { proxy_protocol: false },
+        host: Host::Ipv4(Ipv4Addr::LOCALHOST),
+        port: 80,
+    };
+    let mut connecting = scopeguard::guard(
+        tokio::spawn(async move {
+            match scheme {
+                TransportScheme::Ws => {
+                    crate::tunnel::transport::websocket::connect(Uuid::now_v7().into(), &client, &remote)
+                        .await
+                        .map(|_| ())
+                }
+                TransportScheme::Http => {
+                    crate::tunnel::transport::http2::connect(Uuid::now_v7().into(), &client, &remote)
+                        .await
+                        .map(|_| ())
+                }
+                _ => unreachable!(),
+            }
+        }),
+        |task| task.abort(),
+    );
+    let (mut peer, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    // The peer receives the opening request, then stays silent. Draining until EOF proves
+    // that a timed-out or cancelled setup also drops its transport/connection driver.
+    let (requested, request_seen) = tokio::sync::oneshot::channel();
+    let mut peer = scopeguard::guard(
+        tokio::spawn(async move {
+            let mut first = [0; 4096];
+            assert!(peer.read(&mut first).await.unwrap() > 0);
+            let _ = requested.send(());
+            let mut remainder = Vec::new();
+            peer.read_to_end(&mut remainder).await
+        }),
+        |task| task.abort(),
+    );
+    tokio::time::timeout(Duration::from_secs(2), request_seen)
+        .await
+        .unwrap()
+        .unwrap();
+    if cancel {
+        connecting.abort();
+        assert!((&mut *connecting).await.unwrap_err().is_cancelled());
+    } else {
+        let error = tokio::time::timeout(Duration::from_secs(2), &mut *connecting)
+            .await
+            .expect("a silent tunnel peer must not hold setup indefinitely")
+            .unwrap()
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+    }
+    let closed = tokio::time::timeout(Duration::from_secs(2), &mut *peer)
+        .await
+        .expect("failed or cancelled setup must close the peer socket")
+        .unwrap();
+    assert!(closed.is_ok(), "{closed:?}");
+}
+
+#[rstest]
+#[case::websocket(TransportScheme::Ws)]
+#[case::http2(TransportScheme::Http)]
+#[tokio::test]
+async fn test_reverse_wait_survives_forward_setup_deadline(
+    server_no_tls: Server,
+    no_restrictions: RestrictionsRules,
+    dns_resolver: DnsResolver,
+    #[case] scheme: TransportScheme,
+) {
+    let endpoint = server_no_tls.config.bind;
+    let _server = scopeguard::guard(tokio::spawn(server_no_tls.serve(no_restrictions)), |task| task.abort());
+    let initial = client_ws(endpoint.port(), dns_resolver).await;
+    let mut config = (*initial.config).clone();
+    drop(initial);
+    config.remote_addr = TransportAddr::new(scheme, Host::Ipv4(Ipv4Addr::LOCALHOST), endpoint.port(), None).unwrap();
+    config.timeout_connect = Duration::from_millis(100);
+    let client = Client::new(
+        config,
+        0,
+        Duration::from_secs(2),
+        Duration::from_secs(1),
+        DefaultTokioExecutor::default(),
+    )
+    .await
+    .unwrap();
+    let reverse_port = free_port();
+    let remote = RemoteAddr {
+        protocol: LocalProtocol::ReverseTcp,
+        host: Host::Ipv4(Ipv4Addr::LOCALHOST),
+        port: reverse_port,
+    };
+    let connecting = async {
+        match scheme {
+            TransportScheme::Ws => {
+                crate::tunnel::transport::websocket::connect(Uuid::now_v7().into(), &client, &remote)
+                    .await
+                    .map(|_| ())
+            }
+            TransportScheme::Http => crate::tunnel::transport::http2::connect(Uuid::now_v7().into(), &client, &remote)
+                .await
+                .map(|_| ()),
+            _ => unreachable!(),
+        }
+    };
+    let visitor = async {
+        // Reverse admission is deliberately pending longer than the forward setup deadline.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        loop {
+            if let Ok(visitor) = TcpStream::connect((Ipv4Addr::LOCALHOST, reverse_port)).await {
+                break visitor;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    let (connected, _visitor) =
+        tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(connecting, visitor) })
+            .await
+            .unwrap();
+    connected.unwrap();
+}
+
 #[fixture]
 fn no_restrictions() -> RestrictionsRules {
     pub fn default_host() -> Regex {

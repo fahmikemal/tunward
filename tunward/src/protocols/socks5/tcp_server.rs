@@ -2,7 +2,7 @@ use super::udp_server::{Socks5UdpStream, Socks5UdpStreamWriter};
 use crate::protocols::tcp::configure_socket;
 use crate::somark::SoMark;
 use crate::tunnel::LocalProtocol;
-use crate::tunnel::downstream_listeners::DownstreamWrite;
+use crate::tunnel::downstream_listeners::{DownstreamRead, DownstreamWrite};
 use anyhow::Context;
 use fast_socks5::server::Socks5ServerProtocol;
 use fast_socks5::server::states::CommandRead;
@@ -49,6 +49,15 @@ pub enum Socks5ReadHalf {
     /// the write half replied an error (or was dropped) => treat as EOF.
     TcpPending(Option<oneshot::Receiver<OwnedReadHalf>>),
     Udp(Socks5UdpStream),
+}
+
+impl DownstreamRead for Socks5ReadHalf {
+    async fn cancelled(self: Pin<&mut Self>) -> Error {
+        match self.get_mut() {
+            Self::Tcp(reader) => Pin::new(reader).cancelled().await,
+            Self::TcpPending(_) | Self::Udp(_) => std::future::pending().await,
+        }
+    }
 }
 
 pub enum Socks5WriteHalf {

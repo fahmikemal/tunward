@@ -153,7 +153,14 @@ impl<E: TokioExecutorRef> Client<E> {
         };
 
         debug!("Server response: {response:?}");
-        tunnel::transport::io::forward(local_rx, local_tx, ws_rx, ws_tx, self.config.websocket_ping_frequency).await
+        tunnel::transport::io::forward_downstream(
+            local_rx,
+            local_tx,
+            ws_rx,
+            ws_tx,
+            self.config.websocket_ping_frequency,
+        )
+        .await
     }
 
     pub async fn run_tunnel(self, tunnel_listener: impl DownstreamListener) -> anyhow::Result<()> {
