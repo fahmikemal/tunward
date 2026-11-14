@@ -230,7 +230,9 @@ class CleanupChecks(RecoveryChecks):
                 assert after[role]["fds"] <= before[role]["fds"] + 6, (role, before, after)
                 assert after[role]["threads"] <= before[role]["threads"] + 2, (role, before, after)
             return {"cycles": self.suite.args.cycles, "max_tunnels": 2 if reverse else 1,
-                    "idle_reverse_request_preserved": reverse, "quota_slot_reused": True,
+                    "idle_reverse_request_preserved": reverse,
+                    "quota_slot_reused": self.suite.args.cycles > 1,
+                    "quota_slot_reuses": self.suite.args.cycles - 1,
                     "before": before, "after": after, "cleanup_ms": timings}
 
     async def run(self):
