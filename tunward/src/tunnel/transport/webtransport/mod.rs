@@ -50,7 +50,23 @@ impl WebTransportRead {
     }
 }
 
+async fn stream_failure(stream: &mut RecvStream) -> io::Error {
+    let id = stream.quic_id();
+    match stream.received_reset().await {
+        Ok(None) => std::future::pending().await, // Normal QUIC FIN still needs its data drained.
+        Ok(Some(code)) => {
+            tracing::debug!(stream = %id, code, "WebTransport receive reset interrupted local delivery");
+            io::Error::new(ErrorKind::ConnectionAborted, format!("WebTransport stream reset: {code}"))
+        }
+        Err(error) => io::Error::new(ErrorKind::ConnectionAborted, error),
+    }
+}
+
 impl TransportRead for WebTransportRead {
+    async fn cancelled(&mut self) -> io::Error {
+        stream_failure(&mut self.inner).await
+    }
+
     async fn copy(&mut self, mut writer: impl AsyncWrite + Unpin + Send) -> Result<(), io::Error> {
         // Drain ready chunks under one Quinn connection lock, retaining its buffers without
         // copying. read_chunks returns as soon as any data is ready, even for a short batch.
@@ -60,17 +76,8 @@ impl TransportRead for WebTransportRead {
             Err(err) => return Err(io::Error::new(ErrorKind::ConnectionAborted, err)),
         };
 
-        let reset = async {
-            match self.inner.received_reset().await {
-                Ok(None) => std::future::pending().await, // Normal QUIC FIN still needs its data drained.
-                Ok(Some(code)) => {
-                    io::Error::new(ErrorKind::ConnectionAborted, format!("WebTransport stream reset: {code}"))
-                }
-                Err(error) => io::Error::new(ErrorKind::ConnectionAborted, error),
-            }
-        };
         let result = tokio::select! {
-            error = reset => Err(error),
+            error = stream_failure(&mut self.inner) => Err(error),
             result = write_chunks(&mut writer, &self.chunks[..count]) => result,
         };
         // Release the receive buffers before waiting for more data on an idle tunnel.
@@ -178,7 +185,8 @@ impl TransportWrite for WebTransportWrite {
     }
 
     async fn abort(&mut self) {
-        let _ = self.inner.reset(0);
+        let result = self.inner.reset(0);
+        tracing::debug!(stream = %self.inner.quic_id(), ?result, "Aborted WebTransport send stream");
     }
 
     fn pending_operations_notify(&mut self) -> Arc<Notify> {

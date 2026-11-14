@@ -124,7 +124,11 @@ opposite response direction remains active.
 
 A complete HTTP/2 connection failure or QUIC session closure remains fatal after
 FIN. A QUIC receive-stream reset also interrupts delivery to a blocked local
-writer. Fatal forwarding errors explicitly reset the QUIC send stream; dropping
+writer, including the decoder's final buffered-record flush and writer shutdown
+after a copy completes. Custom `TransportRead` implementations can override the
+optional `cancelled` method to provide this signal; its default remains pending.
+Normal transport FIN keeps buffered payload draining. Fatal forwarding errors
+explicitly reset the QUIC send stream; dropping
 it would otherwise send a graceful transport FIN. Successful directional
 half-close still drains the response and never takes this reset path.
 

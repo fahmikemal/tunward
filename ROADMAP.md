@@ -66,6 +66,11 @@ These gates remain separate from feature count:
   must retain the exact binary hash and completed duration separately. This
   work adds no product features. WAN testing remains deferred while the
   staging VPSs are occupied.
+- The intermittent WebTransport `forward-tcp/fin-then-reset` cleanup failure is
+  traced to a decoder flush outside the transport copy's reset monitor. A full
+  DATA record ending at a chunk boundary could leave that flush blocked after
+  directional FIN. Reset monitoring now covers buffered flush and shutdown,
+  with a deterministic regression and repeated real-stream FIN/reset checks.
 - Tighten WSS cleanup under backpressure with the default or disabled heartbeat.
   The proxy regression profile configures one second; supplemental default
   30-second heartbeat tests still measured about 60 seconds to release a

@@ -78,6 +78,7 @@ python3 scripts/qualify.py \
 python3 scripts/qualify_identity.py --output target/qualification/identity-review
 python3 scripts/qualify_pool_timeout.py --output target/qualification/pool-review
 python3 scripts/qualify_proxy_cleanup.py --cycles 2 --output target/qualification/proxy-cleanup-review
+python3 scripts/qualify_proxy_cleanup.py --transports wts --modes forward-tcp,forward-socks,forward-http --cases fin-then-reset --cycles 20 --output target/qualification/proxy-fin-reset-review
 python3 scripts/qualify_quotas.py --output target/qualification/quota-review
 python3 scripts/qualify_revocation.py --output target/qualification/revocation-review
 python3 scripts/qualify_fleet.py --output target/qualification/fleet-review
@@ -86,6 +87,12 @@ python3 scripts/qualify_trust_boundaries.py --output target/qualification/trust-
 python3 scripts/qualify_reverse_tunnels.py --output target/qualification/reverse-review
 python3 scripts/qualify_hardening.py --output target/qualification/hardening-review
 ~~~
+
+The dedicated WebTransport FIN/reset profile repeats 20 cycles per selected
+mode. It complements the deterministic Rust regression for reset during a
+blocked decoder flush after directional FIN: packet/chunk boundaries can leave
+the final record buffered after transport copy has returned. CI runs this
+profile as well as the full cleanup matrix and short soak.
 
 For a local proxy endurance window, run:
 
