@@ -187,6 +187,39 @@ The template has not been activated on a production service by this repository t
 
 ## Rollout
 
+### Rehearse installation, upgrade, and rollback locally
+
+After verifying the previous release's archive and signed provenance, run a
+disposable Linux rehearsal with that extracted executable and the candidate:
+
+~~~sh
+python3 scripts/qualify_release_lifecycle.py \
+  --previous-binary /path/to/verified-previous/tunward \
+  --binary target/release/tunward \
+  --output target/qualification/release-lifecycle
+~~~
+
+The binaries must have different SHA-256 hashes. The runner stages versioned
+directories and atomically switches its own `current` symlink inside a new
+private output directory. It verifies the executable actually running, rejects
+an invalid candidate before activation, and exercises old clients reconnecting
+to the new server and new clients connecting to the rolled-back server. WSS,
+HTTP/2 and WebTransport carry verified forward TCP, reverse TCP and UDP traffic.
+
+The same disposable SQLite inventory is reused across restarts, with a consistent
+backup while its owner is stopped. Device identities, first-seen timestamps and
+observation counts must survive. A revocation applied before rollback must still
+deny that device afterward while the control device continues forwarding.
+`results.json` and `completion.json` retain binary/runner/result hashes and the
+activation order; only a completed exit-zero receipt qualifies the rehearsal.
+
+This checks the supplied binary pair and an unchanged inventory schema. It
+refuses to claim a direct downgrade when the schema version changes. It does not
+install a host systemd unit, change `/opt` or `/etc`, prove a cross-schema restore,
+or replace deployment-specific certificate, firewall, WAN and MDM qualification.
+
+### Activate an approved deployment
+
 1. Preserve the approved binary, policy files, certificate/trust versions, and a
    consistent inventory backup. Use the [SQLite backup procedure](FLEET_INVENTORY.md)
    or stop its sole owner; copying only a live WAL database file is insufficient.

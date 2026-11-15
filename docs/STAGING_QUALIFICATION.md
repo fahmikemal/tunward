@@ -48,6 +48,7 @@ dependencies in `scripts/requirements-qualification.txt`. Standalone generation 
 | `scripts/qualify_reload.py` | Unix acknowledged/SIGHUP reload, live streams, atomic rejection, preserved quotas, tenant cleanup, and TCP/QUIC trust rotation |
 | `scripts/qualify_device_scale.py` | Up to 256 distinct synthetic CN sessions, tenant tags, quotas, inventory and disconnect cleanup |
 | `scripts/qualify_pki.py` | Distinct server key/issuer renewal, old-only trust denial, and rollback |
+| `scripts/qualify_release_lifecycle.py` | Disposable Linux binary install/upgrade/rollback, mixed-version traffic, same-schema inventory backup/persistence, and preserved revocation |
 | `Dockerfile.qualification` | Python/OpenSSL container environment for the local runner |
 
 The runner snapshots the supplied executable. Rebuilding the original path

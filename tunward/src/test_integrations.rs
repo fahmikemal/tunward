@@ -13,7 +13,7 @@ use crate::tunnel::transport::{TransportAddr, TransportScheme, tunnel_to_jwt_tok
 use crate::tunnel::upstream_connectors::TcpUpstreamConnector;
 use crate::tunnel::{LocalProtocol, RemoteAddr};
 use bytes::BytesMut;
-use futures_util::{Stream, StreamExt};
+use futures_util::{FutureExt, Stream, StreamExt};
 use hyper::http::{HeaderName, HeaderValue};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use regex::Regex;
@@ -131,6 +131,33 @@ fn server_webtransport(dns_resolver: DnsResolver) -> Server {
         ..server_config(dns_resolver)
     };
     Server::new(server_config, DefaultTokioExecutor::default())
+}
+
+#[derive(Debug)]
+struct RunningTestServer(tokio::task::JoinHandle<anyhow::Result<()>>);
+
+impl Drop for RunningTestServer {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn start_webtransport_fixture(
+    server: Server,
+    restrictions: RestrictionsRules,
+) -> anyhow::Result<RunningTestServer> {
+    // With embedded TLS, numeric loopback binds and no async inventory/reload
+    // initialization, the fixture's first pending point is its accept loop.
+    // Bind both listeners before a client UDP endpoint can take the chosen port,
+    // and surface startup errors instead of hiding them behind a QUIC timeout.
+    // The fixture regressions below enforce this first-poll readiness contract.
+    let mut serving = Box::pin(server.serve(restrictions));
+    if let Some(result) = serving.as_mut().now_or_never() {
+        return Err(result
+            .err()
+            .unwrap_or_else(|| anyhow::anyhow!("test server stopped during startup")));
+    }
+    Ok(RunningTestServer(tokio::spawn(serving)))
 }
 
 /// Not a fixture, as the port to dial is only known once the server fixture has picked one.
@@ -529,6 +556,36 @@ async fn test_serve_fails_when_the_webtransport_port_is_taken(
     assert!(format!("{err:#}").contains("Failed to bind to udp socket"), "{err:#}");
 }
 
+#[rstest]
+#[tokio::test]
+#[serial]
+async fn webtransport_fixture_binds_udp_before_client_endpoint_creation(
+    server_webtransport: Server,
+    no_restrictions: RestrictionsRules,
+) {
+    let address = server_webtransport.config.bind;
+    let _server = start_webtransport_fixture(server_webtransport, no_restrictions)
+        .await
+        .unwrap();
+    let error = std::net::UdpSocket::bind(address)
+        .expect_err("a client endpoint could take the server port before the server was polled");
+    assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+}
+
+#[rstest]
+#[tokio::test]
+#[serial]
+async fn webtransport_fixture_reports_udp_bind_failure_before_dialing(
+    server_webtransport: Server,
+    no_restrictions: RestrictionsRules,
+) {
+    let _taken = std::net::UdpSocket::bind(server_webtransport.config.bind).unwrap();
+    let error = start_webtransport_fixture(server_webtransport, no_restrictions)
+        .await
+        .expect_err("startup must report the taken UDP port before a client waits for a handshake");
+    assert!(format!("{error:#}").contains("Failed to bind to udp socket"), "{error:#}");
+}
+
 /// A server asked for the management API must not start without it: a taken port fails startup.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
@@ -920,8 +977,9 @@ async fn test_tcp_tunnel_webtransport(
     let (endpoint_listen, endpoint_host) = free_addr();
 
     let server_port = server_webtransport.config.bind.port();
-    let server_h = tokio::spawn(server_webtransport.serve(no_restrictions));
-    defer! { server_h.abort(); };
+    let _server = start_webtransport_fixture(server_webtransport, no_restrictions)
+        .await
+        .unwrap();
 
     let client = client_webtransport(server_port, dns_resolver.clone()).await;
 
@@ -989,8 +1047,9 @@ async fn test_udp_tunnel_webtransport(
     let (endpoint_listen, endpoint_host) = free_addr();
 
     let server_port = server_webtransport.config.bind.port();
-    let server_h = tokio::spawn(server_webtransport.serve(no_restrictions));
-    defer! { server_h.abort(); };
+    let _server = start_webtransport_fixture(server_webtransport, no_restrictions)
+        .await
+        .unwrap();
 
     let client = client_webtransport(server_port, dns_resolver.clone()).await;
 

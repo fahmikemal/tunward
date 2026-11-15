@@ -104,6 +104,12 @@ separately: default `aws-lc-rs`, then `ring` with default features disabled.
 Do not use all-feature runtime tests as a substitute; they enable both TLS
 providers. All-feature Clippy compiles code and is a separate check.
 
+Keep the loopback integration group in `.config/nextest.toml` enabled. Nextest
+runs each test in a separate process, so `serial_test` alone cannot coordinate
+their port allocation. WebTransport fixtures also bind the server listeners
+before creating the client's ephemeral UDP endpoint and report startup errors
+before dialing.
+
 For protocol, authentication, lifecycle, or resource changes, build the release
 binary and run the relevant executable qualification sections:
 
@@ -309,6 +315,12 @@ attests and publishes as a release does, except that the provenance names
 `release-manifest.json` still names the tag commit and original run. The
 `GITHUB_TOKEN` needs actions-read, contents-write, id-token-write, and
 attestations-write only for that job.
+
+The recovery guard checks the exact fourteen build job names against the release
+matrix, not just the number of jobs starting with `Build -`. It accepts one
+successful native macOS job from either the historical `macos-14` or current
+`macos-15` matrix. Tests read the current workflow matrices so a future runner or
+build-name change cannot silently leave the recovery controls stale.
 
 Use the actual failed run ID, not an unrelated successful run. Build artifacts
 currently expire after one day. Expired artifacts, failed prerequisites, or a

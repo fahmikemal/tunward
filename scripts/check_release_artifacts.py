@@ -17,6 +17,11 @@ TARGETS = (
     "armv7-linux-androideabi", "x86_64-apple-darwin", "aarch64-apple-darwin",
     "x86_64-pc-windows-msvc", "i686-pc-windows-msvc", "aarch64-pc-windows-msvc",
 )
+BUILD_NAMES = (
+    "Linux x86_64", "Linux x86", "Linux aarch64", "Linux armv7hf", "Linux armv6",
+    "Freebsd x86_64", "Freebsd x86", "Android aarch64", "Android armv7",
+    "MacOS x86_64", "MacOS aarch64", "Windows x86_64", "Windows x86", "Windows aarch64",
+)
 ARTIFACTS = {f"tunward-{target}": "tunward.exe" if "windows" in target else "tunward" for target in TARGETS}
 
 
@@ -46,11 +51,20 @@ def verify_recovery(run, jobs, artifacts, releases, repository, tag, commit):
     required = {
         "Validate release tag and publication credentials", "Check - format, lint & tests",
         "Publish Docker Hub image", "native-runtime / native (ubuntu-24.04)",
-        "native-runtime / native (macos-14)", "native-runtime / native (windows-2022)",
+        "native-runtime / native (windows-2022)",
+        *[f"Build - {name}" for name in BUILD_NAMES],
     }
+    # Old tag runs retain macos-14; current runs use macos-15. Exactly one must
+    # have passed, rather than making old tags unrepairable when the runner moves.
+    macos = [j["name"] for j in jobs if j["name"] in {
+        "native-runtime / native (macos-14)", "native-runtime / native (macos-15)",
+    }]
+    if len(macos) != 1:
+        raise ValueError("source run must contain exactly one supported native macOS job")
+    required.add(macos[0])
     prerequisites = [j for j in jobs if j["name"] in required or j["name"].startswith("Build - ")]
-    if (len(prerequisites) != len(required) + len(TARGETS) or
-            not required.issubset({j["name"] for j in prerequisites}) or
+    if (len(prerequisites) != len(required) or
+            {j["name"] for j in prerequisites} != required or
             len({j["name"] for j in prerequisites}) != len(prerequisites) or
             any(j.get("status") != "completed" or j.get("conclusion") != "success" for j in prerequisites)):
         raise ValueError("all checks, native runtimes, fourteen builds, and Docker publication must have succeeded")
