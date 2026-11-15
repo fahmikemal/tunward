@@ -310,6 +310,12 @@ attests and publishes as a release does, except that the provenance names
 `GITHUB_TOKEN` needs actions-read, contents-write, id-token-write, and
 attestations-write only for that job.
 
+The recovery guard checks the exact fourteen build job names against the release
+matrix, not just the number of jobs starting with `Build -`. It accepts one
+successful native macOS job from either the historical `macos-14` or current
+`macos-15` matrix. Tests read the current workflow matrices so a future runner or
+build-name change cannot silently leave the recovery controls stale.
+
 Use the actual failed run ID, not an unrelated successful run. Build artifacts
 currently expire after one day. Expired artifacts, failed prerequisites, or a
 partially created release require operator review; this workflow refuses them.

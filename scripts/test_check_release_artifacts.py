@@ -4,7 +4,7 @@ import re
 import tempfile
 import unittest
 
-from check_release_artifacts import ARTIFACTS, TARGETS, verify_download, verify_recovery
+from check_release_artifacts import ARTIFACTS, BUILD_NAMES, TARGETS, verify_download, verify_recovery
 
 
 class ReleaseArtifactTests(unittest.TestCase):
@@ -12,10 +12,12 @@ class ReleaseArtifactTests(unittest.TestCase):
         commit, tag, repository = "a" * 40, "v0.1.0-beta", "example/tunward"
         run = {"repository": {"full_name": repository}, "event": "push", "path": ".github/workflows/release.yaml",
                "head_branch": tag, "head_sha": commit, "status": "completed", "conclusion": "failure"}
+        workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/release.yaml").read_text()
+        builds = re.findall(r"^\s+- name: (.+)\n(?:\s+os: .+\n)?\s+target: ([\w-]+)$", workflow, re.MULTILINE)
         names = ["Validate release tag and publication credentials", "Check - format, lint & tests",
                  "Publish Docker Hub image", *[f"native-runtime / native ({os})" for os in
                                                ("ubuntu-24.04", "macos-14", "windows-2022")],
-                 *[f"Build - {target}" for target in TARGETS]]
+                 *[f"Build - {name}" for name, _ in builds]]
         jobs = [{"name": name, "status": "completed", "conclusion": "success"} for name in names]
         jobs.append({"name": "Release", "status": "completed", "conclusion": "failure"})
         artifacts = [{"name": name, "expired": False, "workflow_run": {"head_sha": commit}} for name in ARTIFACTS]
@@ -25,6 +27,26 @@ class ReleaseArtifactTests(unittest.TestCase):
         receipt = self.receipt()
         receipt[2].extend([{"name": "example~tunward~record.dockerbuild"}, {"name": "native-runtime-ubuntu"}])
         verify_recovery(*receipt)
+
+    def test_accepts_the_current_native_runtime_matrix(self):
+        receipt = self.receipt()
+        workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/runtime-qualification.yaml").read_text()
+        runners = re.search(r"os: \[([^\]]+)\]", workflow).group(1).split(",")
+        receipt[1] = [j for j in receipt[1] if not j["name"].startswith("native-runtime / native (")]
+        receipt[1].extend({"name": f"native-runtime / native ({runner.strip()})", "status": "completed", "conclusion": "success"}
+                          for runner in runners)
+        verify_recovery(*receipt)
+
+    def test_an_unexpected_build_cannot_replace_a_required_build(self):
+        receipt = self.receipt()
+        build = next(j for j in receipt[1] if j["name"].startswith("Build - "))
+        build["name"] = "Build - unrelated target"
+        with self.assertRaises(ValueError): verify_recovery(*receipt)
+
+    def test_rejects_two_native_macos_jobs(self):
+        receipt = self.receipt()
+        receipt[1].append({"name": "native-runtime / native (macos-15)", "status": "completed", "conclusion": "success"})
+        with self.assertRaises(ValueError): verify_recovery(*receipt)
 
     def test_rejects_wrong_run_provenance(self):
         for key, value in (("event", "pull_request"), ("path", ".github/workflows/ci.yaml"),
@@ -111,6 +133,8 @@ class ReleaseArtifactTests(unittest.TestCase):
         targets = re.findall(r"^\s+target: ([\w-]+)\s*$", workflow, re.MULTILINE)
         self.assertEqual(set(TARGETS), set(targets))
         self.assertEqual(len(TARGETS), len(targets))
+        builds = re.findall(r"^\s+- name: (.+)\n(?:\s+os: .+\n)?\s+target: ([\w-]+)$", workflow, re.MULTILINE)
+        self.assertEqual(dict(zip(TARGETS, BUILD_NAMES, strict=True)), {target: name for name, target in builds})
 
 
 if __name__ == "__main__":
