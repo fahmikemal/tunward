@@ -38,21 +38,23 @@ jobs:
         shell: bash
         run: |
           status=0
-          : > "$RUNNER_TEMP/wss-socket-tests.log"
           for filter in tunnel::transport::websocket::tests tunnel::transport::io::tests protocols::http_proxy::server::tests protocols::tcp::socket_error::tests; do
-            CARGO_TERM_COLOR=never cargo test --locked -p tunward --no-default-features --features ring,fleet-inventory "$filter" >> "$RUNNER_TEMP/wss-socket-tests.log" 2>&1 || status=$?
-          done
-          cat "$RUNNER_TEMP/wss-socket-tests.log"
-          if [ "$status" -ne 0 ]; then
-            python - <<'PY'
+            if CARGO_TERM_COLOR=never cargo test --locked -p tunward --no-default-features --features ring,fleet-inventory "$filter" > "$RUNNER_TEMP/wss-socket-tests.log" 2>&1; then
+              cat "$RUNNER_TEMP/wss-socket-tests.log"
+            else
+              status=$?
+              cat "$RUNNER_TEMP/wss-socket-tests.log"
+              python - <<'PY'
           import os
           from pathlib import Path
-          tail = (Path(os.environ["RUNNER_TEMP"]) / "wss-socket-tests.log").read_text(errors="replace")[-8000:]
+          log = (Path(os.environ["RUNNER_TEMP"]) / "wss-socket-tests.log").read_text(errors="replace")
+          tail = log[log.find("running "):][-8000:] if "running " in log else log[-8000:]
           for offset in range(0, len(tail), 2000):
               message = tail[offset:offset + 2000].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
               print(f"::error title=WebSocket socket regression part {offset // 2000 + 1}::{message}")
           PY
-          fi
+            fi
+          done
           exit "$status"
       - name: Verify portable certificate generation and setup evidence
         run: python -m unittest discover -s scripts -p test_qualify_runtime.py

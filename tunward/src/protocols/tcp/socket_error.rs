@@ -49,7 +49,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     #[tokio::test]
-    async fn probing_preserves_data_and_fin_then_observes_a_late_reset() {
+    async fn probing_preserves_data_and_normal_fin_and_observes_reset() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut peer = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (socket, _) = listener.accept().await.unwrap();
@@ -78,11 +78,24 @@ mod tests {
                 .await
                 .is_err()
         );
+        // A socket that has already sent TCP FIN need not emit a later RST on
+        // Windows. Use a separate, still-open connection for the reset assertion.
+        drop(failure);
+        drop(peer);
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        peer.write_all(b"buffered before reset").await.unwrap();
+        let mut failure = Box::pin(wait(&socket));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut failure)
+                .await
+                .is_err()
+        );
         socket2::SockRef::from(&peer).set_linger(Some(Duration::ZERO)).unwrap();
         drop(peer);
         let error = tokio::time::timeout(Duration::from_secs(2), &mut failure)
             .await
-            .expect("a reset after normal FIN must still be observed");
+            .expect("a reset must be observed even while application bytes remain buffered");
         assert!(matches!(
             error.kind(),
             ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted

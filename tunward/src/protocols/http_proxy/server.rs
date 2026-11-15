@@ -418,8 +418,15 @@ mod tests {
         socket2::SockRef::from(&application)
             .set_send_buffer_size(65536)
             .unwrap();
-        let payload = vec![42; 32 * 1024 * 1024];
-        let mut uploading = Box::pin(application.write_all(&payload));
+        // Small individual writes establish backpressure on Windows too: a single
+        // large Winsock send may complete into OS buffering before the bridge drains.
+        let payload = vec![42; 64 * 1024];
+        let mut uploading = Box::pin(async {
+            for _ in 0..2048 {
+                application.write_all(&payload).await?;
+            }
+            io::Result::Ok(())
+        });
         let mut first = [0];
         tokio::select! {
             result = &mut uploading => panic!("upload unexpectedly completed before the bridge was drained: {result:?}"),
