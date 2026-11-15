@@ -38,15 +38,16 @@ jobs:
         shell: bash
         run: |
           status=0
-          cargo test --locked -p tunward --no-default-features --features ring,fleet-inventory tunnel::transport::websocket::tests > "$RUNNER_TEMP/wss-socket-tests.log" 2>&1 || status=$?
+          CARGO_TERM_COLOR=never cargo test --locked -p tunward --no-default-features --features ring,fleet-inventory tunnel::transport::websocket::tests > "$RUNNER_TEMP/wss-socket-tests.log" 2>&1 || status=$?
           cat "$RUNNER_TEMP/wss-socket-tests.log"
           if [ "$status" -ne 0 ]; then
             python - <<'PY'
           import os
           from pathlib import Path
-          message = (Path(os.environ["RUNNER_TEMP"]) / "wss-socket-tests.log").read_text(errors="replace")[-12000:]
-          message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-          print(f"::error title=WebSocket socket regression::{message}")
+          tail = (Path(os.environ["RUNNER_TEMP"]) / "wss-socket-tests.log").read_text(errors="replace")[-8000:]
+          for offset in range(0, len(tail), 2000):
+              message = tail[offset:offset + 2000].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(f"::error title=WebSocket socket regression part {offset // 2000 + 1}::{message}")
           PY
           fi
           exit "$status"
