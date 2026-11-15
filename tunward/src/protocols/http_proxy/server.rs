@@ -344,6 +344,11 @@ pub async fn run_server(
                     accepted = listener.accept(), if tasks.len() < 256 => {
                         match accepted {
                             Ok((socket, _)) => {
+                                // CONNECT relays can split replies into short writes. Do not
+                                // hold the reply's tail behind the application's delayed ACK.
+                                if let Err(err) = socket.set_nodelay(true) {
+                                    return Some((Err(err.into()), (listener, tasks, tx, rx, auth, permits)));
+                                }
                                 let auth = auth.clone(); let tx = tx.clone(); let permits = permits.clone();
                                 tasks.spawn(async move {
                                     let socket = Arc::new(socket);

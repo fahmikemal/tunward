@@ -149,6 +149,14 @@ the runner uses no host bind mounts or published ports and removes its container
 and image afterward. It never installs a host service. Preserve both completion
 receipts, the exact unit hash, journal and live sandbox probe with the results.
 
+### Performance measurements
+
+Use the [core performance guide](docs/PERFORMANCE.md) for verified-mTLS
+measurements with repeated loads, direct controls, resource observations and
+source/binary-bound receipts. Separate generator limits and configured quota
+ceilings from forwarding costs. Preserve before/after evidence for the same
+workload and run the relevant correctness/cleanup checks after an optimization.
+
 ### Fuzzing
 
 The targets in `fuzz/` feed arbitrary bytes to the parsers of what peers send:
