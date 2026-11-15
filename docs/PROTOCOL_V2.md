@@ -158,6 +158,9 @@ than its connection-error flag. TCP, proxy and WebSocket cancellation therefore
 check those closure states and use a non-consuming socket peek. A 50 ms local
 backoff prevents spinning while buffered data or normal EOF remains readable;
 idle sockets wait for readiness and this sends no heartbeat traffic.
+For monitored plain WebSockets on Windows, an abortive write-half drop also
+suppresses Tokio's implicit directional FIN, allowing the final socket close
+to send RST. Ordinary drop and explicit shutdown keep their graceful behavior.
 
 ## Tunnel readiness
 

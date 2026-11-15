@@ -7,6 +7,59 @@ use std::time::Duration;
 use tokio::io::Interest;
 use tokio::net::TcpStream;
 
+/// Keep Tokio's implicit write-half FIN from turning an abortive close into a
+/// graceful close on Windows. Explicit AsyncWrite shutdown remains unchanged.
+pub struct ResettableWriteHalf(Option<tokio::net::tcp::OwnedWriteHalf>);
+
+impl ResettableWriteHalf {
+    pub(crate) fn new(write: tokio::net::tcp::OwnedWriteHalf) -> Self {
+        Self(Some(write))
+    }
+}
+
+impl Drop for ResettableWriteHalf {
+    fn drop(&mut self) {
+        let write = self.0.take().expect("write half is present until drop");
+        if socket2::SockRef::from(write.as_ref()).linger().ok() == Some(Some(Duration::ZERO)) {
+            write.forget();
+        }
+        // Otherwise the ordinary OwnedWriteHalf drop sends directional FIN.
+    }
+}
+
+impl tokio::io::AsyncWrite for ResettableWriteHalf {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::pin::Pin::new(self.get_mut().0.as_mut().unwrap()).poll_write(cx, bytes)
+    }
+
+    fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(self.get_mut().0.as_mut().unwrap()).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(self.get_mut().0.as_mut().unwrap()).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::pin::Pin::new(self.get_mut().0.as_mut().unwrap()).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        tokio::io::AsyncWrite::is_write_vectored(self.0.as_ref().unwrap())
+    }
+}
+
 pub(crate) async fn wait(socket: &TcpStream) -> io::Error {
     loop {
         if let Err(error) = socket.ready(Interest::READABLE | Interest::ERROR).await {
@@ -47,6 +100,41 @@ mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn write_half_drop_preserves_fin_and_abortive_close() {
+        use tokio::io::AsyncReadExt;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        for abort in [false, true] {
+            let mut peer = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+            let (socket, _) = listener.accept().await.unwrap();
+            let (read, write) = socket.into_split();
+            let write = ResettableWriteHalf::new(write);
+            if abort {
+                socket2::SockRef::from(read.as_ref())
+                    .set_linger(Some(Duration::ZERO))
+                    .unwrap();
+            }
+            drop(write);
+            if abort {
+                drop(read);
+                let result = tokio::time::timeout(Duration::from_secs(2), peer.read_u8())
+                    .await
+                    .unwrap();
+                assert_eq!(result.unwrap_err().kind(), ErrorKind::ConnectionReset);
+            } else {
+                let mut byte = [0];
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(2), peer.read(&mut byte))
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    0
+                );
+                drop(read);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn probing_preserves_data_and_normal_fin_and_observes_reset() {
