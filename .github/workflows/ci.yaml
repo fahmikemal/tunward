@@ -303,6 +303,11 @@ jobs:
           sudo python3 scripts/qualify_tproxy.py --output "$QUALIFICATION_ROOT/tproxy" || status=$?
           sudo chown -R "$(id -u):$(id -g)" "$QUALIFICATION_ROOT/tproxy"
           exit "$status"
+      - name: Qualify production system unit in disposable Ubuntu container
+        timeout-minutes: 10
+        run: |
+          python3 -m unittest discover -s scripts -p test_qualify_systemd.py -v
+          python3 scripts/qualify_systemd.py --output "$QUALIFICATION_ROOT/systemd"
       - name: Preserve qualification evidence
         if: always() && env.QUALIFICATION_ROOT != ''
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -311,4 +316,9 @@ jobs:
           path: |
             ${{ env.QUALIFICATION_ROOT }}/**/results.json
             ${{ env.QUALIFICATION_ROOT }}/**/metadata.json
+            ${{ env.QUALIFICATION_ROOT }}/**/completion.json
+            ${{ env.QUALIFICATION_ROOT }}/**/service-properties.json
+            ${{ env.QUALIFICATION_ROOT }}/**/sandbox-probe.json
+            ${{ env.QUALIFICATION_ROOT }}/**/service-process-status.txt
+            ${{ env.QUALIFICATION_ROOT }}/**/service-journal.txt
             ${{ env.QUALIFICATION_ROOT }}/**/*.log

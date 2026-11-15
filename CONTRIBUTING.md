@@ -132,6 +132,7 @@ python3 scripts/qualify_hardening.py --output target/qualification/hardening-rev
 python3 scripts/qualify_device_scale.py --devices 200 --output target/qualification/device-scale-review
 python3 scripts/qualify_pki.py --output target/qualification/pki-review
 python3 scripts/qualify_runtime.py --output target/qualification/runtime-review
+python3 scripts/qualify_systemd.py --output target/qualification/systemd-review
 python3 scripts/check_publication.py
 ~~~
 
@@ -140,6 +141,13 @@ Output directories must be new. Preserve failures, `metadata.json`,
 Use the [qualification guide](docs/STAGING_QUALIFICATION.md) for bounded capacity,
 container, WAN, and endurance profiles. Historical results do not qualify a new
 binary automatically.
+
+The systemd runner needs a Linux Docker daemon that supports privileged
+containers and private cgroup v2. It builds a pinned Ubuntu 24.04 fixture and
+boots systemd as its PID 1. Runtime networking stays inside that container;
+the runner uses no host bind mounts or published ports and removes its container
+and image afterward. It never installs a host service. Preserve both completion
+receipts, the exact unit hash, journal and live sandbox probe with the results.
 
 ### Fuzzing
 

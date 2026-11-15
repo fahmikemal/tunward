@@ -185,6 +185,16 @@ limits from measurement; the template's FD/task limits are not a capacity promis
 Verify systemd feature support and the exact service sandbox on the deployment OS.
 The template has not been activated on a production service by this repository task.
 
+The [system-unit qualification runner](STAGING_QUALIFICATION.md#runners-and-prerequisites)
+exercises the unchanged template inside a disposable Ubuntu 24.04 systemd
+container, including service-account file access, the actual mount sandbox,
+startup rejection, acknowledged reload with live streams, crash restart and
+inventory persistence. Run `python3 scripts/qualify_systemd.py --output
+target/qualification/systemd-review` with a Linux Docker daemon supporting
+privileged containers and private cgroup v2. It installs no host unit and
+publishes no ports. Keep the exact unit/binary hashes and both completion
+receipts; qualify the real issuer, host configuration and operations separately.
+
 ## Rollout
 
 ### Rehearse installation, upgrade, and rollback locally

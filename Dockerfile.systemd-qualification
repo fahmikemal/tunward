@@ -1,0 +1,11 @@
+# Disposable systemd test fixture. No host filesystem or cgroup bind mounts.
+FROM ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5
+ENV container=docker
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      systemd systemd-sysv dbus python3 openssl ca-certificates util-linux \
+    && rm -rf /var/lib/apt/lists/*
+COPY tunward /qualification/tunward
+COPY tunward.service qualify_systemd.py qualify_runtime.py /qualification/
+RUN printf 'tunward-systemd-qualification-v1\n' > /qualification/CONTAINER_ONLY
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]
