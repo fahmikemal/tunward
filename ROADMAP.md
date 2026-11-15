@@ -116,6 +116,11 @@ These gates remain separate from feature count:
 - Validate the actual deployment's certificate issuer/domain, renewal,
   permissions, reload, monitoring, backup, rollout, and rollback. Define and
   measure latency, availability, capacity, and recovery objectives.
+  The production system unit has a disposable Ubuntu 24.04 qualification for
+  its service account, live filesystem sandbox, rejected startup/reload,
+  active streams, crash restart and inventory persistence. This uses synthetic
+  identities and private container networking; host integration and the real
+  issuer/renewal workflow remain deployment-specific gates.
 - Dependency maintenance warnings are **reviewed**
   ([#7](https://github.com/fahmikemal/tunward/pull/7),
   [#9](https://github.com/fahmikemal/tunward/pull/9)). cargo-deny now fails CI on

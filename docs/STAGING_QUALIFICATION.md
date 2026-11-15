@@ -46,6 +46,7 @@ dependencies in `scripts/requirements-qualification.txt`. Standalone generation 
 | `scripts/qualify_dns.py` | Controlled UDP DNS/DoT/DoH, address fallback, resolver-name denial and ECH edge cases |
 | `scripts/qualify_runtime.py` | Native cross-platform TCP/reverse TCP/UDP smoke checks with verified mTLS |
 | `scripts/qualify_reload.py` | Unix acknowledged/SIGHUP reload, live streams, atomic rejection, preserved quotas, tenant cleanup, and TCP/QUIC trust rotation |
+| `scripts/qualify_systemd.py` | Unchanged production system unit inside disposable Ubuntu 24.04: service-account permissions, live filesystem sandbox, preflight rejection, acknowledged reload, crash restart, runtime-directory cleanup and persistent inventory |
 | `scripts/qualify_device_scale.py` | Up to 256 distinct synthetic CN sessions, tenant tags, quotas, inventory and disconnect cleanup |
 | `scripts/qualify_pki.py` | Distinct server key/issuer renewal, old-only trust denial, and rollback |
 | `Dockerfile.qualification` | Python/OpenSSL container environment for the local runner |
@@ -63,6 +64,40 @@ real issuer, or file permissions. Native CI exercises the socket/SIGHUP suite on
 Linux and macOS; Windows remains covered by the portable baseline runtime suite.
 Keep `metadata.json`, `results.json`, logs, resource samples, and hashes.
 Suite/resource rows are included in counts; they are not all independent tests.
+
+For the production **system** unit rather than the user-manager fixture, run:
+
+~~~sh
+python3 scripts/qualify_systemd.py --output target/qualification/systemd-review
+~~~
+
+This Linux runner builds the pinned Ubuntu 24.04 systemd image and boots it in a
+disposable privileged Docker container with private cgroup v2. It copies the
+exact `deploy/tunward.service`, provisions synthetic identities as `root:tunward`,
+and runs verified WSS/HTTP2/WebTransport forward TCP, reverse TCP and large UDP.
+It tests unreadable-key and invalid-policy startup rejection, policy activation
+and rejection through `systemctl reload` while streams stay open, and automatic
+recovery after killing the main process. The latter must reclaim its reload
+socket, reconnect clients and retain inventory identities/first-seen timestamps.
+Clients explicitly use a one-second heartbeat and one-second retry backoff;
+the server unit keeps its original settings. This is not a default-client
+recovery latency result: the default 30-second heartbeat derives a 90-second
+QUIC idle timeout when a dead peer cannot deliver a connection close/reset.
+
+The sandbox probe joins the actual service's mount namespace and drops to its
+account. It checks that the service can read its key and write its runtime/state
+directories, cannot change administrator policy, cannot write a file that its
+UID could write outside the namespace, and has a private `/tmp`. Process status
+must show the intended UID, no capabilities and `NoNewPrivs=1`.
+
+There are no host bind mounts, host service changes, published ports or runtime
+external networking. The container and its uniquely named image are removed on
+success and failure; build cache/base layers may remain. Preserve the outer and
+inner `completion.json`, `results.json`, journal, properties and sandbox probe.
+Only completed exit-zero receipts with matching binary, runner, helper, unit and
+result hashes qualify the run. CI runs this fixture on Linux. This qualifies the
+template on that Ubuntu/systemd combination, not the deployment host's firewall,
+real issuer, renewal automation, WAN, or production sizing.
 
 A failed assertion returns failure. A `not_run` row is a coverage gap even when
 the process exits successfully. Some synthetic transport tests explicitly opt
