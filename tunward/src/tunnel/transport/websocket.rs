@@ -17,8 +17,7 @@ use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use log::debug;
-use std::io;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
@@ -30,12 +29,27 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_rustls::server::TlsStream;
 use tracing::trace;
 
+#[cfg(not(windows))]
+async fn socket_failure(socket: Option<&TcpStream>) -> io::Error {
+    let Some(socket) = socket else {
+        return std::future::pending().await;
+    };
+    match socket.ready(tokio::io::Interest::ERROR).await {
+        Err(error) => error,
+        Ok(_) => socket
+            .take_error()
+            .unwrap_or_else(Some)
+            .unwrap_or_else(|| io::Error::new(ErrorKind::ConnectionAborted, "WebSocket transport failed")),
+    }
+}
+
 pub struct WebsocketTransportWrite {
     inner: WebSocketWrite<L4WriteHalf>,
     buf: BytesMut,
     pending_operations: Receiver<Frame<'static>>,
     pending_ops_notify: Arc<Notify>,
     in_flight_ping: Arc<AtomicUsize>,
+    error_socket: Option<Arc<ErrorSocket>>,
 }
 
 impl WebsocketTransportWrite {
@@ -50,11 +64,28 @@ impl WebsocketTransportWrite {
             pending_operations,
             pending_ops_notify: notify,
             in_flight_ping,
+            error_socket: None,
         }
     }
 }
 
 impl TransportWrite for WebsocketTransportWrite {
+    async fn abort(&mut self) {
+        if let Some(socket) = self.error_socket.as_deref()
+            && let Err(error) = abort_socket(socket)
+        {
+            tracing::debug!(%error, "Cannot configure WebSocket transport reset");
+        }
+    }
+
+    async fn cancelled(&mut self) {
+        let _ = socket_failure(self.error_socket.as_deref()).await;
+    }
+
+    async fn connection_closed(&mut self) {
+        let _ = socket_failure(self.error_socket.as_deref()).await;
+    }
+
     fn buf_mut(&mut self) -> &mut BytesMut {
         &mut self.buf
     }
@@ -149,6 +180,7 @@ pub struct WebsocketTransportRead {
     pending_operations: Sender<Frame<'static>>,
     notify_pending_ops: Arc<Notify>,
     in_flight_ping: Arc<AtomicUsize>,
+    error_socket: Option<Arc<ErrorSocket>>,
 }
 
 impl WebsocketTransportRead {
@@ -164,6 +196,7 @@ impl WebsocketTransportRead {
                 pending_operations: tx,
                 notify_pending_ops: notify.clone(),
                 in_flight_ping,
+                error_socket: None,
             },
             (rx, notify),
         )
@@ -176,6 +209,10 @@ fn frame_reader(_: Frame<'_>) -> futures_util::future::Ready<anyhow::Result<()>>
 }
 
 impl TransportRead for WebsocketTransportRead {
+    async fn cancelled(&mut self) -> io::Error {
+        socket_failure(self.error_socket.as_deref()).await
+    }
+
     async fn copy(&mut self, mut writer: impl AsyncWrite + Unpin + Send) -> Result<(), io::Error> {
         loop {
             let msg = match self.inner.read_frame(&mut frame_reader).await {
@@ -187,9 +224,11 @@ impl TransportRead for WebsocketTransportRead {
             self.in_flight_ping.store(0, Relaxed);
             match msg.opcode {
                 OpCode::Continuation | OpCode::Text | OpCode::Binary => {
-                    return match writer.write_all(msg.payload.as_ref()).await {
-                        Ok(_) => Ok(()),
-                        Err(err) => Err(io::Error::new(ErrorKind::ConnectionAborted, err)),
+                    return tokio::select! {
+                        error = socket_failure(self.error_socket.as_deref()) => Err(error),
+                        result = writer.write_all(msg.payload.as_ref()) => {
+                            result.map_err(|err| io::Error::new(ErrorKind::ConnectionAborted, err))
+                        }
                     };
                 }
                 OpCode::Close => {
@@ -331,32 +370,39 @@ pub fn mk_websocket_tunnel(
     role: Role,
     mask_frame: bool,
 ) -> anyhow::Result<(WebsocketTransportRead, WebsocketTransportWrite)> {
-    let mut ws = match role {
+    let transport = match role {
         Role::Client => {
             let stream = ws
                 .into_inner()
                 .into_inner()
                 .downcast::<TokioIo<L4Stream>>()
                 .map_err(|_| anyhow!("cannot downcast websocket client stream"))?;
-            let transport = L4Stream::from(stream.io.into_inner(), stream.read_buf);
-            WebSocket::after_handshake(transport, role)
+            L4Stream::from(stream.io.into_inner(), stream.read_buf)
         }
         Role::Server => {
             let upgraded = ws.into_inner().into_inner();
             match upgraded.downcast::<TokioIo<TlsStream<TcpStream>>>() {
-                Ok(stream) => {
-                    let transport = L4Stream::from_server_tls(stream.io.into_inner(), stream.read_buf);
-                    WebSocket::after_handshake(transport, role)
-                }
+                Ok(stream) => L4Stream::from_server_tls(stream.io.into_inner(), stream.read_buf),
                 Err(upgraded) => {
                     let stream = hyper_util::server::conn::auto::upgrade::downcast::<TokioIo<TcpStream>>(upgraded)
                         .map_err(|_| anyhow!("cannot downcast websocket server stream"))?;
-                    let transport = L4Stream::from_tcp(stream.io.into_inner(), stream.read_buf);
-                    WebSocket::after_handshake(transport, role)
+                    L4Stream::from_tcp(stream.io.into_inner(), stream.read_buf)
                 }
             }
         }
     };
+
+    from_stream(transport, role, mask_frame)
+}
+
+fn from_stream(
+    transport: L4Stream,
+    role: Role,
+    mask_frame: bool,
+) -> anyhow::Result<(WebsocketTransportRead, WebsocketTransportWrite)> {
+    let (transport, socket) = transport.with_error_monitor()?;
+    let socket = Arc::new(socket);
+    let mut ws = WebSocket::after_handshake(transport, role);
 
     ws.set_auto_pong(false);
     ws.set_auto_close(false);
@@ -364,16 +410,196 @@ pub fn mk_websocket_tunnel(
     let (ws_rx, ws_tx) = ws.split(|x| x.into_split());
 
     let in_flight_ping = Arc::new(AtomicUsize::new(0));
-    let (ws_rx, pending_ops) = WebsocketTransportRead::new(ws_rx, in_flight_ping.clone());
-    Ok((ws_rx, WebsocketTransportWrite::new(ws_tx, pending_ops, in_flight_ping)))
+    let (mut ws_rx, pending_ops) = WebsocketTransportRead::new(ws_rx, in_flight_ping.clone());
+    let mut ws_tx = WebsocketTransportWrite::new(ws_tx, pending_ops, in_flight_ping);
+    ws_rx.error_socket = Some(socket.clone());
+    ws_tx.error_socket = Some(socket);
+    Ok((ws_rx, ws_tx))
+}
+
+#[cfg(windows)]
+async fn socket_failure(socket: Option<&ErrorSocket>) -> io::Error {
+    match socket {
+        Some(socket) => crate::protocols::tcp::socket_error::wait(socket).await,
+        None => std::future::pending().await,
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) type ErrorSocket = TcpStream;
+#[cfg(windows)]
+pub(crate) type ErrorSocket = crate::protocols::tcp::socket_error::SocketMonitor;
+
+#[cfg(not(windows))]
+fn abort_socket(socket: &ErrorSocket) -> io::Result<()> {
+    socket2::SockRef::from(socket).set_linger(Some(std::time::Duration::ZERO))
+}
+#[cfg(windows)]
+fn abort_socket(socket: &ErrorSocket) -> io::Result<()> {
+    // SAFETY: this private helper is only called by WebsocketTransportWrite::abort,
+    // whose inner writer still owns the original TCP stream (plain or TLS).
+    unsafe { socket.abort() }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tunnel::transport::io::MAX_PACKET_LENGTH;
+    use std::pin::Pin;
+    use std::task::{Context as TaskContext, Poll};
     use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    struct BlockedTarget(Option<oneshot::Sender<()>>);
+
+    impl AsyncWrite for BlockedTarget {
+        fn poll_write(mut self: Pin<&mut Self>, _: &mut TaskContext<'_>, _: &[u8]) -> Poll<io::Result<usize>> {
+            if let Some(blocked) = self.0.take() {
+                let _ = blocked.send(());
+            }
+            Poll::Pending
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn socket_reset_after_fin_releases_quota_during_buffered_flush_without_heartbeat() {
+        let (mut peer, server) = connected_websockets().await;
+        peer.set_auto_apply_mask(false);
+        let (read, write) = from_stream(server.into_inner(), Role::Server, false).unwrap();
+        let mut limits = crate::quotas::DeviceQuotaConfig::default_production_limits();
+        limits.default.max_tunnels = std::num::NonZeroU32::new(1);
+        let quotas = crate::quotas::QuotaManager::new(limits);
+        let session = quotas.open_session("websocket-reset-during-flush").unwrap();
+        let permit = session.open_tunnel().unwrap();
+        let (local_rx, mut application) = tokio::io::duplex(1);
+        application.shutdown().await.unwrap();
+        let (blocked, was_blocked) = oneshot::channel();
+        let mut forwarding = scopeguard::guard(
+            tokio::spawn(crate::tunnel::transport::io::forward_with_quota(
+                local_rx,
+                BlockedTarget(Some(blocked)),
+                read,
+                write,
+                None,
+                Some(permit),
+            )),
+            |task| task.abort(),
+        );
+        let fin = tokio::time::timeout(Duration::from_secs(2), peer.read_frame())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fin.payload.as_ref(), &[1, 0, 0, 0, 0]);
+        peer.write_frame(Frame::binary(Payload::Borrowed(&[0, 0, 0, 0, 1, 42])))
+            .await
+            .unwrap();
+        peer.flush().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), was_blocked)
+            .await
+            .unwrap()
+            .unwrap();
+        let socket = peer.into_inner();
+        socket2::SockRef::from(&socket)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+        drop(socket);
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut *forwarding)
+            .await
+            .expect("socket reset must interrupt buffered flush after FIN without a heartbeat")
+            .unwrap();
+        assert!(result.is_err());
+        session.open_tunnel().expect("socket reset must release the quota slot");
+    }
+
+    #[tokio::test]
+    async fn forwarding_abort_resets_a_peer_blocked_on_local_delivery() {
+        let (peer, server) = connected_websockets().await;
+        let (server_read, mut server_write) = from_stream(server.into_inner(), Role::Server, false).unwrap();
+        let (mut client_read, _client_write) =
+            from_stream(L4Stream::from_tcp(peer.into_inner(), Bytes::new()), Role::Client, false).unwrap();
+        #[cfg(windows)]
+        let probe = client_read.error_socket.as_ref().unwrap().clone();
+        let (blocked, was_blocked) = oneshot::channel();
+        let mut receiving = scopeguard::guard(
+            tokio::spawn(async move { client_read.copy(BlockedTarget(Some(blocked))).await }),
+            |task| task.abort(),
+        );
+        server_write.buf_mut().extend_from_slice(&[0, 0, 0, 0, 1, 42]);
+        server_write.write().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), was_blocked)
+            .await
+            .unwrap()
+            .unwrap();
+        server_write.abort().await;
+        drop(server_write);
+        drop(server_read);
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut *receiving).await;
+        #[cfg(windows)]
+        if result.is_err() {
+            use futures_util::FutureExt;
+            eprintln!(
+                "blocked peer: error={:?}, readable={:?}, writable={:?}, peek={:?}",
+                probe.take_error(),
+                probe.ready(tokio::io::Interest::READABLE).now_or_never(),
+                probe.ready(tokio::io::Interest::WRITABLE).now_or_never(),
+                socket2::SockRef::from(&**probe).peek(&mut [std::mem::MaybeUninit::uninit(); 1])
+            );
+        }
+        let result = result
+            .expect("forwarding abort must cancel the blocked peer without a heartbeat")
+            .unwrap();
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn normal_tcp_fin_preserves_buffered_payload_while_local_delivery_is_blocked() {
+        let (mut peer, server) = connected_websockets().await;
+        peer.set_auto_apply_mask(false);
+        let (mut read, _write) = from_stream(server.into_inner(), Role::Server, false).unwrap();
+        let payload = vec![42; MAX_RECORD_LENGTH];
+        peer.write_frame(Frame::binary(Payload::Borrowed(&payload)))
+            .await
+            .unwrap();
+        peer.flush().await.unwrap();
+        let mut socket = peer.into_inner();
+        socket.shutdown().await.unwrap();
+        let (target, mut application) = tokio::io::duplex(1024);
+        let mut receiving =
+            scopeguard::guard(tokio::spawn(async move { read.copy(target).await }), |task| task.abort());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), application.read_u8())
+                .await
+                .unwrap()
+                .unwrap(),
+            42
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut *receiving)
+                .await
+                .is_err(),
+            "normal TCP FIN must keep the buffered payload draining"
+        );
+        let mut remaining = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), application.read_to_end(&mut remaining))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(remaining.len(), MAX_RECORD_LENGTH - 1);
+        assert!(remaining.iter().all(|byte| *byte == 42));
+        tokio::time::timeout(Duration::from_secs(2), &mut *receiving)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
 
     async fn connected_websockets() -> (WebSocket<TcpStream>, WebSocket<L4Stream>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();

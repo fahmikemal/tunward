@@ -67,6 +67,10 @@ impl UpstreamConnector for TcpUpstreamConnector {
     type Reader = OwnedReadHalf;
     type Writer = OwnedWriteHalf;
 
+    async fn cancelled(reader: std::pin::Pin<&mut Self::Reader>) -> std::io::Error {
+        crate::tunnel::downstream_listeners::DownstreamRead::cancelled(reader).await
+    }
+
     async fn connect(&self, remote: &Option<RemoteAddr>) -> anyhow::Result<(Self::Reader, Self::Writer)> {
         let (host, port) = self.destination(remote);
         let stream = match (remote, &self.addresses, &self.allow) {

@@ -122,10 +122,48 @@ a receive task blocked writing to a non-reading local target and release its
 tunnel permit. After sending FIN, a peer stopping reads is permitted while the
 opposite response direction remains active.
 
+A complete HTTP/2 connection failure or QUIC session closure remains fatal after
+FIN. A QUIC receive-stream reset also interrupts delivery to a blocked local
+writer, including the decoder's final buffered-record flush and writer shutdown
+after a copy completes. Custom `TransportRead` implementations can override the
+optional `cancelled` method to provide this signal; its default remains pending.
+Normal transport FIN keeps buffered payload draining. Fatal forwarding errors
+explicitly reset the QUIC send stream; dropping
+it would otherwise send a graceful transport FIN. Successful directional
+half-close still drains the response and never takes this reset path.
+
 Plain local TCP and SOCKS5 TCP readers also watch socket errors while an
 outgoing tunnel write waits for capacity. A local TCP reset can cancel that
 write and propagate cancellation to the peer even when the target is not
 reading. This watches errors rather than directional EOF, preserving half-close.
+The signal survives the server's erased reader type and applies to TCP/SOCKS5
+reverse destinations as well. HTTP CONNECT and ordinary HTTP proxy readers
+observe fatal socket errors independently of their bounded duplex bridge and
+HTTP body backpressure. Normal HTTP completion does not trigger cancellation.
+
+Built-in WS/WSS connections keep a duplicate TCP socket handle solely for error
+readiness. It consumes no frame/TLS bytes and lets fatal TCP resets interrupt
+frame delivery, decoder flush and shutdown independently of heartbeat, before
+or after directional FIN. Failed forwarding configures an abortive TCP close
+so the peer can observe the reset. Normal TCP FIN is not an error signal and
+buffered data still drains. The extra descriptor lasts with the upgraded
+connection and shares its existing TCP connection; no monitor task is spawned.
+The low-level `WebsocketTransportRead::new`/`WebsocketTransportWrite::new`
+constructors retain their existing signatures and do not attach a socket
+monitor; the built-in upgrade factory supplies it. This does not replace
+heartbeat/liveness policy for silent peers or network blackholes.
+
+On Windows, Mio reports an established reset through read/write closure rather
+than its connection-error flag. TCP, proxy and WebSocket cancellation therefore
+check those closure states and use a non-consuming socket peek. A 50 ms local
+backoff prevents spinning while buffered data or normal EOF remains readable;
+idle sockets wait for readiness and this sends no heartbeat traffic.
+For monitored plain WebSockets on Windows, an abortive write-half drop also
+suppresses Tokio's implicit directional FIN, allowing the final socket close
+to send RST. Ordinary drop and explicit shutdown keep their graceful behavior.
+The abort path sets linger on both the original and duplicate Windows socket
+descriptors; setting it on the duplicate alone does not configure the original.
+The original handle is borrowed only while the transport still owns its write half.
 
 ## Tunnel readiness
 

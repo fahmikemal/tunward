@@ -124,6 +124,9 @@ impl TransportWrite for WebTransportUdpWrite {
         let _ = self.inner.finish();
         Ok(())
     }
+    async fn abort(&mut self) {
+        let _ = self.inner.reset(0);
+    }
     fn pending_operations_notify(&mut self) -> Arc<Notify> {
         Arc::new(Notify::new())
     }

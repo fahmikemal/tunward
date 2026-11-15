@@ -8,3 +8,6 @@ pub use server::connect_to_addresses;
 pub use server::connect_with_http_proxy;
 pub use server::run_server;
 pub use server::run_server_with_addr;
+
+#[cfg(windows)]
+pub(crate) mod socket_error;

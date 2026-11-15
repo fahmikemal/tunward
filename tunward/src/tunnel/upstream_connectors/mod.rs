@@ -1,4 +1,5 @@
 use anyhow::anyhow;
+use std::{io, pin::Pin};
 use tokio::io::{AsyncRead, AsyncWrite};
 use url::Url;
 
@@ -15,6 +16,12 @@ mod udp;
 pub trait UpstreamConnector: Send + Sync + 'static {
     type Reader: AsyncRead + Send + 'static;
     type Writer: AsyncWrite + Send + 'static;
+
+    /// Observe fatal local errors while an outgoing reverse-tunnel write waits for capacity.
+    /// Custom connectors without an independent error signal keep the pending default.
+    fn cancelled(_reader: Pin<&mut Self::Reader>) -> impl Future<Output = io::Error> + Send {
+        std::future::pending()
+    }
 
     fn connect(
         &self,

@@ -24,6 +24,14 @@ class QuotaChecks:
         self.accepted = 0
         self.serial = 0
 
+    def heartbeat_frequency(self, transport=None):
+        # The dedicated profile varies WebSocket heartbeat; QUIC keeps its liveness control.
+        return "1s" if transport and transport not in ("ws", "wss") else getattr(self.suite.args, "proxy_heartbeat", "1s")
+
+    def heartbeat_arguments(self, transport=None):
+        frequency = self.heartbeat_frequency(transport)
+        return () if frequency == "default" else ("--websocket-ping-frequency", frequency)
+
     async def echo(self, reader, writer):
         self.accepted += 1
         try:
@@ -79,7 +87,7 @@ class QuotaChecks:
             "--tls-certificate", str(self.certs / "server.pem"), "--tls-private-key", str(self.certs / "server.key"),
             "--tls-client-ca-certs", str(self.certs / "ca.pem"), "--restrict-config", str(self.policy),
             "--device-quota-config", str(config), "--management-api", f"127.0.0.1:{mp}",
-            "--remote-to-local-server-idle-timeout", "3s", "--websocket-ping-frequency", "1s")
+            "--remote-to-local-server-idle-timeout", "3s", *self.heartbeat_arguments())
         clients, writers = [], []
         await self.suite.ready(sp, process)
         try:
@@ -108,7 +116,7 @@ class QuotaChecks:
             "--tls-verify-certificate", "--tls-certificate", str(self.certs / f"{identity}.pem"),
             "--tls-private-key", str(self.certs / f"{identity}.key"),
             "--client-id", label, "--connection-retry-max-backoff", "1s",
-            "--websocket-ping-frequency", "1s",
+            *self.heartbeat_arguments(scheme),
             "--reverse-tunnel-connection-retry-max-backoff", "1s", *extra_args, f'{scheme}://127.0.0.1:{stack["port"]}',
             extra_env={"SSL_CERT_FILE": str(self.certs / "ca.pem"), "SSL_CERT_DIR": ""})
         stack["clients"].append(process)

@@ -58,6 +58,28 @@ OWASP certification or a requirement that every deployment use the same limits.
 
 These gates remain separate from feature count:
 
+- Core stabilization now covers setup deadlines and cancellation under
+  backpressure, including forward/reverse TCP, SOCKS5 and HTTP proxies. The
+  proxy regression checks distinguish fatal resets from normal directional
+  half-close, verify tunnel quota reuse, and preserve pending reverse requests.
+  CI includes these checks and a short proxy soak; longer local measurements
+  must retain the exact binary hash and completed duration separately. This
+  work adds no product features. WAN testing remains deferred while the
+  staging VPSs are occupied.
+- The intermittent WebTransport `forward-tcp/fin-then-reset` cleanup failure is
+  traced to a decoder flush outside the transport copy's reset monitor. A full
+  DATA record ending at a chunk boundary could leave that flush blocked after
+  directional FIN. Reset monitoring now covers buffered flush and shutdown,
+  with a deterministic regression and repeated real-stream FIN/reset checks.
+- WS/WSS fatal-reset cleanup now watches socket errors independently of frame
+  delivery and heartbeat, including buffered flush after directional FIN.
+  Failed forwarding uses TCP reset; graceful FIN still drains buffered payload.
+  This uses one extra socket descriptor per active WebSocket connection and no
+  extra monitor task. CI checks the CLI's default heartbeat and disabled
+  heartbeat, plus native socket-error/normal-FIN regressions on all three OSs.
+  Earlier default-heartbeat checks took about 60 seconds to release quota;
+  disabled-heartbeat checks retained it past their eight-second budget.
+  Silent peers and network blackholes still need heartbeat/liveness policy.
 - Investigate the historical WSS WAN timeout.
 - The intermittent tenant ephemeral reverse-UDP CI timeout is **resolved**. An
   ephemeral UDP reverse listener closed at its first idle check after its request
@@ -94,11 +116,13 @@ These gates remain separate from feature count:
 - Validate the actual deployment's certificate issuer/domain, renewal,
   permissions, reload, monitoring, backup, rollout, and rollback. Define and
   measure latency, availability, capacity, and recovery objectives.
-- Dependency maintenance warnings are **reviewed and resolved**
+- Dependency maintenance warnings are **reviewed**
   ([#7](https://github.com/fahmikemal/tunward/pull/7),
   [#9](https://github.com/fahmikemal/tunward/pull/9)). cargo-deny now fails CI on
-  unmaintained or yanked crates without exceptions, and Dependabot proposes
-  updates weekly.
+  unmaintained or yanked crates. One documented exception remains for
+  `RUSTSEC-2026-0440` (`astral-tokio-tar`, via the test-only `testcontainers`
+  dependency); it is absent from the CLI's normal/build dependency tree.
+  Vulnerability advisories remain denied. Dependabot proposes updates weekly.
 - Complete the remaining publication/key-rotation follow-ups. Validate tagged
   artifacts and image digests before promotion.
 

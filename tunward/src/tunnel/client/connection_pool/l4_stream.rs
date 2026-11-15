@@ -51,6 +51,49 @@ impl L4Stream {
     pub fn into_split(self) -> (L4ReadHalf, L4WriteHalf) {
         (self.read, self.write)
     }
+
+    /// Duplicate the socket for error readiness without consuming transport bytes.
+    /// Only WebSocket upgrades need this handle; HTTP/2 keeps its existing stream layout.
+    pub(crate) fn with_error_monitor(
+        self,
+    ) -> std::io::Result<(Self, crate::tunnel::transport::websocket::ErrorSocket)> {
+        fn monitor(socket: &TcpStream) -> std::io::Result<crate::tunnel::transport::websocket::ErrorSocket> {
+            let copy: std::net::TcpStream = socket2::SockRef::from(socket).try_clone()?.into();
+            copy.set_nonblocking(true)?;
+            let copy = TcpStream::from_std(copy)?;
+            #[cfg(windows)]
+            return Ok(crate::protocols::tcp::socket_error::SocketMonitor::new(socket, copy));
+            #[cfg(not(windows))]
+            Ok(copy)
+        }
+
+        match self.into_split() {
+            (L4ReadHalf::Plain(read, buf), L4WriteHalf::Plain(write)) => {
+                let socket = monitor(read.as_ref())?;
+                Ok((
+                    Self {
+                        read: L4ReadHalf::Plain(read, buf),
+                        write: L4WriteHalf::monitored_plain(write),
+                    },
+                    socket,
+                ))
+            }
+            (L4ReadHalf::Tls(read, buf), L4WriteHalf::Tls(write)) => {
+                let tls = read.unsplit(write);
+                let socket = monitor(tls.get_ref().0)?;
+                Ok((Self::from_client_tls(tls, buf), socket))
+            }
+            (L4ReadHalf::TlsSrv(read, buf), L4WriteHalf::TlsSrv(write)) => {
+                let tls = read.unsplit(write);
+                let socket = monitor(tls.get_ref().0)?;
+                Ok((Self::from_server_tls(tls, buf), socket))
+            }
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "mismatched transport halves",
+            )),
+        }
+    }
 }
 
 pub enum L4ReadHalf {
@@ -73,6 +116,8 @@ pub enum L4WriteHalf {
     Plain(OwnedWriteHalf),
     Tls(WriteHalf<tokio_rustls::client::TlsStream<TcpStream>>),
     TlsSrv(WriteHalf<tokio_rustls::server::TlsStream<TcpStream>>),
+    #[cfg(windows)]
+    ResettablePlain(crate::protocols::tcp::socket_error::ResettableWriteHalf),
 }
 
 impl AsyncRead for L4Stream {
@@ -142,6 +187,8 @@ impl AsyncWrite for L4WriteHalf {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, Error>> {
         match self.get_mut() {
             Self::Plain(cnx) => Pin::new(cnx).poll_write(cx, buf),
+            #[cfg(windows)]
+            Self::ResettablePlain(cnx) => Pin::new(cnx).poll_write(cx, buf),
             Self::Tls(cnx) => Pin::new(cnx).poll_write(cx, buf),
             Self::TlsSrv(cnx) => Pin::new(cnx).poll_write(cx, buf),
         }
@@ -151,6 +198,8 @@ impl AsyncWrite for L4WriteHalf {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         match self.get_mut() {
             Self::Plain(cnx) => Pin::new(cnx).poll_flush(cx),
+            #[cfg(windows)]
+            Self::ResettablePlain(cnx) => Pin::new(cnx).poll_flush(cx),
             Self::Tls(cnx) => Pin::new(cnx).poll_flush(cx),
             Self::TlsSrv(cnx) => Pin::new(cnx).poll_flush(cx),
         }
@@ -160,6 +209,8 @@ impl AsyncWrite for L4WriteHalf {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         match self.get_mut() {
             Self::Plain(cnx) => Pin::new(cnx).poll_shutdown(cx),
+            #[cfg(windows)]
+            Self::ResettablePlain(cnx) => Pin::new(cnx).poll_shutdown(cx),
             Self::Tls(cnx) => Pin::new(cnx).poll_shutdown(cx),
             Self::TlsSrv(cnx) => Pin::new(cnx).poll_shutdown(cx),
         }
@@ -173,6 +224,8 @@ impl AsyncWrite for L4WriteHalf {
     ) -> Poll<Result<usize, Error>> {
         match self.get_mut() {
             Self::Plain(cnx) => Pin::new(cnx).poll_write_vectored(cx, bufs),
+            #[cfg(windows)]
+            Self::ResettablePlain(cnx) => Pin::new(cnx).poll_write_vectored(cx, bufs),
             Self::Tls(cnx) => Pin::new(cnx).poll_write_vectored(cx, bufs),
             Self::TlsSrv(cnx) => Pin::new(cnx).poll_write_vectored(cx, bufs),
         }
@@ -182,8 +235,19 @@ impl AsyncWrite for L4WriteHalf {
     fn is_write_vectored(&self) -> bool {
         match &self {
             Self::Plain(cnx) => cnx.is_write_vectored(),
+            #[cfg(windows)]
+            Self::ResettablePlain(cnx) => cnx.is_write_vectored(),
             Self::Tls(cnx) => cnx.is_write_vectored(),
             Self::TlsSrv(cnx) => cnx.is_write_vectored(),
         }
+    }
+}
+
+impl L4WriteHalf {
+    fn monitored_plain(write: OwnedWriteHalf) -> Self {
+        #[cfg(windows)]
+        return Self::ResettablePlain(crate::protocols::tcp::socket_error::ResettableWriteHalf::new(write));
+        #[cfg(not(windows))]
+        Self::Plain(write)
     }
 }

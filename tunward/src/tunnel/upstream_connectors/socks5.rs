@@ -59,6 +59,15 @@ impl UpstreamConnector for Socks5UpstreamConnector {
     type Reader = Socks5UpstreamReader;
     type Writer = Socks5UpstreamWriter;
 
+    async fn cancelled(reader: Pin<&mut Self::Reader>) -> std::io::Error {
+        match reader.get_mut() {
+            Socks5UpstreamReader::Tcp(reader) => {
+                crate::tunnel::downstream_listeners::DownstreamRead::cancelled(Pin::new(reader)).await
+            }
+            Socks5UpstreamReader::Udp(_) => std::future::pending().await,
+        }
+    }
+
     async fn connect(&self, remote: &Option<RemoteAddr>) -> anyhow::Result<(Self::Reader, Self::Writer)> {
         let Some(remote) = remote else {
             return Err(anyhow!("Missing remote destination for reverse socks5"));
