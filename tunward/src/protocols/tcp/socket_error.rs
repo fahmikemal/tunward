@@ -20,6 +20,11 @@ impl ResettableWriteHalf {
 impl Drop for ResettableWriteHalf {
     fn drop(&mut self) {
         let write = self.0.take().expect("write half is present until drop");
+        #[cfg(test)]
+        eprintln!(
+            "resettable write drop: linger={:?}",
+            socket2::SockRef::from(write.as_ref()).linger()
+        );
         if socket2::SockRef::from(write.as_ref()).linger().ok() == Some(Some(Duration::ZERO)) {
             write.forget();
         }
@@ -105,23 +110,29 @@ mod tests {
     async fn write_half_drop_preserves_fin_and_abortive_close() {
         use tokio::io::AsyncReadExt;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        for abort in [false, true] {
+        for (abort, duplicate) in [(false, false), (true, false), (true, true)] {
             let mut peer = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
             let (socket, _) = listener.accept().await.unwrap();
+            let monitor = duplicate.then(|| {
+                let copy: std::net::TcpStream = socket2::SockRef::from(&socket).try_clone().unwrap().into();
+                copy.set_nonblocking(true).unwrap();
+                TcpStream::from_std(copy).unwrap()
+            });
             let (read, write) = socket.into_split();
             let write = ResettableWriteHalf::new(write);
             if abort {
-                socket2::SockRef::from(read.as_ref())
+                socket2::SockRef::from(monitor.as_ref().unwrap_or(read.as_ref()))
                     .set_linger(Some(Duration::ZERO))
                     .unwrap();
             }
             drop(write);
             if abort {
                 drop(read);
+                drop(monitor);
                 let result = tokio::time::timeout(Duration::from_secs(2), peer.read_u8())
                     .await
                     .unwrap();
-                assert_eq!(result.unwrap_err().kind(), ErrorKind::ConnectionReset);
+                assert_eq!(result.unwrap_err().kind(), ErrorKind::ConnectionReset, "duplicate={duplicate}");
             } else {
                 let mut byte = [0];
                 assert_eq!(

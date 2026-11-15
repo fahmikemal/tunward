@@ -509,6 +509,8 @@ mod tests {
         let (server_read, mut server_write) = from_stream(server.into_inner(), Role::Server, false).unwrap();
         let (mut client_read, _client_write) =
             from_stream(L4Stream::from_tcp(peer.into_inner(), Bytes::new()), Role::Client, false).unwrap();
+        #[cfg(windows)]
+        let probe = client_read.error_socket.as_ref().unwrap().clone();
         let (blocked, was_blocked) = oneshot::channel();
         let mut receiving = scopeguard::guard(
             tokio::spawn(async move { client_read.copy(BlockedTarget(Some(blocked))).await }),
@@ -523,8 +525,19 @@ mod tests {
         server_write.abort().await;
         drop(server_write);
         drop(server_read);
-        let result = tokio::time::timeout(Duration::from_secs(2), &mut *receiving)
-            .await
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut *receiving).await;
+        #[cfg(windows)]
+        if result.is_err() {
+            use futures_util::FutureExt;
+            eprintln!(
+                "blocked peer: error={:?}, readable={:?}, writable={:?}, peek={:?}",
+                probe.take_error(),
+                probe.ready(tokio::io::Interest::READABLE).now_or_never(),
+                probe.ready(tokio::io::Interest::WRITABLE).now_or_never(),
+                socket2::SockRef::from(probe.as_ref()).peek(&mut [std::mem::MaybeUninit::uninit(); 1])
+            );
+        }
+        let result = result
             .expect("forwarding abort must cancel the blocked peer without a heartbeat")
             .unwrap();
         assert!(result.is_err());
