@@ -31,10 +31,16 @@ def digest(path):
 
 def container_guard():
     # The destructive fixture provisioning below is never a host setup command.
-    assert os.geteuid() == 0 and Path("/.dockerenv").exists(), "container fixture only"
-    assert Path("/proc/1/comm").read_text().strip() == "systemd", "systemd must be container PID 1"
-    assert Path("/run/systemd/container").read_text().strip() == "docker", "Docker system manager required"
-    assert Path("/qualification/CONTAINER_ONLY").read_text().strip() == "tunward-systemd-qualification-v1"
+    if os.geteuid() != 0 or not Path("/.dockerenv").exists():
+        raise RuntimeError("container fixture only")
+    if Path("/proc/1/comm").read_text().strip() != "systemd":
+        raise RuntimeError("container fixture only: systemd must be PID 1")
+    marker = Path("/qualification/CONTAINER_ONLY")
+    manager = Path("/run/systemd/container")
+    if not marker.is_file() or not manager.is_file() or manager.read_text().strip() != "docker":
+        raise RuntimeError("container fixture only: missing Docker fixture markers")
+    if marker.read_text().strip() != "tunward-systemd-qualification-v1":
+        raise RuntimeError("container fixture only: wrong marker")
 
 
 class SystemdChecks(RuntimeChecks):
@@ -472,6 +478,8 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--inside-container", action="store_true", help=argparse.SUPPRESS)
     arguments = parser.parse_args()
+    if not __debug__:
+        parser.error("qualification requires Python assertions; do not use -O or PYTHONOPTIMIZE")
     if arguments.inside_container:
         raise SystemExit(int(asyncio.run(SystemdChecks(arguments).run())))
     raise SystemExit(host(arguments))

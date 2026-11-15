@@ -305,7 +305,9 @@ jobs:
           exit "$status"
       - name: Qualify production system unit in disposable Ubuntu container
         timeout-minutes: 10
-        run: python3 scripts/qualify_systemd.py --output "$QUALIFICATION_ROOT/systemd"
+        run: |
+          python3 -m unittest discover -s scripts -p test_qualify_systemd.py -v
+          python3 scripts/qualify_systemd.py --output "$QUALIFICATION_ROOT/systemd"
       - name: Preserve qualification evidence
         if: always() && env.QUALIFICATION_ROOT != ''
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
