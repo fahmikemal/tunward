@@ -181,7 +181,7 @@ class CleanupChecks(RecoveryChecks):
 
     async def case(self, scheme, mode, behavior):
         reverse = mode.startswith("reverse")
-        async with self.stack(f"{scheme}-{mode}-{behavior}", max_tunnels=2 if reverse else 1) as stack:
+        async with self.stack(f"{scheme}-{mode}-{behavior}", max_tunnels=2 if reverse else 1, transport=scheme) as stack:
             endpoint = await self.start_application(stack, scheme, mode, self.unused_port)
             before = {"server": stats(stack["process"].pid), "client": stats(stack["clients"][-1].pid)}
             timings = []
@@ -230,6 +230,7 @@ class CleanupChecks(RecoveryChecks):
                 assert after[role]["fds"] <= before[role]["fds"] + 6, (role, before, after)
                 assert after[role]["threads"] <= before[role]["threads"] + 2, (role, before, after)
             return {"cycles": self.suite.args.cycles, "max_tunnels": 2 if reverse else 1,
+                    "heartbeat": self.heartbeat_frequency(scheme),
                     "idle_reverse_request_preserved": reverse,
                     "quota_slot_reused": self.suite.args.cycles > 1,
                     "quota_slot_reuses": self.suite.args.cycles - 1,
@@ -267,6 +268,8 @@ class CleanupChecks(RecoveryChecks):
                 "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                 "results_sha256": hashlib.sha256(results.read_bytes()).hexdigest() if results.exists() else None,
                 "modes": self.suite.args.modes.split(","), "cases": self.suite.args.cases.split(","),
+                "heartbeat_requested": getattr(self.suite.args, "proxy_heartbeat", "1s"),
+                "heartbeat_by_transport": {s: self.heartbeat_frequency(s) for s in self.suite.args.transports.split(",")},
                 "scope": "Linux loopback verified mTLS; one active tunnel plus a pending request for reverse; no WAN claim"
             }, indent=2) + "\n")
 
@@ -279,6 +282,8 @@ def main():
     parser.add_argument("--modes", default=",".join(MODES))
     parser.add_argument("--cases", default=",".join(CASES))
     parser.add_argument("--cycles", type=int, default=2)
+    parser.add_argument("--heartbeat", dest="proxy_heartbeat", choices=("1s", "default", "0s"), default="1s",
+                        help="WS/WSS client/server heartbeat; other transports keep the one-second qualification profile")
     args = parser.parse_args()
     for value, allowed in ((args.transports, ("wss", "https", "wts")), (args.modes, MODES), (args.cases, CASES)):
         if not value or any(x not in allowed for x in value.split(",")):

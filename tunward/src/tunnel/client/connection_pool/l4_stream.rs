@@ -51,6 +51,43 @@ impl L4Stream {
     pub fn into_split(self) -> (L4ReadHalf, L4WriteHalf) {
         (self.read, self.write)
     }
+
+    /// Duplicate the socket for error readiness without consuming transport bytes.
+    /// Only WebSocket upgrades need this handle; HTTP/2 keeps its existing stream layout.
+    pub(crate) fn with_error_monitor(self) -> std::io::Result<(Self, TcpStream)> {
+        fn monitor(socket: &TcpStream) -> std::io::Result<TcpStream> {
+            let copy: std::net::TcpStream = socket2::SockRef::from(socket).try_clone()?.into();
+            copy.set_nonblocking(true)?;
+            TcpStream::from_std(copy)
+        }
+
+        match self.into_split() {
+            (L4ReadHalf::Plain(read, buf), L4WriteHalf::Plain(write)) => {
+                let socket = monitor(read.as_ref())?;
+                Ok((
+                    Self {
+                        read: L4ReadHalf::Plain(read, buf),
+                        write: L4WriteHalf::Plain(write),
+                    },
+                    socket,
+                ))
+            }
+            (L4ReadHalf::Tls(read, buf), L4WriteHalf::Tls(write)) => {
+                let tls = read.unsplit(write);
+                let socket = monitor(tls.get_ref().0)?;
+                Ok((Self::from_client_tls(tls, buf), socket))
+            }
+            (L4ReadHalf::TlsSrv(read, buf), L4WriteHalf::TlsSrv(write)) => {
+                let tls = read.unsplit(write);
+                let socket = monitor(tls.get_ref().0)?;
+                Ok((Self::from_server_tls(tls, buf), socket))
+            }
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "mismatched transport halves",
+            )),
+        }
+    }
 }
 
 pub enum L4ReadHalf {

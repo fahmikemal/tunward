@@ -112,14 +112,28 @@ one-stream-per-mode smoke profile; that is not a 30-minute endurance result.
 This loopback workload does not qualify WAN latency, production capacity or
 physical-device availability.
 
-Both proxy runners configure a one-second heartbeat. Their eight-second cleanup
-budget must not be read as a guarantee for the default 30-second WSS heartbeat.
-Supplemental candidate tests with that default observed about 60 seconds to
-release a forward HTTP CONNECT tunnel after an upload reset against a blocked
-destination, both before and after directional FIN. Reverse TCP reset checks
-completed promptly in the same supplemental profile. Longer or disabled
-heartbeats need separate acceptance criteria and qualification; fast cleanup
-independent of the WSS heartbeat remains follow-up stabilization work.
+Both proxy runners use a one-second heartbeat unless `--heartbeat default`
+omits the WS/WSS override or `--heartbeat 0s` disables it on the WS/WSS client
+and server. HTTP/2 and WebTransport retain the existing one-second qualification
+control; the QUIC option also controls idle timeout. CI runs the WSS cleanup
+matrix with each setting and the short soak without WebSocket heartbeat. The
+eight-second cleanup budget stays unchanged.
+
+~~~sh
+python3 scripts/qualify_proxy_cleanup.py --transports wss --heartbeat default --cycles 2 --output target/qualification/wss-default-review
+python3 scripts/qualify_proxy_cleanup.py --transports wss --heartbeat 0s --cycles 2 --output target/qualification/wss-disabled-review
+python3 scripts/qualify_proxy_soak.py --heartbeat 0s --seconds 1800 --per-mode 3 --output target/qualification/proxy-soak-disabled-review
+~~~
+
+The earlier binary needed about 60 seconds to release blocked forward tunnels
+with the default heartbeat and retained them past eight seconds when heartbeat
+was disabled. The socket-error monitor now covers fatal reset propagation and
+buffered flush independently of that timer. It adds one descriptor per upgraded
+WS/WSS connection; measure descriptor headroom with the actual upgraded
+connection count across ordinary and reverse tunnels. Native CI separately verifies reset during
+blocked delivery and normal TCP FIN with buffered data on Linux, macOS and
+Windows. A no-heartbeat profile qualifies fatal resets, not discovery of silent
+peers or network blackholes.
 
 The hardening runner checks, on WS and on mTLS WSS, HTTPS, and WebTransport, that a
 domain is only reached at resolved addresses inside a constraining restriction

@@ -34,6 +34,22 @@ jobs:
         run: '"C:\Program Files\Git\usr\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append'
       - name: Build native ring binary
         run: cargo build --release --locked -p tunward-cli --no-default-features --features ring,fleet-inventory
+      - name: Verify WebSocket reset and normal FIN without heartbeat
+        shell: bash
+        run: |
+          status=0
+          cargo test --locked -p tunward --no-default-features --features ring,fleet-inventory tunnel::transport::websocket::tests > "$RUNNER_TEMP/wss-socket-tests.log" 2>&1 || status=$?
+          cat "$RUNNER_TEMP/wss-socket-tests.log"
+          if [ "$status" -ne 0 ]; then
+            python - <<'PY'
+          import os
+          from pathlib import Path
+          message = (Path(os.environ["RUNNER_TEMP"]) / "wss-socket-tests.log").read_text(errors="replace")[-12000:]
+          message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print(f"::error title=WebSocket socket regression::{message}")
+          PY
+          fi
+          exit "$status"
       - name: Verify portable certificate generation and setup evidence
         run: python -m unittest discover -s scripts -p test_qualify_runtime.py
       - name: Verify offline server configuration checks

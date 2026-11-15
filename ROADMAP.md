@@ -71,11 +71,15 @@ These gates remain separate from feature count:
   DATA record ending at a chunk boundary could leave that flush blocked after
   directional FIN. Reset monitoring now covers buffered flush and shutdown,
   with a deterministic regression and repeated real-stream FIN/reset checks.
-- Tighten WSS cleanup under backpressure with the default or disabled heartbeat.
-  The proxy regression profile configures one second; supplemental default
-  30-second heartbeat tests still measured about 60 seconds to release a
-  blocked forward CONNECT tunnel after reset. Passing the shorter profile does
-  not establish the same cleanup deadline for the default configuration.
+- WS/WSS fatal-reset cleanup now watches socket errors independently of frame
+  delivery and heartbeat, including buffered flush after directional FIN.
+  Failed forwarding uses TCP reset; graceful FIN still drains buffered payload.
+  This uses one extra socket descriptor per active WebSocket connection and no
+  extra monitor task. CI checks the CLI's default heartbeat and disabled
+  heartbeat, plus native socket-error/normal-FIN regressions on all three OSs.
+  Earlier default-heartbeat checks took about 60 seconds to release quota;
+  disabled-heartbeat checks retained it past their eight-second budget.
+  Silent peers and network blackholes still need heartbeat/liveness policy.
 - Investigate the historical WSS WAN timeout.
 - The intermittent tenant ephemeral reverse-UDP CI timeout is **resolved**. An
   ephemeral UDP reverse listener closed at its first idle check after its request

@@ -64,7 +64,7 @@ class ProxySoak(CleanupChecks):
 
     async def one(self, scheme):
         connections = []
-        async with self.stack(f"{scheme}-proxy-soak", max_tunnels=64) as stack:
+        async with self.stack(f"{scheme}-proxy-soak", max_tunnels=64, transport=scheme) as stack:
             before_clients = stats(stack["process"].pid)
             endpoints = {mode: port() for mode in STREAM_MODES}
             specs = []
@@ -130,7 +130,9 @@ class ProxySoak(CleanupChecks):
                     "latency": {mode: percentiles(values) for mode, values in timings.items()},
                     "cpu_percent_one_core": {role: round(100 * (after[role]["cpu_seconds"] - baseline[role]["cpu_seconds"]) / elapsed, 3)
                                              for role in baseline},
-                    "heartbeat_seconds": 1, "payload_bytes_per_held_exchange": 16384,
+                    "heartbeat": self.heartbeat_frequency(scheme),
+                    "heartbeat_seconds": {"1s": 1, "default": 30, "0s": 0}[self.heartbeat_frequency(scheme)],
+                    "payload_bytes_per_held_exchange": 16384,
                     "transient_burst_connections": 8, "ordinary_http_requests_per_burst": 2}
                 await self.suite.stop(stack["process"])
                 await stack["start"]()
@@ -187,6 +189,8 @@ class ProxySoak(CleanupChecks):
             (self.suite.out / "completion.json").write_text(json.dumps({
                 "state": state, "exit_code": exit_code, "started_at_unix": started, "finished_at_unix": time.time(),
                 "requested_seconds": self.suite.args.seconds,
+                "heartbeat_requested": getattr(self.suite.args, "proxy_heartbeat", "1s"),
+                "heartbeat_by_transport": {s: self.heartbeat_frequency(s) for s in self.suite.args.transports.split(",")},
                 "binary_sha256": hashlib.sha256(self.suite.binary.read_bytes()).hexdigest(),
                 "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                 "results_sha256": hashlib.sha256(results.read_bytes()).hexdigest() if results.exists() else None,
@@ -202,6 +206,7 @@ def main():
     parser.add_argument("--seconds", type=int, default=1800)
     parser.add_argument("--sample-seconds", type=float, default=5)
     parser.add_argument("--per-mode", type=int, default=3)
+    parser.add_argument("--heartbeat", dest="proxy_heartbeat", choices=("1s", "default", "0s"), default="1s")
     args = parser.parse_args()
     if not 30 <= args.seconds <= 7200 or not 1 <= args.sample_seconds <= 30 or not 1 <= args.per_mode <= 3:
         parser.error("seconds: 30..7200; sample-seconds: 1..30; per-mode: 1..3")

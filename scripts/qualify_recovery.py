@@ -102,7 +102,7 @@ class Relay(asyncio.DatagramProtocol):
 
 class RecoveryChecks(QuotaChecks):
     @asynccontextmanager
-    async def stack(self, label, max_tunnels=1):
+    async def stack(self, label, max_tunnels=1, transport=None):
         self.serial += 1
         prefix = f"{self.serial}-{label}"
         sp, mp = port(), port()
@@ -113,7 +113,7 @@ class RecoveryChecks(QuotaChecks):
                 "--tls-private-key", str(self.certs / "server.key"),
                 "--tls-client-ca-certs", str(self.certs / "ca.pem"),
                 "--restrict-config", str(self.policy), "--device-quota-config", str(quota),
-                "--management-api", f"127.0.0.1:{mp}", "--websocket-ping-frequency", "1s",
+                "--management-api", f"127.0.0.1:{mp}", *self.heartbeat_arguments(transport),
                 "--remote-to-local-server-idle-timeout", "1s")
         stack = {"port": sp, "management": mp, "prefix": prefix, "clients": [], "writers": []}
         async def start():

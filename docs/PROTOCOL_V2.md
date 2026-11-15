@@ -141,6 +141,18 @@ reverse destinations as well. HTTP CONNECT and ordinary HTTP proxy readers
 observe fatal socket errors independently of their bounded duplex bridge and
 HTTP body backpressure. Normal HTTP completion does not trigger cancellation.
 
+Built-in WS/WSS connections keep a duplicate TCP socket handle solely for error
+readiness. It consumes no frame/TLS bytes and lets fatal TCP resets interrupt
+frame delivery, decoder flush and shutdown independently of heartbeat, before
+or after directional FIN. Failed forwarding configures an abortive TCP close
+so the peer can observe the reset. Normal TCP FIN is not an error signal and
+buffered data still drains. The extra descriptor lasts with the upgraded
+connection and shares its existing TCP connection; no monitor task is spawned.
+The low-level `WebsocketTransportRead::new`/`WebsocketTransportWrite::new`
+constructors retain their existing signatures and do not attach a socket
+monitor; the built-in upgrade factory supplies it. This does not replace
+heartbeat/liveness policy for silent peers or network blackholes.
+
 ## Tunnel readiness
 
 TCP target establishment and restriction validation precede a successful
