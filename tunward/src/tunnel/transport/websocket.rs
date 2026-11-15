@@ -17,8 +17,7 @@ use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use log::debug;
-use std::io;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
@@ -30,6 +29,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio_rustls::server::TlsStream;
 use tracing::trace;
 
+#[cfg(not(windows))]
 async fn socket_failure(socket: Option<&TcpStream>) -> io::Error {
     let Some(socket) = socket else {
         return std::future::pending().await;
@@ -415,6 +415,14 @@ fn from_stream(
     ws_rx.error_socket = Some(socket.clone());
     ws_tx.error_socket = Some(socket);
     Ok((ws_rx, ws_tx))
+}
+
+#[cfg(windows)]
+async fn socket_failure(socket: Option<&TcpStream>) -> io::Error {
+    match socket {
+        Some(socket) => crate::protocols::tcp::socket_error::wait(socket).await,
+        None => std::future::pending().await,
+    }
 }
 
 #[cfg(test)]

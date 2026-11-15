@@ -153,6 +153,12 @@ constructors retain their existing signatures and do not attach a socket
 monitor; the built-in upgrade factory supplies it. This does not replace
 heartbeat/liveness policy for silent peers or network blackholes.
 
+On Windows, Mio reports an established reset through read/write closure rather
+than its connection-error flag. TCP, proxy and WebSocket cancellation therefore
+check those closure states and use a non-consuming socket peek. A 50 ms local
+backoff prevents spinning while buffered data or normal EOF remains readable;
+idle sockets wait for readiness and this sends no heartbeat traffic.
+
 ## Tunnel readiness
 
 TCP target establishment and restriction validation precede a successful

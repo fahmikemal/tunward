@@ -38,7 +38,10 @@ jobs:
         shell: bash
         run: |
           status=0
-          CARGO_TERM_COLOR=never cargo test --locked -p tunward --no-default-features --features ring,fleet-inventory tunnel::transport::websocket::tests > "$RUNNER_TEMP/wss-socket-tests.log" 2>&1 || status=$?
+          : > "$RUNNER_TEMP/wss-socket-tests.log"
+          for filter in tunnel::transport::websocket::tests tunnel::transport::io::tests protocols::http_proxy::server::tests protocols::tcp::socket_error::tests; do
+            CARGO_TERM_COLOR=never cargo test --locked -p tunward --no-default-features --features ring,fleet-inventory "$filter" >> "$RUNNER_TEMP/wss-socket-tests.log" 2>&1 || status=$?
+          done
           cat "$RUNNER_TEMP/wss-socket-tests.log"
           if [ "$status" -ne 0 ]; then
             python - <<'PY'

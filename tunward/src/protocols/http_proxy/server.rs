@@ -9,7 +9,6 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use std::io::{self, IoSlice};
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll, ready};
@@ -106,6 +105,7 @@ impl AsyncWrite for ProxySocket {
     }
 }
 
+#[cfg(not(windows))]
 async fn socket_failure(socket: &TcpStream) -> io::Error {
     match socket.ready(tokio::io::Interest::ERROR).await {
         Err(error) => error,
@@ -148,11 +148,11 @@ type ProxyBody = BoxBody<Bytes, hyper::Error>;
 
 pub struct HttpProxyListener {
     listener: Pin<Box<dyn Stream<Item = Accepted> + Send>>,
-    local_addr: SocketAddr,
+    local_addr: std::net::SocketAddr,
 }
 impl HttpProxyListener {
     /// The address the proxy is bound to, with the port the OS picked for a port-0 bind.
-    pub fn local_addr(&self) -> SocketAddr {
+    pub fn local_addr(&self) -> std::net::SocketAddr {
         self.local_addr
     }
 }
@@ -313,7 +313,7 @@ pub(crate) fn destination(uri: &Uri, is_connect: bool) -> Option<(Host, u16)> {
 }
 
 pub async fn run_server(
-    bind: SocketAddr,
+    bind: std::net::SocketAddr,
     timeout: Option<Duration>,
     credentials: Option<(String, String)>,
 ) -> anyhow::Result<HttpProxyListener> {
@@ -375,6 +375,11 @@ pub async fn run_server(
         listener: Box::pin(stream),
         local_addr,
     })
+}
+
+#[cfg(windows)]
+async fn socket_failure(socket: &TcpStream) -> io::Error {
+    crate::protocols::tcp::socket_error::wait(socket).await
 }
 
 #[cfg(test)]

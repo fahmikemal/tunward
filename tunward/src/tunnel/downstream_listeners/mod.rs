@@ -40,6 +40,7 @@ pub trait DownstreamRead: AsyncRead + Send + 'static {
 }
 
 impl DownstreamRead for tokio::net::tcp::OwnedReadHalf {
+    #[cfg(not(windows))]
     async fn cancelled(self: Pin<&mut Self>) -> io::Error {
         let reader = self.get_mut();
         let socket: &tokio::net::TcpStream = reader.as_ref();
@@ -50,6 +51,11 @@ impl DownstreamRead for tokio::net::tcp::OwnedReadHalf {
                 .unwrap_or_else(Some)
                 .unwrap_or_else(|| io::Error::new(io::ErrorKind::ConnectionAborted, "local TCP socket failed")),
         }
+    }
+
+    #[cfg(windows)]
+    async fn cancelled(self: Pin<&mut Self>) -> io::Error {
+        crate::protocols::tcp::socket_error::wait(self.get_mut().as_ref()).await
     }
 }
 #[cfg(unix)]
