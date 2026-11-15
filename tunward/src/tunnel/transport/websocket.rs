@@ -49,7 +49,7 @@ pub struct WebsocketTransportWrite {
     pending_operations: Receiver<Frame<'static>>,
     pending_ops_notify: Arc<Notify>,
     in_flight_ping: Arc<AtomicUsize>,
-    error_socket: Option<Arc<TcpStream>>,
+    error_socket: Option<Arc<ErrorSocket>>,
 }
 
 impl WebsocketTransportWrite {
@@ -72,7 +72,7 @@ impl WebsocketTransportWrite {
 impl TransportWrite for WebsocketTransportWrite {
     async fn abort(&mut self) {
         if let Some(socket) = self.error_socket.as_deref()
-            && let Err(error) = socket2::SockRef::from(socket).set_linger(Some(std::time::Duration::ZERO))
+            && let Err(error) = abort_socket(socket)
         {
             tracing::debug!(%error, "Cannot configure WebSocket transport reset");
         }
@@ -180,7 +180,7 @@ pub struct WebsocketTransportRead {
     pending_operations: Sender<Frame<'static>>,
     notify_pending_ops: Arc<Notify>,
     in_flight_ping: Arc<AtomicUsize>,
-    error_socket: Option<Arc<TcpStream>>,
+    error_socket: Option<Arc<ErrorSocket>>,
 }
 
 impl WebsocketTransportRead {
@@ -418,11 +418,27 @@ fn from_stream(
 }
 
 #[cfg(windows)]
-async fn socket_failure(socket: Option<&TcpStream>) -> io::Error {
+async fn socket_failure(socket: Option<&ErrorSocket>) -> io::Error {
     match socket {
         Some(socket) => crate::protocols::tcp::socket_error::wait(socket).await,
         None => std::future::pending().await,
     }
+}
+
+#[cfg(not(windows))]
+pub(crate) type ErrorSocket = TcpStream;
+#[cfg(windows)]
+pub(crate) type ErrorSocket = crate::protocols::tcp::socket_error::SocketMonitor;
+
+#[cfg(not(windows))]
+fn abort_socket(socket: &ErrorSocket) -> io::Result<()> {
+    socket2::SockRef::from(socket).set_linger(Some(std::time::Duration::ZERO))
+}
+#[cfg(windows)]
+fn abort_socket(socket: &ErrorSocket) -> io::Result<()> {
+    // SAFETY: this private helper is only called by WebsocketTransportWrite::abort,
+    // whose inner writer still owns the original TCP stream (plain or TLS).
+    unsafe { socket.abort() }
 }
 
 #[cfg(test)]
@@ -534,7 +550,7 @@ mod tests {
                 probe.take_error(),
                 probe.ready(tokio::io::Interest::READABLE).now_or_never(),
                 probe.ready(tokio::io::Interest::WRITABLE).now_or_never(),
-                socket2::SockRef::from(probe.as_ref()).peek(&mut [std::mem::MaybeUninit::uninit(); 1])
+                socket2::SockRef::from(&**probe).peek(&mut [std::mem::MaybeUninit::uninit(); 1])
             );
         }
         let result = result

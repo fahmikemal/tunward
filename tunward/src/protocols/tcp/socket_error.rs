@@ -7,6 +7,41 @@ use std::time::Duration;
 use tokio::io::Interest;
 use tokio::net::TcpStream;
 
+#[cfg(windows)]
+pub(crate) struct SocketMonitor {
+    socket: TcpStream,
+    original: std::os::windows::io::RawSocket,
+}
+
+#[cfg(windows)]
+impl SocketMonitor {
+    pub(crate) fn new(original: &TcpStream, socket: TcpStream) -> Self {
+        use std::os::windows::io::AsRawSocket;
+        Self {
+            socket,
+            original: original.as_raw_socket(),
+        }
+    }
+
+    /// The caller must still own the original stream's write half.
+    pub(crate) unsafe fn abort(&self) -> io::Result<()> {
+        use std::os::windows::io::BorrowedSocket;
+        // SAFETY: WebsocketTransportWrite owns its original write half throughout
+        // abort(), so this handle cannot be closed or reused during this call.
+        let original = unsafe { BorrowedSocket::borrow_raw(self.original) };
+        socket2::SockRef::from(&original).set_linger(Some(Duration::ZERO))?;
+        socket2::SockRef::from(&self.socket).set_linger(Some(Duration::ZERO))
+    }
+}
+
+#[cfg(windows)]
+impl std::ops::Deref for SocketMonitor {
+    type Target = TcpStream;
+    fn deref(&self) -> &Self::Target {
+        &self.socket
+    }
+}
+
 /// Keep Tokio's implicit write-half FIN from turning an abortive close into a
 /// graceful close on Windows. Explicit AsyncWrite shutdown remains unchanged.
 pub struct ResettableWriteHalf(Option<tokio::net::tcp::OwnedWriteHalf>);
@@ -20,11 +55,6 @@ impl ResettableWriteHalf {
 impl Drop for ResettableWriteHalf {
     fn drop(&mut self) {
         let write = self.0.take().expect("write half is present until drop");
-        #[cfg(test)]
-        eprintln!(
-            "resettable write drop: linger={:?}",
-            socket2::SockRef::from(write.as_ref()).linger()
-        );
         if socket2::SockRef::from(write.as_ref()).linger().ok() == Some(Some(Duration::ZERO)) {
             write.forget();
         }
@@ -118,12 +148,26 @@ mod tests {
                 copy.set_nonblocking(true).unwrap();
                 TcpStream::from_std(copy).unwrap()
             });
+            #[cfg(windows)]
+            let monitor = monitor.map(|copy| SocketMonitor::new(&socket, copy));
             let (read, write) = socket.into_split();
             let write = ResettableWriteHalf::new(write);
             if abort {
-                socket2::SockRef::from(monitor.as_ref().unwrap_or(read.as_ref()))
-                    .set_linger(Some(Duration::ZERO))
-                    .unwrap();
+                if let Some(monitor) = monitor.as_ref() {
+                    #[cfg(windows)]
+                    // SAFETY: read/write still own the original stream here.
+                    unsafe {
+                        monitor.abort().unwrap();
+                    }
+                    #[cfg(not(windows))]
+                    socket2::SockRef::from(monitor)
+                        .set_linger(Some(Duration::ZERO))
+                        .unwrap();
+                } else {
+                    socket2::SockRef::from(read.as_ref())
+                        .set_linger(Some(Duration::ZERO))
+                        .unwrap();
+                }
             }
             drop(write);
             if abort {

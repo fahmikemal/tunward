@@ -54,11 +54,17 @@ impl L4Stream {
 
     /// Duplicate the socket for error readiness without consuming transport bytes.
     /// Only WebSocket upgrades need this handle; HTTP/2 keeps its existing stream layout.
-    pub(crate) fn with_error_monitor(self) -> std::io::Result<(Self, TcpStream)> {
-        fn monitor(socket: &TcpStream) -> std::io::Result<TcpStream> {
+    pub(crate) fn with_error_monitor(
+        self,
+    ) -> std::io::Result<(Self, crate::tunnel::transport::websocket::ErrorSocket)> {
+        fn monitor(socket: &TcpStream) -> std::io::Result<crate::tunnel::transport::websocket::ErrorSocket> {
             let copy: std::net::TcpStream = socket2::SockRef::from(socket).try_clone()?.into();
             copy.set_nonblocking(true)?;
-            TcpStream::from_std(copy)
+            let copy = TcpStream::from_std(copy)?;
+            #[cfg(windows)]
+            return Ok(crate::protocols::tcp::socket_error::SocketMonitor::new(socket, copy));
+            #[cfg(not(windows))]
+            Ok(copy)
         }
 
         match self.into_split() {

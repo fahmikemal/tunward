@@ -161,6 +161,9 @@ idle sockets wait for readiness and this sends no heartbeat traffic.
 For monitored plain WebSockets on Windows, an abortive write-half drop also
 suppresses Tokio's implicit directional FIN, allowing the final socket close
 to send RST. Ordinary drop and explicit shutdown keep their graceful behavior.
+The abort path sets linger on both the original and duplicate Windows socket
+descriptors; setting it on the duplicate alone does not configure the original.
+The original handle is borrowed only while the transport still owns its write half.
 
 ## Tunnel readiness
 
