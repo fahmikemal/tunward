@@ -104,6 +104,12 @@ separately: default `aws-lc-rs`, then `ring` with default features disabled.
 Do not use all-feature runtime tests as a substitute; they enable both TLS
 providers. All-feature Clippy compiles code and is a separate check.
 
+Keep the loopback integration group in `.config/nextest.toml` enabled. Nextest
+runs each test in a separate process, so `serial_test` alone cannot coordinate
+their port allocation. WebTransport fixtures also bind the server listeners
+before creating the client's ephemeral UDP endpoint and report startup errors
+before dialing.
+
 For protocol, authentication, lifecycle, or resource changes, build the release
 binary and run the relevant executable qualification sections:
 

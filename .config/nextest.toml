@@ -1,0 +1,9 @@
+# serial_test coordinates threads within one test process. Nextest starts each
+# test in a separate process, so preserve the integration fixtures' serial
+# contract here too, including their pick-then-bind loopback port handoff.
+[test-groups.loopback-integration]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'test(/^test_integrations::/)'
+test-group = 'loopback-integration'
